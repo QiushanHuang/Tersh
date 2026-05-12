@@ -414,10 +414,15 @@ impl App {
             }
             let command = match key.code {
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => Some(Command::Cancel),
-                KeyCode::Char('j') | KeyCode::Down => Some(Command::Down),
-                KeyCode::Char('k') | KeyCode::Up => Some(Command::Up),
-                KeyCode::PageDown | KeyCode::Char(' ') => Some(Command::HalfDown),
-                KeyCode::PageUp => Some(Command::HalfUp),
+                KeyCode::Char('j') | KeyCode::Down => Some(Command::HalfDown),
+                KeyCode::Char('k') | KeyCode::Up => Some(Command::HalfUp),
+                KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    Some(Command::Down)
+                }
+                KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    Some(Command::Up)
+                }
+                KeyCode::Char(' ') => Some(Command::HalfDown),
                 KeyCode::Home => Some(Command::First),
                 KeyCode::End => Some(Command::Last),
                 KeyCode::Char('G') => Some(Command::Last),

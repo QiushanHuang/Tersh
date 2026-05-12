@@ -150,8 +150,8 @@ tersh
 ### Preview Mode
 
 - `Enter` on a file: open fullscreen preview
-- `j` / `k` or `↑` / `↓`: scroll preview line by line
-- `PageUp` / `PageDown`: scroll preview by page
+- `j` / `k`: scroll preview by page
+- `↑` / `↓` / `Ctrl+F` / `Ctrl+B`: scroll preview line by line
 - `Home` or `gg`: jump to top
 - `End` or `G`: jump to bottom
 - `/`: find in preview
@@ -387,8 +387,8 @@ tersh
 ### 全屏预览
 
 - `Enter`：对当前文件进入全文预览
-- `j` / `k` 或 `↑` / `↓`：按行上下滚动
-- `PageUp` / `PageDown`：按页滚动
+- `j` / `k`：按页滚动
+- `↑` / `↓` / `Ctrl+F` / `Ctrl+B`：按行上下滚动
 - `Home` 或 `gg`：跳到顶部
 - `End` 或 `G`：跳到底部
 - `/`：在预览中查找
