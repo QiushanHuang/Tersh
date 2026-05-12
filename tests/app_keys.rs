@@ -1,0 +1,211 @@
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use tersh::app::{App, Command, Mode};
+
+#[test]
+fn escape_closes_filter_before_quitting() {
+    let mut app = App::for_test();
+
+    app.apply(Command::OpenFilter);
+    app.apply(Command::Cancel);
+
+    assert_eq!(app.mode(), Mode::Normal);
+    assert!(!app.should_quit());
+}
+
+#[test]
+fn q_quits_only_from_normal_mode() {
+    let mut app = App::for_test();
+
+    app.apply(Command::OpenHelp);
+    app.apply(Command::Quit);
+
+    assert_eq!(app.mode(), Mode::Normal);
+    assert!(!app.should_quit());
+
+    app.apply(Command::Quit);
+
+    assert!(app.should_quit());
+}
+
+#[test]
+fn force_quit_sets_quit_from_any_mode() {
+    let mut app = App::for_test();
+
+    app.apply(Command::OpenHelp);
+    app.apply(Command::ForceQuit);
+
+    assert!(app.should_quit());
+}
+
+#[test]
+fn filter_mode_treats_letters_and_backspace_as_text_input() {
+    let mut app = App::for_test();
+
+    app.apply(Command::OpenFilter);
+    app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+
+    assert_eq!(app.input(), "r");
+    assert_eq!(app.mode(), Mode::Filter);
+}
+
+#[test]
+fn confirm_mode_accepts_delete_confirmation_text() {
+    let mut app = App::for_test();
+
+    app.apply(Command::PermanentDelete);
+    for ch in "delete".chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+    }
+
+    assert_eq!(app.input(), "delete");
+    assert_eq!(app.mode(), Mode::ConfirmDelete);
+}
+
+#[test]
+fn changing_directory_clears_previous_selection() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("old.txt"), "old").unwrap();
+    std::fs::create_dir(dir.path().join("subdir")).unwrap();
+    let mut app = App::new(dir.path().to_path_buf()).unwrap();
+
+    app.handle_command(Command::Down);
+    app.handle_command(Command::ToggleSelect);
+    assert_eq!(app.selected_len(), 1);
+    app.handle_command(Command::Up);
+    app.handle_command(Command::Open);
+
+    assert_eq!(app.selected_len(), 0);
+}
+
+#[test]
+fn gg_requires_two_g_keypresses_to_jump_to_first_item() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "b").unwrap();
+    let mut app = App::new(dir.path().to_path_buf()).unwrap();
+    app.handle_command(Command::Last);
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+    assert_eq!(app.cursor(), 1);
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+    assert_eq!(app.cursor(), 0);
+}
+
+#[test]
+fn reload_failure_clears_previous_selection() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("old.txt"), "old").unwrap();
+    let mut app = App::new(dir.path().to_path_buf()).unwrap();
+    app.handle_command(Command::ToggleSelect);
+    assert_eq!(app.selected_len(), 1);
+
+    app.force_cwd_for_test(dir.path().join("missing"));
+
+    assert_eq!(app.selected_len(), 0);
+    assert!(app.entries().is_empty());
+}
+
+#[test]
+fn goto_prompt_changes_to_specified_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let child = dir.path().join("child");
+    std::fs::create_dir(&child).unwrap();
+    let mut app = App::new(dir.path().to_path_buf()).unwrap();
+
+    app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
+    for ch in child.to_string_lossy().chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+    }
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert_eq!(app.cwd(), child.canonicalize().unwrap());
+}
+
+#[test]
+fn y_prefix_copies_name_relative_and_absolute_paths_as_text() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("file name.txt"), "x").unwrap();
+    let mut app = App::new(dir.path().to_path_buf()).unwrap();
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+    assert_eq!(app.last_clipboard_text().unwrap(), "file name.txt");
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+    assert_eq!(app.last_clipboard_text().unwrap(), "file name.txt");
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+    assert!(
+        app.last_clipboard_text()
+            .unwrap()
+            .ends_with("file name.txt")
+    );
+}
+
+#[test]
+fn yy_copies_file_and_p_pastes_into_current_directory() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let target_dir = tempfile::tempdir().unwrap();
+    std::fs::write(source_dir.path().join("item.txt"), "item").unwrap();
+    let mut app = App::new(source_dir.path().to_path_buf()).unwrap();
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    app.force_cwd_for_test(target_dir.path().to_path_buf());
+    app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+
+    assert_eq!(
+        std::fs::read_to_string(target_dir.path().join("item.txt")).unwrap(),
+        "item"
+    );
+}
+
+#[test]
+fn x_cuts_file_and_p_moves_into_current_directory() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let target_dir = tempfile::tempdir().unwrap();
+    let source = source_dir.path().join("cut.txt");
+    std::fs::write(&source, "cut").unwrap();
+    let mut app = App::new(source_dir.path().to_path_buf()).unwrap();
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+    app.force_cwd_for_test(target_dir.path().to_path_buf());
+    app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+
+    assert!(!source.exists());
+    assert_eq!(
+        std::fs::read_to_string(target_dir.path().join("cut.txt")).unwrap(),
+        "cut"
+    );
+}
+
+#[test]
+fn copy_to_and_move_to_use_typed_destination_directory() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let target_dir = tempfile::tempdir().unwrap();
+    std::fs::write(source_dir.path().join("copy.txt"), "copy").unwrap();
+    std::fs::write(source_dir.path().join("move.txt"), "move").unwrap();
+    let mut app = App::new(source_dir.path().to_path_buf()).unwrap();
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+    for ch in target_dir.path().to_string_lossy().chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+    }
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(target_dir.path().join("copy.txt").exists());
+
+    app.handle_command(Command::Down);
+    let moving = source_dir.path().join("move.txt");
+    app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+    for ch in target_dir.path().to_string_lossy().chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+    }
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(!moving.exists());
+    assert!(target_dir.path().join("move.txt").exists());
+}
