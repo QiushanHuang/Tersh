@@ -59,7 +59,9 @@ This matters when your working environment is:
 - Full-screen terminal file workbench
 - Directory navigation with keyboard-first controls
 - Inline file preview
+- Enter fullscreen preview for files with full-content scrolling/search/jump
 - Filter the current directory
+- Quick file edit with `nano` (`e`)
 - Copy, cut, paste, rename, and move workflows
 - Safe trash flow before permanent deletion
 - Copy file name, relative path, and absolute path
@@ -144,6 +146,17 @@ tersh
 - `:`: go to directory
 - `.`: toggle hidden files
 - `r`: refresh
+
+### Preview Mode
+
+- `Enter` on a file: open fullscreen preview
+- `j` / `k` or `↑` / `↓`: scroll preview line by line
+- `PageUp` / `PageDown`: scroll preview by page
+- `Home` or `gg`: jump to top
+- `End` or `G`: jump to bottom
+- `/`: find in preview
+- `n` / `N`: next / previous match
+- `e`: open current file in `nano`
 
 ### File Operations
 
@@ -283,7 +296,9 @@ Tersh 不是 SSH 客户端，也不是多主机会话管理器。
 - 全屏终端文件工作台
 - 键盘优先的目录浏览
 - 文件内联预览
+- 回车进入全文预览，可快速滚动、跳转与查找
 - 当前目录筛选
+- 可在预览中用 `e` 快速调用 `nano` 编辑
 - 复制、剪切、粘贴、重命名与移动
 - 先入回收站再永久删除的安全流程
 - 复制文件名、相对路径和绝对路径
@@ -368,6 +383,17 @@ tersh
 - `:`：跳转目录
 - `.`：切换隐藏文件显示
 - `r`：刷新
+
+### 全屏预览
+
+- `Enter`：对当前文件进入全文预览
+- `j` / `k` 或 `↑` / `↓`：按行上下滚动
+- `PageUp` / `PageDown`：按页滚动
+- `Home` 或 `gg`：跳到顶部
+- `End` 或 `G`：跳到底部
+- `/`：在预览中查找
+- `n` / `N`：下一个 / 上一个匹配
+- `e`：使用 `nano` 打开当前文件编辑
 
 ### 文件操作
 

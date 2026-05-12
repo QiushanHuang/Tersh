@@ -12,22 +12,37 @@ use ratatui::{
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(2)])
-        .split(area);
-    draw_body(frame, rows[0], app);
-    draw_footer(frame, rows[1], app);
     match app.mode() {
-        Mode::Help => draw_help(frame, centered_rect(70, 70, area)),
-        Mode::Filter
-        | Mode::Goto
-        | Mode::Rename
-        | Mode::CopyTo
-        | Mode::MoveTo
-        | Mode::ConfirmTrash
-        | Mode::ConfirmDelete => draw_input_modal(frame, centered_rect(70, 30, area), app),
-        Mode::Message | Mode::Normal => {}
+        Mode::Preview | Mode::PreviewSearch => {
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(3), Constraint::Length(2)])
+                .split(area);
+            draw_fullscreen_preview(frame, rows[0], app);
+            if app.mode() == Mode::PreviewSearch {
+                draw_input_modal(frame, centered_rect(70, 30, area), app);
+            }
+            draw_footer(frame, rows[1], app);
+        }
+        _ => {
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(3), Constraint::Length(2)])
+                .split(area);
+            draw_body(frame, rows[0], app);
+            draw_footer(frame, rows[1], app);
+            match app.mode() {
+                Mode::Help => draw_help(frame, centered_rect(70, 70, area)),
+                Mode::Filter
+                | Mode::Goto
+                | Mode::Rename
+                | Mode::CopyTo
+                | Mode::MoveTo
+                | Mode::ConfirmTrash
+                | Mode::ConfirmDelete => draw_input_modal(frame, centered_rect(70, 30, area), app),
+                Mode::Message | Mode::Normal | Mode::Preview | Mode::PreviewSearch => {}
+            }
+        }
     }
 }
 
@@ -101,6 +116,57 @@ fn draw_files(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(paragraph, area);
 }
 
+fn draw_fullscreen_preview(frame: &mut Frame, area: Rect, app: &App) {
+    let lines = app.preview().lines.iter().collect::<Vec<_>>();
+    let total_lines = lines.len();
+    let view_lines = area.height.saturating_sub(4) as usize;
+    let offset = app
+        .preview_offset()
+        .min(total_lines.saturating_sub(1));
+    let query = app.preview_search_query().to_lowercase();
+    let matches = app.preview_matches();
+    let active_match = app.preview_active_match();
+    let active_line = active_match
+        .and_then(|index| matches.get(index))
+        .copied()
+        .unwrap_or(usize::MAX);
+
+    let mut rendered = Vec::new();
+    rendered.push(Line::from(Span::styled(
+        app.preview()
+            .path
+            .display()
+            .to_string(),
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+    )));
+    rendered.push(Line::from(format!(
+        "offset: {} / {} | search: {}",
+        offset.saturating_add(1),
+        total_lines,
+        app.preview_search_query(),
+    )));
+    for (index, line) in lines
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(view_lines)
+    {
+        let mut style = Style::default();
+        if !query.is_empty() && line.to_lowercase().contains(&query) {
+            style = style.fg(Color::Black).bg(Color::Yellow);
+        }
+        if index == active_line {
+            style = style.add_modifier(Modifier::UNDERLINED).add_modifier(Modifier::BOLD);
+        }
+        rendered.push(Line::from(Span::styled(line.as_str(), style)));
+    }
+
+    let paragraph = Paragraph::new(rendered)
+        .block(Block::default().title("Preview").borders(Borders::ALL))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, area);
+}
+
 fn draw_preview(frame: &mut Frame, area: Rect, app: &App) {
     let mut lines = vec![Line::from(Span::styled(
         app.preview().path.display().to_string(),
@@ -148,7 +214,16 @@ fn draw_info(frame: &mut Frame, area: Rect, app: &App) {
 
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     let mode = format!("{:?}", app.mode()).to_lowercase();
-    let text = format!("{mode} | q quit | Esc | ^C | ? | : goto | yy/yf/yr/ya | x/p | c/m | d/D");
+    let text = match app.mode() {
+        Mode::Preview | Mode::PreviewSearch => {
+            "preview | j/k/↑/↓ scroll  g/g top  G bottom  / search  n/N next/prev  e edit  q/esc close".to_string()
+        }
+        _ => {
+            format!(
+                "{mode} | q quit | Esc | ^C | ? | : goto | / filter | yy/yf/yr/ya | x/p | c/m | d/D | e edit"
+            )
+        }
+    };
     let paragraph = Paragraph::new(text)
         .style(Style::default().fg(Color::Gray))
         .block(Block::default().borders(Borders::TOP));
@@ -159,15 +234,21 @@ fn draw_help(frame: &mut Frame, area: Rect) {
     frame.render_widget(Clear, area);
     let lines = vec![
         Line::from("Navigation"),
-        Line::from("  j/k or arrows: move    h: parent    l/Enter: open"),
+        Line::from("  j/k or arrows: move    h: parent    l: open directory"),
+        Line::from("  Enter on file: fullscreen preview"),
         Line::from("  /: filter    .: hidden    r: refresh"),
         Line::from(""),
         Line::from("Operations"),
         Line::from("  Space: mark    yy: copy    x: cut    p: paste"),
         Line::from("  c: copy to...    m: move to...    n: rename"),
         Line::from("  yf: file name    yr: relative path    ya: absolute path"),
+        Line::from("  e: edit focused file with nano"),
         Line::from("  :: goto directory"),
         Line::from("  d: trash, then type trash    D: delete, then type delete"),
+        Line::from(""),
+        Line::from("Preview mode"),
+        Line::from("  j/k/↑/↓: scroll    gg: top    G: bottom"),
+        Line::from("  /: search    n/N: next/prev match"),
         Line::from(""),
         Line::from("Exit"),
         Line::from("  q: quit/close    Q: force quit    Esc: cancel    Ctrl+C: exit"),
@@ -188,6 +269,7 @@ fn draw_input_modal(frame: &mut Frame, area: Rect, app: &App) {
         Mode::MoveTo => "Move selected/focused item(s) to directory",
         Mode::ConfirmTrash => "Type trash then Enter. Esc cancels.",
         Mode::ConfirmDelete => "Permanent delete: type delete then Enter. Esc cancels.",
+        Mode::PreviewSearch => "Find in preview",
         _ => "",
     };
     let lines = vec![

@@ -16,6 +16,7 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{
     collections::BTreeSet,
     io,
+    process::Command as ProcessCommand,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -26,6 +27,8 @@ pub enum Mode {
     Filter,
     Goto,
     Help,
+    Preview,
+    PreviewSearch,
     Rename,
     CopyTo,
     MoveTo,
@@ -46,6 +49,7 @@ pub enum Command {
     Open,
     OpenFilter,
     OpenGoto,
+    OpenPreviewSearch,
     ToggleHidden,
     ToggleSelect,
     SelectAll,
@@ -63,10 +67,13 @@ pub enum Command {
     PermanentDelete,
     Refresh,
     OpenHelp,
+    PreviewSearchNext,
+    PreviewSearchPrev,
     Cancel,
     Quit,
     ForceQuit,
     Input(char),
+    Edit,
     Backspace,
     Submit,
 }
@@ -80,6 +87,10 @@ pub struct App {
     selected: BTreeSet<PathBuf>,
     transfer_buffer: Option<TransferBuffer>,
     preview: Preview,
+    preview_offset: usize,
+    preview_search_query: String,
+    preview_search_matches: Vec<usize>,
+    preview_search_index: Option<usize>,
     mode: Mode,
     should_quit: bool,
     show_hidden: bool,
@@ -117,6 +128,10 @@ impl App {
             selected: BTreeSet::new(),
             transfer_buffer: None,
             preview: Preview::message(PathBuf::new(), PreviewKind::Empty, "No file selected"),
+            preview_offset: 0,
+            preview_search_query: String::new(),
+            preview_search_matches: Vec::new(),
+            preview_search_index: None,
             mode: Mode::Normal,
             should_quit: false,
             show_hidden: false,
@@ -168,6 +183,10 @@ impl App {
                 lines: vec!["   1  # tersh".to_string(), "   2  preview".to_string()],
                 truncated: false,
             },
+            preview_offset: 0,
+            preview_search_query: String::new(),
+            preview_search_matches: Vec::new(),
+            preview_search_index: None,
             mode: Mode::Normal,
             should_quit: false,
             show_hidden: false,
@@ -216,22 +235,55 @@ impl App {
 
     pub fn handle_command(&mut self, command: Command) {
         match command {
-            Command::Down => self.move_cursor(1),
-            Command::Up => self.move_cursor(-1),
-            Command::HalfDown => self.move_cursor(10),
-            Command::HalfUp => self.move_cursor(-10),
+            Command::Down => {
+                if self.mode == Mode::Preview {
+                    self.scroll_preview(1);
+                } else {
+                    self.move_cursor(1);
+                }
+            }
+            Command::Up => {
+                if self.mode == Mode::Preview {
+                    self.scroll_preview(-1);
+                } else {
+                    self.move_cursor(-1);
+                }
+            }
+            Command::HalfDown => {
+                if self.mode == Mode::Preview {
+                    self.scroll_preview(10);
+                } else {
+                    self.move_cursor(10);
+                }
+            }
+            Command::HalfUp => {
+                if self.mode == Mode::Preview {
+                    self.scroll_preview(-10);
+                } else {
+                    self.move_cursor(-10);
+                }
+            }
             Command::First => {
-                self.cursor = 0;
-                self.update_preview();
+                if self.mode == Mode::Preview {
+                    self.scroll_preview_to_top();
+                } else {
+                    self.cursor = 0;
+                    self.update_preview();
+                }
             }
             Command::Last => {
-                self.cursor = self.entries.len().saturating_sub(1);
-                self.update_preview();
+                if self.mode == Mode::Preview {
+                    self.scroll_preview_to_bottom();
+                } else {
+                    self.cursor = self.entries.len().saturating_sub(1);
+                    self.update_preview();
+                }
             }
             Command::Parent => self.go_parent(),
             Command::Open => self.open_focused(),
             Command::OpenFilter => self.apply(command),
             Command::OpenGoto => self.apply(command),
+            Command::OpenPreviewSearch => self.enter_preview_search(),
             Command::ToggleHidden => {
                 self.show_hidden = !self.show_hidden;
                 self.reload();
@@ -261,6 +313,8 @@ impl App {
                 self.mode = Mode::MoveTo;
                 self.input.clear();
             }
+            Command::PreviewSearchNext => self.preview_search_next(),
+            Command::PreviewSearchPrev => self.preview_search_prev(),
             Command::Rename => {
                 if let Some(entry) = self.focused() {
                     if let Some(name) = entry.raw_name.to_str() {
@@ -283,6 +337,7 @@ impl App {
             Command::OpenHelp | Command::Cancel | Command::Quit | Command::ForceQuit => {
                 self.apply(command)
             }
+            Command::Edit => self.open_in_editor(),
             Command::Input(ch) => self.handle_input(ch),
             Command::Backspace => {
                 self.input.pop();
@@ -322,6 +377,19 @@ impl App {
             }
             return;
         }
+        if self.mode == Mode::PreviewSearch {
+            let command = match key.code {
+                KeyCode::Esc => Some(Command::Cancel),
+                KeyCode::Enter => Some(Command::Submit),
+                KeyCode::Backspace => Some(Command::Backspace),
+                KeyCode::Char(ch) => Some(Command::Input(ch)),
+                _ => None,
+            };
+            if let Some(command) = command {
+                self.handle_command(command);
+            }
+            return;
+        }
         if self.mode == Mode::Help {
             match key.code {
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('?') => {
@@ -331,26 +399,43 @@ impl App {
             }
             return;
         }
-        if key.code == KeyCode::Char('g') && key.modifiers.is_empty() {
+        if self.mode == Mode::Preview {
+            if key.code == KeyCode::Char('g') && key.modifiers.is_empty() {
+                if self.pending_g {
+                    self.pending_g = false;
+                    self.handle_command(Command::First);
+                } else {
+                    self.pending_g = true;
+                }
+                return;
+            }
             if self.pending_g {
                 self.pending_g = false;
-                self.handle_command(Command::First);
-            } else {
-                self.pending_g = true;
             }
-            return;
-        }
-        if key.code == KeyCode::Char('y') && key.modifiers.is_empty() {
-            if self.pending_y {
-                self.pending_y = false;
-                self.handle_command(Command::Copy);
-            } else {
-                self.pending_y = true;
+            let command = match key.code {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => Some(Command::Cancel),
+                KeyCode::Char('j') | KeyCode::Down => Some(Command::Down),
+                KeyCode::Char('k') | KeyCode::Up => Some(Command::Up),
+                KeyCode::PageDown | KeyCode::Char(' ') => Some(Command::HalfDown),
+                KeyCode::PageUp => Some(Command::HalfUp),
+                KeyCode::Home => Some(Command::First),
+                KeyCode::End => Some(Command::Last),
+                KeyCode::Char('G') => Some(Command::Last),
+                KeyCode::Char('e') => Some(Command::Edit),
+                KeyCode::Char('/') => Some(Command::OpenPreviewSearch),
+                KeyCode::Char('n') => Some(Command::PreviewSearchNext),
+                KeyCode::Char('N') => Some(Command::PreviewSearchPrev),
+                KeyCode::Char('g') => None,
+                _ => None,
+            };
+            if let Some(command) = command {
+                self.handle_command(command);
             }
             return;
         }
         if self.pending_y {
             let command = match key.code {
+                KeyCode::Char('y') => Some(Command::Copy),
                 KeyCode::Char('f') => Some(Command::CopyName),
                 KeyCode::Char('r') => Some(Command::CopyRelativePath),
                 KeyCode::Char('a') => Some(Command::CopyAbsolutePath),
@@ -362,11 +447,23 @@ impl App {
                 return;
             }
         }
-        self.pending_g = false;
-        self.pending_y = false;
+        if key.code == KeyCode::Char('y') && key.modifiers.is_empty() {
+            self.pending_y = true;
+            return;
+        }
+        if key.code == KeyCode::Char('g') && key.modifiers.is_empty() {
+            if self.pending_g {
+                self.pending_g = false;
+                self.handle_command(Command::First);
+            } else {
+                self.pending_g = true;
+            }
+            return;
+        }
         if let Some(command) = key_to_command(key) {
             self.handle_command(command);
         }
+        self.pending_g = false;
     }
 
     pub fn mode(&self) -> Mode {
@@ -420,6 +517,22 @@ impl App {
         &self.input
     }
 
+    pub fn preview_offset(&self) -> usize {
+        self.preview_offset
+    }
+
+    pub fn preview_search_query(&self) -> &str {
+        &self.preview_search_query
+    }
+
+    pub fn preview_matches(&self) -> &[usize] {
+        &self.preview_search_matches
+    }
+
+    pub fn preview_active_match(&self) -> Option<usize> {
+        self.preview_search_index
+    }
+
     pub fn last_clipboard_text(&self) -> Option<&str> {
         self.last_clipboard_text.as_deref()
     }
@@ -440,12 +553,14 @@ impl App {
                 self.retain_visible_selection();
                 self.cursor = self.cursor.min(self.entries.len().saturating_sub(1));
                 self.update_preview();
+                self.preview_offset = 0;
             }
             Err(err) => {
                 self.log(format!("error: {err}"));
                 self.entries.clear();
                 self.selected.clear();
                 self.update_preview();
+                self.preview_offset = 0;
             }
         }
     }
@@ -462,6 +577,152 @@ impl App {
             self.preview =
                 Preview::message(self.cwd.clone(), PreviewKind::Empty, "No file selected");
         }
+    }
+
+    fn scroll_preview(&mut self, delta: isize) {
+        if self.preview.lines.is_empty() {
+            self.preview_offset = 0;
+            return;
+        }
+        if delta.is_negative() {
+            self.preview_offset = self
+                .preview_offset
+                .saturating_sub(delta.unsigned_abs());
+        } else {
+            self.preview_offset = self
+                .preview_offset
+                .saturating_add(delta as usize)
+                .min(self.preview.lines.len().saturating_sub(1));
+        }
+    }
+
+    fn scroll_preview_to_top(&mut self) {
+        self.preview_offset = 0;
+        self.pending_g = false;
+    }
+
+    fn scroll_preview_to_bottom(&mut self) {
+        self.preview_offset = self.preview.lines.len().saturating_sub(1);
+        self.pending_g = false;
+    }
+
+    fn clear_preview_search(&mut self) {
+        self.preview_search_query.clear();
+        self.preview_search_matches.clear();
+        self.preview_search_index = None;
+        self.input.clear();
+    }
+
+    fn enter_preview_search(&mut self) {
+        if self.mode != Mode::Preview {
+            return;
+        }
+        self.input = self.preview_search_query.clone();
+        self.mode = Mode::PreviewSearch;
+    }
+
+    fn execute_preview_search(&mut self) {
+        let query = self.input.trim().to_string();
+        self.preview_search_query = query.clone();
+        self.input.clear();
+        self.mode = Mode::Preview;
+        if query.is_empty() {
+            self.preview_search_matches.clear();
+            self.preview_search_index = None;
+            return;
+        }
+
+        let lower_query = query.to_lowercase();
+        self.preview_search_matches = self
+            .preview
+            .lines
+            .iter()
+            .enumerate()
+            .filter_map(|(index, line)| {
+                if line.to_lowercase().contains(&lower_query) {
+                    Some(index)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if self.preview_search_matches.is_empty() {
+            self.preview_search_index = None;
+            self.log(format!("no match: {query}"));
+            return;
+        }
+        self.preview_search_index = Some(0);
+        self.preview_offset = self.preview_search_matches[0];
+        self.log(format!("search: {query}"));
+    }
+
+    fn preview_search_next(&mut self) {
+        if self.preview_search_matches.is_empty() {
+            return;
+        }
+        let next = match self.preview_search_index {
+            Some(current) => (current + 1) % self.preview_search_matches.len(),
+            None => 0,
+        };
+        self.preview_search_index = Some(next);
+        self.preview_offset = self.preview_search_matches[next];
+    }
+
+    fn preview_search_prev(&mut self) {
+        if self.preview_search_matches.is_empty() {
+            return;
+        }
+        let prev = match self.preview_search_index {
+            Some(current) if current > 0 => current - 1,
+            Some(_) => self.preview_search_matches.len().saturating_sub(1),
+            None => 0,
+        };
+        self.preview_search_index = Some(prev);
+        self.preview_offset = self.preview_search_matches[prev];
+    }
+
+    fn open_in_editor(&mut self) {
+        let Some(entry) = self.focused() else {
+            self.log("no file selected");
+            return;
+        };
+        if entry.kind == FileKind::Directory {
+            self.log("can only edit files");
+            return;
+        }
+        let path = entry.path.clone();
+        match self.launch_editor(&path) {
+            Ok(()) => {
+                self.log(format!("saved in nano: {}", path.display()));
+            }
+            Err(err) => {
+                self.log(format!("edit failed: {err}"));
+                return;
+            }
+        }
+        self.update_preview();
+        self.scroll_preview_to_top();
+    }
+
+    fn launch_editor(&self, path: &Path) -> Result<()> {
+        let mut stdout = io::stdout();
+        execute!(stdout, LeaveAlternateScreen)?;
+        disable_raw_mode()?;
+        let status = ProcessCommand::new("nano").arg(path).status();
+        let status = match status {
+            Ok(status) => status,
+            Err(err) => {
+                let _ = execute!(stdout, EnterAlternateScreen);
+                let _ = enable_raw_mode();
+                return Err(err.into());
+            }
+        };
+        execute!(stdout, EnterAlternateScreen)?;
+        enable_raw_mode()?;
+        if !status.success() {
+            return Err(anyhow::anyhow!("nano exited with {status}"));
+        }
+        Ok(())
     }
 
     fn move_cursor(&mut self, delta: isize) {
@@ -498,7 +759,10 @@ impl App {
                 self.cursor = 0;
                 self.reload();
             } else {
+                self.mode = Mode::Preview;
                 self.update_preview();
+                self.clear_preview_search();
+                self.preview_offset = 0;
             }
         }
     }
@@ -596,6 +860,7 @@ impl App {
                 self.mode = Mode::Normal;
                 self.reload();
             }
+            Mode::PreviewSearch => self.execute_preview_search(),
             Mode::Goto => self.submit_goto(),
             Mode::Rename => self.submit_rename(),
             Mode::CopyTo => self.copy_to_destination(false),
@@ -695,6 +960,7 @@ impl App {
         match self.mode {
             Mode::Filter
             | Mode::Goto
+            | Mode::PreviewSearch
             | Mode::Rename
             | Mode::CopyTo
             | Mode::MoveTo
@@ -714,6 +980,10 @@ impl App {
         match self.mode {
             Mode::Normal => {
                 self.selected.clear();
+                self.input.clear();
+            }
+            Mode::PreviewSearch => {
+                self.mode = Mode::Preview;
                 self.input.clear();
             }
             _ => {
@@ -850,6 +1120,7 @@ fn key_to_command(key: KeyEvent) -> Option<Command> {
         KeyCode::Char('d') => Some(Command::Trash),
         KeyCode::Char('D') => Some(Command::PermanentDelete),
         KeyCode::Char('r') => Some(Command::Refresh),
+        KeyCode::Char('e') => Some(Command::Edit),
         KeyCode::Char('?') => Some(Command::OpenHelp),
         KeyCode::Esc => Some(Command::Cancel),
         KeyCode::Char('q') => Some(Command::Quit),

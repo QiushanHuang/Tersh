@@ -8,7 +8,6 @@ use std::{
 
 const DETECT_LIMIT: usize = 64 * 1024;
 const PREVIEW_LIMIT: usize = 2 * 1024 * 1024;
-const MAX_LINES: usize = 20_000;
 const MAX_LINE_BYTES: usize = 4_096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,12 +116,9 @@ pub fn preview_file(path: &Path) -> Result<Preview> {
 
     let text = String::from_utf8_lossy(&bytes);
     let mut lines = Vec::new();
-    for (index, line) in text.lines().take(MAX_LINES).enumerate() {
+    for (index, line) in text.lines().enumerate() {
         let visible = truncate_line(line);
         lines.push(format!("{:>4}  {}", index + 1, escape_display(&visible)));
-    }
-    if text.lines().count() > MAX_LINES {
-        lines.push("[preview truncated at 20000 lines]".to_string());
     }
     if truncated {
         lines.push("[preview truncated at 2 MiB]".to_string());
