@@ -1,7 +1,7 @@
 # Tersh
 
-[![English](https://img.shields.io/badge/Language-English-0f172a?style=for-the-badge)](#english)
-[![简体中文](https://img.shields.io/badge/%E8%AF%AD%E8%A8%80-%E7%AE%80%E4%BD%93%E4%B8%AD%E6%96%87-334155?style=for-the-badge)](#zh-cn)
+[![简体中文](https://img.shields.io/badge/语言-简体中文-1677ff)](#中文)
+[![English](https://img.shields.io/badge/Language-English-24292f)](#english)
 
 [![Rust](https://img.shields.io/badge/Rust-2024-000000?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Terminal UI](https://img.shields.io/badge/TUI-ratatui-1f2937)](https://ratatui.rs/)
@@ -209,12 +209,12 @@ MIT
 
 ---
 
-<a id="zh-cn"></a>
+<a id="中文"></a>
 
 # Tersh
 
-[![English](https://img.shields.io/badge/Language-English-0f172a?style=for-the-badge)](#english)
-[![简体中文](https://img.shields.io/badge/%E8%AF%AD%E8%A8%80-%E7%AE%80%E4%BD%93%E4%B8%AD%E6%96%87-334155?style=for-the-badge)](#zh-cn)
+[![简体中文](https://img.shields.io/badge/语言-简体中文-1677ff)](#中文)
+[![English](https://img.shields.io/badge/Language-English-24292f)](#english)
 
 **Tersh** 是一个面向本地目录和 SSH shell 会话的轻量、移动端友好的终端文件工作台。
 
