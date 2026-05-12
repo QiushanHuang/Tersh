@@ -861,6 +861,7 @@ impl App {
                 self.reload();
             }
             Mode::PreviewSearch => self.execute_preview_search(),
+            Mode::Preview => {}
             Mode::Goto => self.submit_goto(),
             Mode::Rename => self.submit_rename(),
             Mode::CopyTo => self.copy_to_destination(false),
