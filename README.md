@@ -68,26 +68,47 @@ This matters when your working environment is:
 
 ## Installation
 
-### Cargo
+Product name: **Tersh**. CLI tool name and crate name: `tersh`.
+
+### Fastest GitHub Install
 
 ```bash
-cargo install --path .
+# macOS / Linux
+# Installs the tersh CLI from GitHub, then starts it in the current directory.
+set -eu
+
+if ! command -v cargo >/dev/null 2>&1; then
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+  . "$HOME/.cargo/env"
+fi
+
+export PATH="$HOME/.cargo/bin:$PATH"
+cargo install --git https://github.com/QiushanHuang/Tersh.git --bin tersh --force
+
+tersh --help
+tersh
 ```
 
-This installs the CLI tool as `tersh`.
+Run this same block on a remote server after SSH if you want to use Tersh there.
 
-### Install script
+### Download The Source
+
+Use this when you want the local source repository too:
 
 ```bash
+git clone https://github.com/QiushanHuang/Tersh.git
+cd Tersh
 ./scripts/install.sh
+tersh
 ```
 
-By default this installs `target/release/tersh` as `tersh` into a writable common directory on your `PATH`. Set `TERSH_INSTALL_DIR` to choose another install directory.
+The install script builds `target/release/tersh` and installs it as the `tersh` command. Set `TERSH_INSTALL_DIR` to choose another install directory.
 
-### Build locally
+### Local Development Build
 
 ```bash
 cargo build --release --bin tersh
+./target/release/tersh
 ```
 
 ## Quick Start
@@ -271,26 +292,47 @@ Tersh 不是 SSH 客户端，也不是多主机会话管理器。
 
 ## 安装
 
-### Cargo
+产品展示名：**Tersh**。CLI 命令名和 crate 名：`tersh`。
+
+### 最快 GitHub 安装
 
 ```bash
-cargo install --path .
+# macOS / Linux
+# 从 GitHub 安装 tersh CLI，然后直接在当前目录启动。
+set -eu
+
+if ! command -v cargo >/dev/null 2>&1; then
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+  . "$HOME/.cargo/env"
+fi
+
+export PATH="$HOME/.cargo/bin:$PATH"
+cargo install --git https://github.com/QiushanHuang/Tersh.git --bin tersh --force
+
+tersh --help
+tersh
 ```
 
-这会把 CLI 命令安装为 `tersh`。
+如果你已经 SSH 到服务器上，就在服务器终端里运行同一段命令；这样 `tersh` 会安装到服务器本地。
 
-### 安装脚本
+### 下载源码
+
+需要把源码仓库也下载到本地时，用这一段：
 
 ```bash
+git clone https://github.com/QiushanHuang/Tersh.git
+cd Tersh
 ./scripts/install.sh
+tersh
 ```
 
-默认会把 `target/release/tersh` 作为 `tersh` 安装到一个常见且可写的 `PATH` 目录。你也可以设置 `TERSH_INSTALL_DIR` 指定安装目录。
+安装脚本会构建 `target/release/tersh`，并把它安装成 `tersh` 命令。你也可以设置 `TERSH_INSTALL_DIR` 指定安装目录。
 
-### 本地构建
+### 本地开发构建
 
 ```bash
 cargo build --release --bin tersh
+./target/release/tersh
 ```
 
 ## 快速开始

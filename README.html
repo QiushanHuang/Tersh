@@ -197,16 +197,35 @@
 <li>Hidden file toggle</li>
 </ul>
 <h2 id="installation">Installation</h2>
-<h3 id="cargo">Cargo</h3>
-<pre><code class="language-bash">cargo install --path .
+<p>Product name: <strong>Tersh</strong>. CLI tool name and crate name: <code>tersh</code>.</p>
+<h3 id="fastest-github-install">Fastest GitHub Install</h3>
+<pre><code class="language-bash"># macOS / Linux
+# Installs the tersh CLI from GitHub, then starts it in the current directory.
+set -eu
+
+if ! command -v cargo &gt;/dev/null 2&gt;&amp;1; then
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+  . "$HOME/.cargo/env"
+fi
+
+export PATH="$HOME/.cargo/bin:$PATH"
+cargo install --git https://github.com/QiushanHuang/Tersh.git --bin tersh --force
+
+tersh --help
+tersh
 </code></pre>
-<p>This installs the CLI tool as <code>tersh</code>.</p>
-<h3 id="install-script">Install script</h3>
-<pre><code class="language-bash">./scripts/install.sh
+<p>Run this same block on a remote server after SSH if you want to use Tersh there.</p>
+<h3 id="download-the-source">Download The Source</h3>
+<p>Use this when you want the local source repository too:</p>
+<pre><code class="language-bash">git clone https://github.com/QiushanHuang/Tersh.git
+cd Tersh
+./scripts/install.sh
+tersh
 </code></pre>
-<p>By default this installs <code>target/release/tersh</code> as <code>tersh</code> into a writable common directory on your <code>PATH</code>. Set <code>TERSH_INSTALL_DIR</code> to choose another install directory.</p>
-<h3 id="build-locally">Build locally</h3>
+<p>The install script builds <code>target/release/tersh</code> and installs it as the <code>tersh</code> command. Set <code>TERSH_INSTALL_DIR</code> to choose another install directory.</p>
+<h3 id="local-development-build">Local Development Build</h3>
 <pre><code class="language-bash">cargo build --release --bin tersh
+./target/release/tersh
 </code></pre>
 <h2 id="quick-start">Quick Start</h2>
 <p>Run <code>tersh</code> in the current directory:</p>
@@ -359,16 +378,35 @@ tersh
 <li>隐藏文件开关</li>
 </ul>
 <h2 id="安装">安装</h2>
-<h3 id="cargo-1">Cargo</h3>
-<pre><code class="language-bash">cargo install --path .
+<p>产品展示名：<strong>Tersh</strong>。CLI 命令名和 crate 名：<code>tersh</code>。</p>
+<h3 id="最快-github-安装">最快 GitHub 安装</h3>
+<pre><code class="language-bash"># macOS / Linux
+# 从 GitHub 安装 tersh CLI，然后直接在当前目录启动。
+set -eu
+
+if ! command -v cargo &gt;/dev/null 2&gt;&amp;1; then
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+  . "$HOME/.cargo/env"
+fi
+
+export PATH="$HOME/.cargo/bin:$PATH"
+cargo install --git https://github.com/QiushanHuang/Tersh.git --bin tersh --force
+
+tersh --help
+tersh
 </code></pre>
-<p>这会把 CLI 命令安装为 <code>tersh</code>。</p>
-<h3 id="安装脚本">安装脚本</h3>
-<pre><code class="language-bash">./scripts/install.sh
+<p>如果你已经 SSH 到服务器上，就在服务器终端里运行同一段命令；这样 <code>tersh</code> 会安装到服务器本地。</p>
+<h3 id="下载源码">下载源码</h3>
+<p>需要把源码仓库也下载到本地时，用这一段：</p>
+<pre><code class="language-bash">git clone https://github.com/QiushanHuang/Tersh.git
+cd Tersh
+./scripts/install.sh
+tersh
 </code></pre>
-<p>默认会把 <code>target/release/tersh</code> 作为 <code>tersh</code> 安装到一个常见且可写的 <code>PATH</code> 目录。你也可以设置 <code>TERSH_INSTALL_DIR</code> 指定安装目录。</p>
-<h3 id="本地构建">本地构建</h3>
+<p>安装脚本会构建 <code>target/release/tersh</code>，并把它安装成 <code>tersh</code> 命令。你也可以设置 <code>TERSH_INSTALL_DIR</code> 指定安装目录。</p>
+<h3 id="本地开发构建">本地开发构建</h3>
 <pre><code class="language-bash">cargo build --release --bin tersh
+./target/release/tersh
 </code></pre>
 <h2 id="快速开始">快速开始</h2>
 <p>在当前目录启动 <code>tersh</code>：</p>
