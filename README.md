@@ -27,9 +27,11 @@ It is built for the moment when you are already inside a terminal, locally or af
 
 ## Local And SSH Shell Sessions
 
-Tersh is not an SSH client and it is not a multi-host session manager.
+The default Tersh file workbench is not an SSH client and is not a multi-host session manager.
 
 Its role is narrower and more practical: run the `tersh` CLI in any local directory, or connect to a server through your preferred SSH app and launch `tersh` there for remote file inspection and lightweight operations.
+
+For read-only multi-host health checks, `tersh --c` opens a separate cluster status TUI. It reads a JSON inventory, uses non-interactive SSH probes, and shows connection, CPU load, memory, storage, task count, GPU availability, and recent probe errors without installing an agent on remote hosts.
 
 That makes it a good fit for:
 
@@ -68,16 +70,17 @@ This matters when your working environment is:
 - Copy file name, relative path, and absolute path
 - Compact info pane and operation log
 - Hidden file toggle
+- `tersh --c` multi-server status dashboard for local, jump, and remote hosts
 
 ## Installation
 
 Product name: **Tersh**. CLI tool name and crate name: `tersh`.
 
-### Fastest GitHub Install
+### New Computer Install From GitHub
+
+Run this on a new macOS or Linux machine:
 
 ```bash
-# macOS / Linux
-# Installs the tersh CLI from GitHub, then starts it in the current directory.
 set -eu
 
 if ! command -v cargo >/dev/null 2>&1; then
@@ -92,9 +95,9 @@ tersh --help
 tersh
 ```
 
-Run this same block on a remote server after SSH if you want to use Tersh there.
+Run this same block on a remote server after SSH if you want `tersh --c` -> `t` to open the Tersh workbench on that remote host.
 
-### Download The Source
+### Clone And Install From Source
 
 Use this when you want the local source repository too:
 
@@ -127,6 +130,36 @@ Open a specific path:
 ```bash
 tersh /var/www
 ```
+
+Open the multi-server status dashboard:
+
+```bash
+tersh --c
+```
+
+Use a specific JSON inventory:
+
+```bash
+tersh --c --cluster-config /path/to/servers.json
+```
+
+The dashboard also checks `TERSH_SERVERS_JSON`, `./ssh/servers.json`, and `~/.config/tersh/servers.json`. The campus access layout from the companion runbook is supported: a local host, a Tailscale jump host, and campus servers reached through `ProxyJump`.
+
+Inside the dashboard, select a host and press `s` to leave the status screen temporarily and open a local shell or interactive `ssh` session. Press `t` to open the Tersh file workbench on that host instead; remote hosts use `ssh -t` so the remote TUI has a real terminal. When that shell or workbench exits, Tersh returns to the dashboard and refreshes the selected host.
+
+Inventory entries may set `workdir` (also accepted as `directory` or `tersh_dir`) to choose where `t` starts:
+
+```json
+{
+  "alias": "school-star",
+  "ssh_user": "star",
+  "campus_ip": "10.13.7.138",
+  "proxy_jump": "campus-mac",
+  "workdir": "/srv/app"
+}
+```
+
+Remote `t` mode requires `tersh` to be installed on the target host and available in that host's `PATH`.
 
 Typical remote flow:
 
@@ -281,9 +314,11 @@ MIT
 
 ## 本地与 SSH Shell 会话
 
-Tersh 不是 SSH 客户端，也不是多主机会话管理器。
+默认的 Tersh 文件工作台不是 SSH 客户端，也不是多主机会话管理器。
 
 它的角色更聚焦，也更实用：你可以在本地目录直接运行 `tersh`，也可以先通过自己习惯的 SSH 工具进入服务器，然后在服务器目录里启动 `tersh`，完成文件查阅和轻量操作。
+
+如果只是做只读的多主机健康检查，可以用 `tersh --c` 打开独立的集群状态 TUI。它读取 JSON 主机清单，使用非交互 SSH 探测，展示连接、CPU load、内存、存储、任务数量、GPU 可用性和最近探测错误，不需要在远端安装 agent。
 
 它适合这些工作：
 
@@ -322,16 +357,17 @@ Tersh 不是 SSH 客户端，也不是多主机会话管理器。
 - 复制文件名、相对路径和绝对路径
 - 紧凑的信息面板和操作日志
 - 隐藏文件开关
+- `tersh --c` 多服务器状态面板，可查看本机、跳板机和远端服务器
 
 ## 安装
 
 产品展示名：**Tersh**。CLI 命令名和 crate 名：`tersh`。
 
-### 最快 GitHub 安装
+### 新电脑从 GitHub 安装
+
+在新的 macOS 或 Linux 机器上运行：
 
 ```bash
-# macOS / Linux
-# 从 GitHub 安装 tersh CLI，然后直接在当前目录启动。
 set -eu
 
 if ! command -v cargo >/dev/null 2>&1; then
@@ -346,9 +382,9 @@ tersh --help
 tersh
 ```
 
-如果你已经 SSH 到服务器上，就在服务器终端里运行同一段命令；这样 `tersh` 会安装到服务器本地。
+如果你已经 SSH 到服务器上，就在服务器终端里运行同一段命令；这样 `tersh --c` -> `t` 才能在那台远端主机上打开 Tersh 文件工作台。
 
-### 下载源码
+### 克隆源码并安装
 
 需要把源码仓库也下载到本地时，用这一段：
 
@@ -381,6 +417,36 @@ tersh
 ```bash
 tersh /var/www
 ```
+
+打开多服务器状态面板：
+
+```bash
+tersh --c
+```
+
+指定 JSON 主机清单：
+
+```bash
+tersh --c --cluster-config /path/to/servers.json
+```
+
+状态面板也会检查 `TERSH_SERVERS_JSON`、`./ssh/servers.json` 和 `~/.config/tersh/servers.json`。之前运行指南里的校园网布局可以直接使用：本机、Tailscale 跳板机，以及通过 `ProxyJump` 访问的校园服务器。
+
+在状态面板里选中主机后按 `s`，会临时离开状态页并打开本地 shell 或交互式 `ssh` 会话。按 `t` 则是在这台主机上打开 Tersh 文件工作台；远端主机会使用 `ssh -t`，这样远端 TUI 有真实终端。退出 shell 或工作台后，Tersh 会回到状态面板并刷新当前主机。
+
+主机清单里可以设置 `workdir`（也兼容 `directory` 或 `tersh_dir`）来决定 `t` 从哪个目录启动：
+
+```json
+{
+  "alias": "school-star",
+  "ssh_user": "star",
+  "campus_ip": "10.13.7.138",
+  "proxy_jump": "campus-mac",
+  "workdir": "/srv/app"
+}
+```
+
+远端 `t` 模式要求目标主机已经安装 `tersh`，并且远端 `PATH` 中可以找到 `tersh`。
 
 典型远程使用方式：
 

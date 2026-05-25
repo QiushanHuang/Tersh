@@ -10,19 +10,37 @@ use std::path::PathBuf;
 )]
 struct Cli {
     #[arg(
+        long = "c",
+        conflicts_with = "print_cwd",
+        help = "Open the multi-server status manager instead of the file workbench"
+    )]
+    cluster_status: bool,
+
+    #[arg(
+        long,
+        value_name = "FILE",
+        requires = "cluster_status",
+        help = "Read multi-server status inventory from a JSON file"
+    )]
+    cluster_config: Option<PathBuf>,
+
+    #[arg(
         long,
         help = "Print the final directory after exit for shell cd wrappers"
     )]
     print_cwd: bool,
 
-    #[arg(default_value = ".")]
-    path: PathBuf,
+    #[arg(conflicts_with = "cluster_status")]
+    path: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if cli.cluster_status {
+        return tersh::cluster::run_with_config_path(cli.cluster_config.as_deref());
+    }
     tersh::app::run_with_options(
-        cli.path,
+        cli.path.unwrap_or_else(|| PathBuf::from(".")),
         tersh::app::RunOptions {
             print_cwd: cli.print_cwd,
         },
