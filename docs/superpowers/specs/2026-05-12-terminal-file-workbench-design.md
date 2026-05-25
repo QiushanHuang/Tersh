@@ -94,7 +94,7 @@ Minimum target:
 
 ## Keyboard Model
 
-Keyboard behavior should copy mature terminal products where possible: vim-like navigation, lazygit/ranger-style panels, predictable escape/cancel behavior, and obvious quit commands.
+Keyboard behavior should copy mature terminal products where possible: vim-like navigation, lazygit/ranger-style panels, predictable `Ctrl+G` cancel behavior, and obvious quit commands.
 
 Navigation:
 
@@ -107,7 +107,7 @@ Navigation:
 - `h` / `Backspace`: parent directory.
 - `l` / `Enter`: enter directory or open focused file in preview.
 - `/`: filter current directory.
-- `Esc`: close filter, close modal, clear transient state, or return focus to the list.
+- `Ctrl+G`: close filter, close modal, clear transient state, or return focus to the list.
 - `r`: refresh current directory.
 - `.`: toggle hidden files.
 
@@ -132,7 +132,7 @@ Exit and help:
 - `q`: quit when no modal/filter is open; otherwise closes the active modal/filter first.
 - `Q`: force quit after terminal state restoration, without running pending destructive actions.
 - `Ctrl+c`: emergency quit with terminal state restoration.
-- `Esc`: universal cancel/back action.
+- `Ctrl+G`: universal cancel/back action.
 - `?`: help overlay with keybindings and safety rules.
 
 No destructive modal may default to a destructive action on `Enter`. The default focused action is always `Cancel`, `Skip`, or another non-destructive choice.
@@ -277,7 +277,7 @@ Rendering tests:
 Terminal tests:
 
 - Raw mode and alternate screen restoration.
-- `q`, `Q`, `Esc`, and `Ctrl+c` behavior.
+- `q`, `Q`, `Ctrl+G`, and `Ctrl+c` behavior.
 - Resize handling.
 - Panic cleanup path.
 

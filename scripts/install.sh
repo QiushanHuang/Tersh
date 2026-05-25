@@ -38,6 +38,7 @@ cp "$project_dir/target/release/tersh" "$install_dir/tersh"
 chmod 755 "$install_dir/tersh"
 
 printf 'Installed Tersh CLI as %s/tersh\n' "$install_dir"
+printf 'Optional visual cd helper: source %s/scripts/tersh-cd.sh from your shell profile.\n' "$project_dir"
 
 case ":$PATH:" in
     *":$install_dir:"*) ;;

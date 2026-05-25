@@ -58,6 +58,7 @@ This matters when your working environment is:
 
 - Full-screen terminal file workbench
 - Directory navigation with keyboard-first controls
+- Optional shell wrapper for visual `cd` from the terminal
 - Inline file preview
 - Enter fullscreen preview for files with full-content scrolling/search/jump
 - Filter the current directory
@@ -135,11 +136,26 @@ cd /srv/app
 tersh
 ```
 
+Use Tersh as a visual `cd` by defining a shell function:
+
+```bash
+tersh-cd() {
+  local target_dir
+  target_dir="$(tersh --print-cwd "$@")" || return
+  [ -n "$target_dir" ] && cd -- "$target_dir"
+}
+alias tcd=tersh-cd
+```
+
+Then run `tcd`, browse from directory A to directory B, and quit. Your shell will return in directory B. This works through a shell wrapper because a child process cannot directly change its parent shell directory.
+
 ## Keybindings
 
 ### Navigation
 
 - `j` / `k` or arrow keys: move
+- `PageUp` / `PageDown`: move by page
+- `Home` / `End` or `gg` / `G`: jump to first / last item
 - `h`: parent directory
 - `l` or `Enter`: open
 - `/`: filter current directory
@@ -152,6 +168,7 @@ tersh
 - `Enter` on a file: open fullscreen preview
 - `j` / `k`: scroll preview by page
 - `↑` / `↓` / `Ctrl+F` / `Ctrl+B`: scroll preview line by line
+- `PageUp` / `PageDown`: scroll preview by page
 - `Home` or `gg`: jump to top
 - `End` or `G`: jump to bottom
 - `/`: find in preview
@@ -179,7 +196,7 @@ tersh
 ### Exit and Help
 
 - `?`: help
-- `Esc`: cancel
+- `Ctrl+G`: cancel
 - `q`: quit
 - `Q` or `Ctrl+C`: force quit
 
@@ -295,6 +312,7 @@ Tersh 不是 SSH 客户端，也不是多主机会话管理器。
 
 - 全屏终端文件工作台
 - 键盘优先的目录浏览
+- 可选 shell 包装函数，让 `tersh` 作为可视化 `cd` 使用
 - 文件内联预览
 - 回车进入全文预览，可快速滚动、跳转与查找
 - 当前目录筛选
@@ -372,11 +390,26 @@ cd /srv/app
 tersh
 ```
 
+把 Tersh 当作可视化 `cd` 使用时，先在 shell 里定义函数：
+
+```bash
+tersh-cd() {
+  local target_dir
+  target_dir="$(tersh --print-cwd "$@")" || return
+  [ -n "$target_dir" ] && cd -- "$target_dir"
+}
+alias tcd=tersh-cd
+```
+
+之后运行 `tcd`，从 A 目录浏览到 B 目录并退出，回到终端后当前目录就是 B。这里必须通过 shell 函数实现，因为子进程不能直接修改父 shell 的当前目录。
+
 ## 快捷键
 
 ### 导航
 
 - `j` / `k` 或方向键：移动
+- `PageUp` / `PageDown`：按页移动
+- `Home` / `End` 或 `gg` / `G`：跳到第一项 / 最后一项
 - `h`：返回上级目录
 - `l` 或 `Enter`：打开
 - `/`：筛选当前目录
@@ -389,6 +422,7 @@ tersh
 - `Enter`：对当前文件进入全文预览
 - `j` / `k`：按页滚动
 - `↑` / `↓` / `Ctrl+F` / `Ctrl+B`：按行上下滚动
+- `PageUp` / `PageDown`：按页滚动
 - `Home` 或 `gg`：跳到顶部
 - `End` 或 `G`：跳到底部
 - `/`：在预览中查找
@@ -416,7 +450,7 @@ tersh
 ### 退出与帮助
 
 - `?`：帮助
-- `Esc`：取消
+- `Ctrl+G`：取消
 - `q`：退出
 - `Q` 或 `Ctrl+C`：强制退出
 

@@ -188,6 +188,7 @@
 <ul>
 <li>Full-screen terminal file workbench</li>
 <li>Directory navigation with keyboard-first controls</li>
+<li>Optional shell wrapper for visual <code>cd</code> from the terminal</li>
 <li>Inline file preview</li>
 <li>Filter the current directory</li>
 <li>Copy, cut, paste, rename, and move workflows</li>
@@ -239,10 +240,21 @@ tersh
 <span class="hljs-built_in">cd</span> /srv/app
 tersh
 </code></pre>
+<p>Use Tersh as a visual <code>cd</code> by defining a shell function:</p>
+<pre><code class="language-bash">tersh-cd() {
+  local target_dir
+  target_dir="$(tersh --print-cwd "$@")" || return
+  [ -n "$target_dir" ] &amp;&amp; cd -- "$target_dir"
+}
+alias tcd=tersh-cd
+</code></pre>
+<p>Then run <code>tcd</code>, browse from directory A to directory B, and quit. Your shell will return in directory B. This works through a shell wrapper because a child process cannot directly change its parent shell directory.</p>
 <h2 id="keybindings">Keybindings</h2>
 <h3 id="navigation">Navigation</h3>
 <ul>
 <li><code>j</code> / <code>k</code> or arrow keys: move</li>
+<li><code>PageUp</code> / <code>PageDown</code>: move by page</li>
+<li><code>Home</code> / <code>End</code> or <code>gg</code> / <code>G</code>: jump to first / last item</li>
 <li><code>h</code>: parent directory</li>
 <li><code>l</code> or <code>Enter</code>: open</li>
 <li><code>/</code>: filter current directory</li>
@@ -271,7 +283,7 @@ tersh
 <h3 id="exit-and-help">Exit and Help</h3>
 <ul>
 <li><code>?</code>: help</li>
-<li><code>Esc</code>: cancel</li>
+<li><code>Ctrl+G</code>: cancel</li>
 <li><code>q</code>: quit</li>
 <li><code>Q</code> or <code>Ctrl+C</code>: force quit</li>
 </ul>
@@ -369,6 +381,7 @@ tersh
 <ul>
 <li>全屏终端文件工作台</li>
 <li>键盘优先的目录浏览</li>
+<li>可选 shell 包装函数，让 <code>tersh</code> 作为可视化 <code>cd</code> 使用</li>
 <li>文件内联预览</li>
 <li>当前目录筛选</li>
 <li>复制、剪切、粘贴、重命名与移动</li>
@@ -420,10 +433,21 @@ tersh
 <span class="hljs-built_in">cd</span> /srv/app
 tersh
 </code></pre>
+<p>把 Tersh 当作可视化 <code>cd</code> 使用时，先在 shell 里定义函数：</p>
+<pre><code class="language-bash">tersh-cd() {
+  local target_dir
+  target_dir="$(tersh --print-cwd "$@")" || return
+  [ -n "$target_dir" ] &amp;&amp; cd -- "$target_dir"
+}
+alias tcd=tersh-cd
+</code></pre>
+<p>之后运行 <code>tcd</code>，从 A 目录浏览到 B 目录并退出，回到终端后当前目录就是 B。这里必须通过 shell 函数实现，因为子进程不能直接修改父 shell 的当前目录。</p>
 <h2 id="快捷键">快捷键</h2>
 <h3 id="导航">导航</h3>
 <ul>
 <li><code>j</code> / <code>k</code> 或方向键：移动</li>
+<li><code>PageUp</code> / <code>PageDown</code>：按页移动</li>
+<li><code>Home</code> / <code>End</code> 或 <code>gg</code> / <code>G</code>：跳到第一项 / 最后一项</li>
 <li><code>h</code>：返回上级目录</li>
 <li><code>l</code> 或 <code>Enter</code>：打开</li>
 <li><code>/</code>：筛选当前目录</li>
@@ -452,7 +476,7 @@ tersh
 <h3 id="退出与帮助">退出与帮助</h3>
 <ul>
 <li><code>?</code>：帮助</li>
-<li><code>Esc</code>：取消</li>
+<li><code>Ctrl+G</code>：取消</li>
 <li><code>q</code>：退出</li>
 <li><code>Q</code> 或 <code>Ctrl+C</code>：强制退出</li>
 </ul>

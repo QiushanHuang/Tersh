@@ -234,7 +234,7 @@ Expected: pass.
 use tersh::app::{App, Command, Mode};
 
 #[test]
-fn escape_closes_filter_before_quitting() {
+fn ctrl_g_closes_filter_before_quitting() {
     let mut app = App::for_test();
     app.apply(Command::OpenFilter);
     app.apply(Command::Cancel);
@@ -261,7 +261,7 @@ Expected: fail because app API does not exist.
 
 - [ ] **Step 3: Implement state and commands**
 
-Implement `App`, `Mode`, `Command`, directory loading, selection, copy buffer, log messages, command dispatch, and key-to-command mapping for `q`, `Q`, `Esc`, `Ctrl+c`, `?`, `j/k/h/l`, `Space`, `y`, `p`, `d`, `D`, `/`, `.`, and `r`.
+Implement `App`, `Mode`, `Command`, directory loading, selection, copy buffer, log messages, command dispatch, and key-to-command mapping for `q`, `Q`, `Ctrl+G`, `Ctrl+c`, `?`, `j/k/h/l`, `Space`, `y`, `p`, `d`, `D`, `/`, `.`, and `r`.
 
 - [ ] **Step 4: Verify green**
 

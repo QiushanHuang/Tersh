@@ -79,7 +79,18 @@ fn draw_files(frame: &mut Frame, area: Rect, app: &App) {
     if !app.filter().is_empty() {
         lines.push(Line::from(format!("filter: {}", app.filter())));
     }
-    for (index, entry) in app.entries().iter().enumerate() {
+    let entry_capacity = area
+        .height
+        .saturating_sub(2)
+        .saturating_sub(lines.len() as u16) as usize;
+    let visible_start = visible_entry_start(app.cursor(), app.entries().len(), entry_capacity);
+    for (index, entry) in app
+        .entries()
+        .iter()
+        .enumerate()
+        .skip(visible_start)
+        .take(entry_capacity)
+    {
         let cursor = if index == app.cursor() { ">" } else { " " };
         let mark = if app.is_selected(&entry.path) {
             "*"
@@ -110,9 +121,17 @@ fn draw_files(frame: &mut Frame, area: Rect, app: &App) {
             lines.push(Line::from(row));
         }
     }
-    let paragraph = Paragraph::new(lines)
-        .block(Block::default().title("Files").borders(Borders::ALL))
-        .wrap(Wrap { trim: false });
+    let title = if app.entries().is_empty() {
+        "Files".to_string()
+    } else {
+        format!(
+            "Files {}/{}",
+            app.cursor().saturating_add(1),
+            app.entries().len()
+        )
+    };
+    let paragraph =
+        Paragraph::new(lines).block(Block::default().title(title).borders(Borders::ALL));
     frame.render_widget(paragraph, area);
 }
 
@@ -120,9 +139,7 @@ fn draw_fullscreen_preview(frame: &mut Frame, area: Rect, app: &App) {
     let lines = app.preview().lines.iter().collect::<Vec<_>>();
     let total_lines = lines.len();
     let view_lines = area.height.saturating_sub(4) as usize;
-    let offset = app
-        .preview_offset()
-        .min(total_lines.saturating_sub(1));
+    let offset = app.preview_offset().min(total_lines.saturating_sub(1));
     let query = app.preview_search_query().to_lowercase();
     let matches = app.preview_matches();
     let active_match = app.preview_active_match();
@@ -133,11 +150,10 @@ fn draw_fullscreen_preview(frame: &mut Frame, area: Rect, app: &App) {
 
     let mut rendered = Vec::new();
     rendered.push(Line::from(Span::styled(
-        app.preview()
-            .path
-            .display()
-            .to_string(),
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        app.preview().path.display().to_string(),
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
     )));
     rendered.push(Line::from(format!(
         "offset: {} / {} | search: {}",
@@ -145,18 +161,15 @@ fn draw_fullscreen_preview(frame: &mut Frame, area: Rect, app: &App) {
         total_lines,
         app.preview_search_query(),
     )));
-    for (index, line) in lines
-        .iter()
-        .enumerate()
-        .skip(offset)
-        .take(view_lines)
-    {
+    for (index, line) in lines.iter().enumerate().skip(offset).take(view_lines) {
         let mut style = Style::default();
         if !query.is_empty() && line.to_lowercase().contains(&query) {
             style = style.fg(Color::Black).bg(Color::Yellow);
         }
         if index == active_line {
-            style = style.add_modifier(Modifier::UNDERLINED).add_modifier(Modifier::BOLD);
+            style = style
+                .add_modifier(Modifier::UNDERLINED)
+                .add_modifier(Modifier::BOLD);
         }
         rendered.push(Line::from(Span::styled(line.as_str(), style)));
     }
@@ -216,11 +229,11 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     let mode = format!("{:?}", app.mode()).to_lowercase();
     let text = match app.mode() {
         Mode::Preview | Mode::PreviewSearch => {
-            "preview | j/k/↑/↓ scroll  g/g top  G bottom  / search  n/N next/prev  e edit  q/esc close".to_string()
+            "preview | j/k/↑/↓ scroll  PgUp/PgDn  gg top  G bottom  / search  n/N  e edit  q/^G close".to_string()
         }
         _ => {
             format!(
-                "{mode} | q quit | Esc | ^C | ? | : goto | / filter | yy/yf/yr/ya | x/p | c/m | d/D | e edit"
+                "{mode} | q quit | ^G cancel | ^C force | ? | PgUp/PgDn | : goto | / filter | yy/yf/yr/ya | x/p | c/m | d/D | e edit"
             )
         }
     };
@@ -234,7 +247,8 @@ fn draw_help(frame: &mut Frame, area: Rect) {
     frame.render_widget(Clear, area);
     let lines = vec![
         Line::from("Navigation"),
-        Line::from("  j/k or arrows: move    h: parent    l: open directory"),
+        Line::from("  j/k or arrows: move    PageUp/PageDown: page    Home/End: first/last"),
+        Line::from("  h: parent    l: open directory"),
         Line::from("  Enter on file: fullscreen preview"),
         Line::from("  /: filter    .: hidden    r: refresh"),
         Line::from(""),
@@ -247,11 +261,11 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("  d: trash, then type trash    D: delete, then type delete"),
         Line::from(""),
         Line::from("Preview mode"),
-        Line::from("  j/k/↑/↓: scroll    gg: top    G: bottom"),
+        Line::from("  j/k/↑/↓: scroll    PageUp/PageDown: page    gg: top    G: bottom"),
         Line::from("  /: search    n/N: next/prev match"),
         Line::from(""),
         Line::from("Exit"),
-        Line::from("  q: quit/close    Q: force quit    Esc: cancel    Ctrl+C: exit"),
+        Line::from("  q: quit/close    Ctrl+G: cancel    Q/Ctrl+C: force quit"),
     ];
     let paragraph = Paragraph::new(lines)
         .block(Block::default().title("Help").borders(Borders::ALL))
@@ -267,8 +281,8 @@ fn draw_input_modal(frame: &mut Frame, area: Rect, app: &App) {
         Mode::Rename => "Rename focused item",
         Mode::CopyTo => "Copy selected/focused item(s) to directory",
         Mode::MoveTo => "Move selected/focused item(s) to directory",
-        Mode::ConfirmTrash => "Type trash then Enter. Esc cancels.",
-        Mode::ConfirmDelete => "Permanent delete: type delete then Enter. Esc cancels.",
+        Mode::ConfirmTrash => "Type trash then Enter. Ctrl+G cancels.",
+        Mode::ConfirmDelete => "Permanent delete: type delete then Enter. Ctrl+G cancels.",
         Mode::PreviewSearch => "Find in preview",
         _ => "",
     };
@@ -281,6 +295,16 @@ fn draw_input_modal(frame: &mut Frame, area: Rect, app: &App) {
         .block(Block::default().title("Command").borders(Borders::ALL))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
+}
+
+fn visible_entry_start(cursor: usize, total_entries: usize, entry_capacity: usize) -> usize {
+    if entry_capacity == 0 || total_entries <= entry_capacity {
+        return 0;
+    }
+    cursor
+        .saturating_add(1)
+        .saturating_sub(entry_capacity)
+        .min(total_entries.saturating_sub(entry_capacity))
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {

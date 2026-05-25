@@ -15,9 +15,9 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{
     collections::BTreeSet,
-    io,
-    process::Command as ProcessCommand,
+    io::{self, Write},
     path::{Path, PathBuf},
+    process::Command as ProcessCommand,
     time::Duration,
 };
 
@@ -101,6 +101,11 @@ pub struct App {
     pending_y: bool,
     clipboard_text: Option<String>,
     last_clipboard_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RunOptions {
+    pub print_cwd: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -355,6 +360,10 @@ impl App {
             self.handle_command(Command::ForceQuit);
             return;
         }
+        if is_cancel_key(key) {
+            self.handle_command(Command::Cancel);
+            return;
+        }
         if matches!(
             self.mode,
             Mode::Filter
@@ -366,7 +375,6 @@ impl App {
                 | Mode::ConfirmDelete
         ) {
             let command = match key.code {
-                KeyCode::Esc => Some(Command::Cancel),
                 KeyCode::Enter => Some(Command::Submit),
                 KeyCode::Backspace => Some(Command::Backspace),
                 KeyCode::Char(ch) => Some(Command::Input(ch)),
@@ -379,7 +387,6 @@ impl App {
         }
         if self.mode == Mode::PreviewSearch {
             let command = match key.code {
-                KeyCode::Esc => Some(Command::Cancel),
                 KeyCode::Enter => Some(Command::Submit),
                 KeyCode::Backspace => Some(Command::Backspace),
                 KeyCode::Char(ch) => Some(Command::Input(ch)),
@@ -392,7 +399,7 @@ impl App {
         }
         if self.mode == Mode::Help {
             match key.code {
-                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('?') => {
+                KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('?') => {
                     self.handle_command(Command::Cancel)
                 }
                 _ => {}
@@ -413,7 +420,7 @@ impl App {
                 self.pending_g = false;
             }
             let command = match key.code {
-                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => Some(Command::Cancel),
+                KeyCode::Enter | KeyCode::Char('q') => Some(Command::Cancel),
                 KeyCode::Char('j') | KeyCode::Down => Some(Command::HalfDown),
                 KeyCode::Char('k') | KeyCode::Up => Some(Command::HalfUp),
                 KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -590,9 +597,7 @@ impl App {
             return;
         }
         if delta.is_negative() {
-            self.preview_offset = self
-                .preview_offset
-                .saturating_sub(delta.unsigned_abs());
+            self.preview_offset = self.preview_offset.saturating_sub(delta.unsigned_abs());
         } else {
             self.preview_offset = self
                 .preview_offset
@@ -1076,9 +1081,25 @@ impl App {
 }
 
 pub fn run(path: PathBuf) -> Result<()> {
-    let _guard = TerminalGuard::enter()?;
-    let stdout = io::stdout();
-    let backend = CrosstermBackend::new(stdout);
+    run_with_options(path, RunOptions::default())
+}
+
+pub fn run_with_options(path: PathBuf, options: RunOptions) -> Result<()> {
+    let output = if options.print_cwd {
+        TerminalOutput::Stderr
+    } else {
+        TerminalOutput::Stdout
+    };
+    let final_cwd = run_tui(path, output)?;
+    if options.print_cwd {
+        println!("{}", final_cwd.display());
+    }
+    Ok(())
+}
+
+fn run_tui(path: PathBuf, output: TerminalOutput) -> Result<PathBuf> {
+    let _guard = TerminalGuard::enter(output)?;
+    let backend = CrosstermBackend::new(output.writer());
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
     let mut app = App::new(path)?;
@@ -1089,18 +1110,19 @@ pub fn run(path: PathBuf) -> Result<()> {
             if let Event::Key(key) = event::read()? {
                 app.handle_key(key);
                 if let Some(text) = app.take_clipboard_text() {
-                    crate::clipboard::write_clipboard(&mut io::stdout(), &text)?;
+                    crate::clipboard::write_clipboard(&mut output.writer(), &text)?;
                 }
             }
         }
     }
-    Ok(())
+    Ok(app.cwd().to_path_buf())
 }
 
 fn key_to_command(key: KeyEvent) -> Option<Command> {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return match key.code {
             KeyCode::Char('c') => Some(Command::ForceQuit),
+            KeyCode::Char('g') => Some(Command::Cancel),
             KeyCode::Char('d') => Some(Command::HalfDown),
             KeyCode::Char('u') => Some(Command::HalfUp),
             _ => None,
@@ -1109,6 +1131,10 @@ fn key_to_command(key: KeyEvent) -> Option<Command> {
     match key.code {
         KeyCode::Char('j') | KeyCode::Down => Some(Command::Down),
         KeyCode::Char('k') | KeyCode::Up => Some(Command::Up),
+        KeyCode::PageDown => Some(Command::HalfDown),
+        KeyCode::PageUp => Some(Command::HalfUp),
+        KeyCode::Home => Some(Command::First),
+        KeyCode::End => Some(Command::Last),
         KeyCode::Char('G') => Some(Command::Last),
         KeyCode::Char('h') | KeyCode::Backspace => Some(Command::Parent),
         KeyCode::Char('l') | KeyCode::Enter => Some(Command::Open),
@@ -1128,7 +1154,6 @@ fn key_to_command(key: KeyEvent) -> Option<Command> {
         KeyCode::Char('r') => Some(Command::Refresh),
         KeyCode::Char('e') => Some(Command::Edit),
         KeyCode::Char('?') => Some(Command::OpenHelp),
-        KeyCode::Esc => Some(Command::Cancel),
         KeyCode::Char('q') => Some(Command::Quit),
         KeyCode::Char('Q') => Some(Command::ForceQuit),
         KeyCode::Char(ch) => Some(Command::Input(ch)),
@@ -1150,22 +1175,44 @@ fn expand_path(input: &str) -> PathBuf {
     PathBuf::from(input)
 }
 
-struct TerminalGuard;
+fn is_cancel_key(key: KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('g') | KeyCode::Char('G'))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TerminalOutput {
+    Stdout,
+    Stderr,
+}
+
+impl TerminalOutput {
+    fn writer(self) -> Box<dyn Write> {
+        match self {
+            Self::Stdout => Box::new(io::stdout()),
+            Self::Stderr => Box::new(io::stderr()),
+        }
+    }
+}
+
+struct TerminalGuard {
+    output: TerminalOutput,
+}
 
 impl TerminalGuard {
-    fn enter() -> Result<Self> {
+    fn enter(output: TerminalOutput) -> Result<Self> {
         enable_raw_mode()?;
-        if let Err(err) = execute!(io::stdout(), EnterAlternateScreen) {
+        if let Err(err) = execute!(output.writer(), EnterAlternateScreen) {
             let _ = disable_raw_mode();
             return Err(err.into());
         }
-        Ok(Self)
+        Ok(Self { output })
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(self.output.writer(), LeaveAlternateScreen);
     }
 }

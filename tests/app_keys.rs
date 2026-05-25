@@ -2,14 +2,24 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tersh::app::{App, Command, Mode};
 
 #[test]
-fn escape_closes_filter_before_quitting() {
+fn ctrl_g_closes_filter_before_quitting() {
     let mut app = App::for_test();
 
     app.apply(Command::OpenFilter);
-    app.apply(Command::Cancel);
+    app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
 
     assert_eq!(app.mode(), Mode::Normal);
     assert!(!app.should_quit());
+}
+
+#[test]
+fn escape_does_not_cancel_filter_mode() {
+    let mut app = App::for_test();
+
+    app.apply(Command::OpenFilter);
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+    assert_eq!(app.mode(), Mode::Filter);
 }
 
 #[test]
@@ -91,6 +101,36 @@ fn gg_requires_two_g_keypresses_to_jump_to_first_item() {
     assert_eq!(app.cursor(), 1);
 
     app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+    assert_eq!(app.cursor(), 0);
+}
+
+#[test]
+fn page_keys_move_directory_cursor_by_page() {
+    let dir = tempfile::tempdir().unwrap();
+    for index in 0..25 {
+        std::fs::write(dir.path().join(format!("item-{index:02}.txt")), "x").unwrap();
+    }
+    let mut app = App::new(dir.path().to_path_buf()).unwrap();
+
+    app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+    assert_eq!(app.cursor(), 10);
+
+    app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+    assert_eq!(app.cursor(), 0);
+}
+
+#[test]
+fn home_and_end_keys_jump_directory_cursor_to_edges() {
+    let dir = tempfile::tempdir().unwrap();
+    for index in 0..5 {
+        std::fs::write(dir.path().join(format!("item-{index:02}.txt")), "x").unwrap();
+    }
+    let mut app = App::new(dir.path().to_path_buf()).unwrap();
+
+    app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+    assert_eq!(app.cursor(), 4);
+
+    app.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
     assert_eq!(app.cursor(), 0);
 }
 
