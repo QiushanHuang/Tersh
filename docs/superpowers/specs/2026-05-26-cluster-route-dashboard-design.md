@@ -94,7 +94,7 @@ Resource bars should be derived at render time from existing `ProbeReport` strin
 
 Initial bar rules:
 
-- Memory: parse the first percentage token, e.g. `512/1024 MB (50%)`.
+- Memory: parse the first percentage token, e.g. `512/1024 MB (50%)`. If the string describes free memory, e.g. `42% free`, invert it for the bar and label the bar as used while preserving the raw text.
 - Storage: parse the first percentage token, e.g. `8G/20G 40% used`.
 - GPU: if the string is `none`, show an empty neutral bar; otherwise parse the first percentage if present and show the raw string.
 - CPU load: show the raw load average text only. Do not convert it to a utilization bar without probing CPU core count and utilization.

@@ -40,6 +40,19 @@ const CAMPUS_JSON: &str = r#"
 }
 "#;
 
+const DIRECT_JSON: &str = r#"
+{
+  "servers": [
+    {
+      "alias": "direct-box",
+      "ssh_user": "ops",
+      "campus_ip": "203.0.113.10",
+      "role": "Direct remote server"
+    }
+  ]
+}
+"#;
+
 #[test]
 fn inventory_parses_campus_access_json_into_monitorable_hosts() {
     let inventory = ClusterInventory::from_json(CAMPUS_JSON).unwrap();
@@ -335,15 +348,180 @@ fn cluster_render_shows_host_list_detail_metrics_and_footer_keys() {
         .map(|cell| cell.symbol())
         .collect::<String>();
     assert!(buffer.contains("Cluster Status"));
+    assert!(buffer.contains("Route"));
+    assert!(buffer.contains("LOCAL"));
+    assert!(buffer.contains("JUMP"));
+    assert!(buffer.contains("SERVER"));
+    assert!(buffer.contains("ssh -J"));
+    assert!(buffer.contains("joshua@100.90.116.54"));
     assert!(buffer.contains("school-star"));
     assert!(buffer.contains("CPU load"));
+    assert!(buffer.contains("CPU load: 0.12 0.20 0.30"));
+    assert!(!buffer.contains("CPU load: ["));
     assert!(buffer.contains("Memory"));
+    assert!(buffer.contains("Memory: ["));
+    assert!(buffer.contains("512/1024 MB (50%)"));
     assert!(buffer.contains("Storage"));
+    assert!(buffer.contains("Storage: ["));
+    assert!(buffer.contains("8G/20G 40% used"));
     assert!(buffer.contains("Tasks"));
+    assert!(buffer.contains("GPU: ["));
+    assert!(buffer.contains("Log"));
     assert!(buffer.contains("r refresh"));
     assert!(buffer.contains("s shell/ssh"));
     assert!(buffer.contains("t tersh"));
     assert!(buffer.contains("q quit"));
+}
+
+#[test]
+fn cluster_render_local_host_shows_local_only_route() {
+    let inventory = ClusterInventory::from_json(CAMPUS_JSON).unwrap();
+    let app = ClusterApp::new(inventory.hosts().to_vec());
+
+    let backend = TestBackend::new(120, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| cluster_ui::draw(frame, &app))
+        .unwrap();
+
+    let buffer = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(buffer.contains("Route"));
+    assert!(buffer.contains("LOCAL ONLY"));
+    assert!(buffer.contains("qiushan-mbp"));
+    assert!(!buffer.contains("ssh -J"));
+}
+
+#[test]
+fn cluster_render_direct_server_route_has_no_jump_hop() {
+    let inventory = ClusterInventory::from_json(DIRECT_JSON).unwrap();
+    let app = ClusterApp::new(inventory.hosts().to_vec());
+
+    let backend = TestBackend::new(120, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| cluster_ui::draw(frame, &app))
+        .unwrap();
+
+    let buffer = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(buffer.contains("Route"));
+    assert!(buffer.contains("LOCAL"));
+    assert!(buffer.contains("SERVER"));
+    assert!(buffer.contains("ssh ops@203.0.113.10"));
+    assert!(!buffer.contains("JUMP"));
+    assert!(!buffer.contains("ssh -J"));
+}
+
+#[test]
+fn cluster_render_medium_boundary_keeps_route_and_metrics_visible() {
+    let inventory = ClusterInventory::from_json(CAMPUS_JSON).unwrap();
+    let mut app = ClusterApp::new(inventory.hosts().to_vec());
+    app.apply(ClusterCommand::Down);
+    app.apply(ClusterCommand::Down);
+    app.apply_snapshot(HostSnapshot::online(
+        "school-star",
+        ProbeReport::parse(
+            "hostname=starbox\nload=0.12 0.20 0.30\nmemory=512/1024 MB (50%)\nstorage=8G/20G 40% used\ntasks=72 processes\ngpu=none\n",
+        ),
+        87,
+    ));
+
+    let backend = TestBackend::new(72, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| cluster_ui::draw(frame, &app))
+        .unwrap();
+
+    let buffer = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(buffer.contains("Hosts"));
+    assert!(buffer.contains("Route"));
+    assert!(buffer.contains("LOCAL"));
+    assert!(buffer.contains("JUMP"));
+    assert!(buffer.contains("SERVER"));
+    assert!(buffer.contains("Memory"));
+    assert!(buffer.contains("Storage"));
+    assert!(buffer.contains("Log:"));
+    assert!(buffer.contains("r refresh"));
+}
+
+#[test]
+fn cluster_render_resource_bars_keep_none_gpu_neutral_and_parse_free_memory() {
+    let inventory = ClusterInventory::from_json(DIRECT_JSON).unwrap();
+    let mut app = ClusterApp::new(inventory.hosts().to_vec());
+    app.apply_snapshot(HostSnapshot::online(
+        "direct-box",
+        ProbeReport::parse(
+            "hostname=direct\nload=0.12 0.20 0.30\nmemory=42% free\nstorage=8G/20G 40% used\ntasks=72 processes\ngpu=none\n",
+        ),
+        42,
+    ));
+
+    let backend = TestBackend::new(120, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| cluster_ui::draw(frame, &app))
+        .unwrap();
+
+    let buffer = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(buffer.contains("Memory: [######----]  58% used  42% free"));
+    assert!(buffer.contains("GPU: [----------]  --  none"));
+}
+
+#[test]
+fn cluster_render_narrow_normal_mode_keeps_host_list_primary() {
+    let inventory = ClusterInventory::from_json(CAMPUS_JSON).unwrap();
+    let mut app = ClusterApp::new(inventory.hosts().to_vec());
+    app.apply(ClusterCommand::Down);
+    app.apply(ClusterCommand::Down);
+    app.apply_snapshot(HostSnapshot::online(
+        "school-star",
+        ProbeReport::parse(
+            "hostname=starbox\nload=0.12 0.20 0.30\nmemory=512/1024 MB (50%)\nstorage=8G/20G 40% used\ntasks=72 processes\ngpu=none\n",
+        ),
+        87,
+    ));
+
+    let backend = TestBackend::new(71, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| cluster_ui::draw(frame, &app))
+        .unwrap();
+
+    let buffer = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(buffer.contains("Hosts"));
+    assert!(buffer.contains("school-star"));
+    assert!(!buffer.contains("Route"));
+    assert!(!buffer.contains("Memory: ["));
+    assert!(buffer.contains("r refresh"));
 }
 
 #[test]
@@ -374,6 +552,10 @@ fn cluster_render_narrow_detail_mode_shows_metrics() {
         .iter()
         .map(|cell| cell.symbol())
         .collect::<String>();
+    assert!(buffer.contains("Route"));
+    assert!(buffer.contains("LOCAL"));
+    assert!(buffer.contains("JUMP"));
+    assert!(buffer.contains("SERVER"));
     assert!(buffer.contains("CPU load"));
     assert!(buffer.contains("Memory"));
     assert!(buffer.contains("Storage"));
