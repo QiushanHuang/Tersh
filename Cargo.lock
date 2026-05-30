@@ -714,12 +714,13 @@ dependencies = [
 
 [[package]]
 name = "tersh"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "base64",
  "clap",
  "crossterm",
+ "libc",
  "ratatui",
  "serde",
  "serde_json",

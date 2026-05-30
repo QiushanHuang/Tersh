@@ -1,4 +1,6 @@
-use tersh::fs_ops::{DeleteDecision, copy_path, rename_path, trash_path, validate_file_name};
+use tersh::fs_ops::{
+    DeleteDecision, copy_path, permanent_delete, rename_path, trash_path, validate_file_name,
+};
 
 #[test]
 fn copies_symlink_as_symlink() {
@@ -33,6 +35,128 @@ fn trash_moves_file_into_tersh_trash() {
     assert!(matches!(decision, DeleteDecision::MovedToTrash { .. }));
     assert!(!file.exists());
     assert!(dir.path().join(".tersh-trash").exists());
+}
+
+#[test]
+fn delete_rejects_canonical_work_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let nested = dir.path().join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    let alias = nested.join("..");
+
+    let err = permanent_delete(&alias, dir.path()).unwrap_err();
+
+    assert!(err.to_string().contains("work root"));
+    assert!(dir.path().exists());
+}
+
+#[test]
+fn trash_rejects_canonical_work_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let nested = dir.path().join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    let alias = nested.join("..");
+
+    let err = trash_path(&alias, dir.path()).unwrap_err();
+
+    assert!(err.to_string().contains("work root"));
+    assert!(dir.path().exists());
+}
+
+#[test]
+fn delete_rejects_root_and_relative_paths() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let root_err = permanent_delete(std::path::Path::new("/"), dir.path()).unwrap_err();
+    let relative_err = permanent_delete(std::path::Path::new("relative"), dir.path()).unwrap_err();
+
+    assert!(root_err.to_string().contains("filesystem root"));
+    assert!(relative_err.to_string().contains("non-absolute"));
+}
+
+#[test]
+fn delete_and_trash_reject_home_directory_when_home_is_available() {
+    let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+        return;
+    };
+    let Ok(home) = home.canonicalize() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+
+    let delete_err = permanent_delete(&home, dir.path()).unwrap_err();
+    let trash_err = trash_path(&home, dir.path()).unwrap_err();
+
+    assert!(delete_err.to_string().contains("home directory"));
+    assert!(trash_err.to_string().contains("home directory"));
+}
+
+#[test]
+fn trash_rejects_tersh_trash_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let trash = dir.path().join(".tersh-trash");
+    std::fs::create_dir(&trash).unwrap();
+
+    let err = trash_path(&trash, dir.path()).unwrap_err();
+
+    assert!(err.to_string().contains(".tersh-trash"));
+    assert!(trash.exists());
+}
+
+#[test]
+fn permanent_delete_rejects_tersh_trash_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let trash = dir.path().join(".tersh-trash");
+    std::fs::create_dir(&trash).unwrap();
+
+    let err = permanent_delete(&trash, dir.path()).unwrap_err();
+
+    assert!(err.to_string().contains(".tersh-trash"));
+    assert!(trash.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn trash_rejects_symlinked_tersh_trash_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let trash = dir.path().join(".tersh-trash");
+    std::os::unix::fs::symlink(outside.path(), &trash).unwrap();
+    let file = dir.path().join("old.txt");
+    std::fs::write(&file, "old").unwrap();
+
+    let err = trash_path(&file, dir.path()).unwrap_err();
+
+    assert!(err.to_string().contains(".tersh-trash"));
+    assert!(file.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn permanent_delete_removes_symlink_without_deleting_target_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("target-dir");
+    let link = dir.path().join("link-dir");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::write(target.join("kept.txt"), "kept").unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    permanent_delete(&link, dir.path()).unwrap();
+
+    assert!(std::fs::symlink_metadata(&link).is_err());
+    assert!(target.join("kept.txt").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn permanent_delete_removes_dangling_symlink() {
+    let dir = tempfile::tempdir().unwrap();
+    let link = dir.path().join("dangling");
+    std::os::unix::fs::symlink(dir.path().join("missing"), &link).unwrap();
+
+    permanent_delete(&link, dir.path()).unwrap();
+
+    assert!(std::fs::symlink_metadata(&link).is_err());
 }
 
 #[test]

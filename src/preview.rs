@@ -1,7 +1,7 @@
 use crate::fs_core::{escape_display, format_size};
 use anyhow::{Context, Result};
 use std::{
-    fs,
+    fs::{self, File},
     io::Read,
     path::{Path, PathBuf},
 };
@@ -9,13 +9,16 @@ use std::{
 const DETECT_LIMIT: usize = 64 * 1024;
 const PREVIEW_LIMIT: usize = 2 * 1024 * 1024;
 const MAX_LINE_BYTES: usize = 4_096;
+const MAX_PREVIEW_LINES: usize = 20_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreviewKind {
     Text,
     Binary,
+    Symlink,
     Directory,
     Empty,
+    Unsupported,
     Error,
 }
 
@@ -41,6 +44,22 @@ impl Preview {
 pub fn preview_file(path: &Path) -> Result<Preview> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("failed to preview {}", path.display()))?;
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        let target = fs::read_link(path)
+            .map(|target| target.display().to_string())
+            .unwrap_or_else(|_| "unreadable target".to_string());
+        return Ok(Preview {
+            path: path.to_path_buf(),
+            kind: PreviewKind::Symlink,
+            lines: vec![
+                format!("Symlink · {}", format_size(metadata.len())),
+                format!("Target: {}", escape_display(&target)),
+                "Preview does not follow symlinks.".to_string(),
+            ],
+            truncated: false,
+        });
+    }
     if metadata.is_dir() {
         return Ok(Preview::message(
             path.to_path_buf(),
@@ -48,6 +67,15 @@ pub fn preview_file(path: &Path) -> Result<Preview> {
             "Directory selected",
         ));
     }
+    if !file_type.is_file() {
+        return Ok(Preview::message(
+            path.to_path_buf(),
+            PreviewKind::Unsupported,
+            "Unsupported file type for preview",
+        ));
+    }
+    let (mut file, metadata) = open_regular_file(path)?;
+
     if metadata.len() == 0 {
         return Ok(Preview::message(
             path.to_path_buf(),
@@ -56,8 +84,6 @@ pub fn preview_file(path: &Path) -> Result<Preview> {
         ));
     }
 
-    let mut file =
-        fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
     let mut detect_bytes = vec![0; DETECT_LIMIT.min(metadata.len() as usize)];
     let detected = file.read(&mut detect_bytes)?;
     detect_bytes.truncate(detected);
@@ -84,7 +110,7 @@ pub fn preview_file(path: &Path) -> Result<Preview> {
     file.by_ref()
         .take((PREVIEW_LIMIT + 1 - bytes.len()) as u64)
         .read_to_end(&mut bytes)?;
-    let truncated = bytes.len() > PREVIEW_LIMIT;
+    let mut truncated = bytes.len() > PREVIEW_LIMIT;
     if truncated {
         bytes.truncate(PREVIEW_LIMIT);
     }
@@ -117,11 +143,15 @@ pub fn preview_file(path: &Path) -> Result<Preview> {
     let text = String::from_utf8_lossy(&bytes);
     let mut lines = Vec::new();
     for (index, line) in text.lines().enumerate() {
+        if index >= MAX_PREVIEW_LINES {
+            truncated = true;
+            break;
+        }
         let visible = truncate_line(line);
         lines.push(format!("{:>4}  {}", index + 1, escape_display(&visible)));
     }
     if truncated {
-        lines.push("[preview truncated at 2 MiB]".to_string());
+        lines.push("[preview truncated]".to_string());
     }
 
     Ok(Preview {
@@ -130,6 +160,34 @@ pub fn preview_file(path: &Path) -> Result<Preview> {
         lines,
         truncated,
     })
+}
+
+fn open_regular_file(path: &Path) -> Result<(File, fs::Metadata)> {
+    let file = open_no_follow(path)?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect opened file {}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        anyhow::bail!("unsupported file type for preview: {}", path.display());
+    }
+    Ok((file, metadata))
+}
+
+#[cfg(unix)]
+fn open_no_follow(path: &Path) -> Result<File> {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .with_context(|| format!("failed to open {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn open_no_follow(path: &Path) -> Result<File> {
+    File::open(path).with_context(|| format!("failed to open {}", path.display()))
 }
 
 fn looks_binary(bytes: &[u8]) -> bool {

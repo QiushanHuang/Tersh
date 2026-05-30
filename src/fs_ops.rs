@@ -62,9 +62,7 @@ pub fn rename_path(source: &Path, target: &Path) -> Result<()> {
 
 pub fn trash_path(path: &Path, work_root: &Path) -> Result<DeleteDecision> {
     guard_delete_target(path, work_root)?;
-    let trash_dir = work_root.join(".tersh-trash");
-    fs::create_dir_all(&trash_dir)
-        .with_context(|| format!("failed to create trash {}", trash_dir.display()))?;
+    let trash_dir = prepare_trash_dir(work_root)?;
     let file_name = path
         .file_name()
         .ok_or_else(|| anyhow!("cannot trash path without file name: {}", path.display()))?;
@@ -82,6 +80,34 @@ pub fn trash_path(path: &Path, work_root: &Path) -> Result<DeleteDecision> {
         from: path.to_path_buf(),
         to: target,
     })
+}
+
+fn prepare_trash_dir(work_root: &Path) -> Result<PathBuf> {
+    let trash_dir = work_root.join(".tersh-trash");
+    match fs::symlink_metadata(&trash_dir) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                bail!("refusing to use symlinked .tersh-trash");
+            }
+            if !metadata.is_dir() {
+                bail!(".tersh-trash exists and is not a directory");
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(&trash_dir)
+                .with_context(|| format!("failed to create trash {}", trash_dir.display()))?;
+        }
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("failed to inspect trash {}", trash_dir.display()));
+        }
+    }
+    let metadata = fs::symlink_metadata(&trash_dir)
+        .with_context(|| format!("failed to inspect trash {}", trash_dir.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!("refusing to use unsafe .tersh-trash");
+    }
+    Ok(trash_dir)
 }
 
 pub fn permanent_delete(path: &Path, work_root: &Path) -> Result<()> {
@@ -163,17 +189,47 @@ fn remove_existing(path: &Path) -> Result<()> {
 }
 
 fn guard_delete_target(path: &Path, work_root: &Path) -> Result<()> {
-    if path.parent().is_none() {
+    if path.as_os_str().is_empty() || !path.is_absolute() {
+        bail!("refusing to delete non-absolute path: {}", path.display());
+    }
+    let target = delete_identity(path)?;
+    if target.parent().is_none() {
         bail!("refusing to delete filesystem root");
     }
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    if home.as_deref() == Some(path) {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .and_then(|home| home.canonicalize().ok());
+    if home.as_deref() == Some(target.as_path()) {
         bail!("refusing to delete home directory");
     }
-    if path == work_root {
+    let work_root = work_root
+        .canonicalize()
+        .with_context(|| format!("failed to resolve work root {}", work_root.display()))?;
+    if target == work_root {
         bail!("refusing to delete active work root");
     }
+    if target == work_root.join(".tersh-trash") {
+        bail!("refusing to delete .tersh-trash");
+    }
     Ok(())
+}
+
+fn delete_identity(path: &Path) -> Result<PathBuf> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect delete target {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow!("delete target has no parent: {}", path.display()))?
+            .canonicalize()
+            .with_context(|| format!("failed to resolve parent for {}", path.display()))?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| anyhow!("delete target has no file name: {}", path.display()))?;
+        return Ok(parent.join(name));
+    }
+    path.canonicalize()
+        .with_context(|| format!("failed to resolve delete target {}", path.display()))
 }
 
 fn unique_suffix() -> String {

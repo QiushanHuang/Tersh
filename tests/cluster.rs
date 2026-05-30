@@ -243,6 +243,30 @@ fn cluster_app_does_not_open_session_from_help_overlay() {
 }
 
 #[test]
+fn cluster_help_closes_on_question_mark_and_enter() {
+    let inventory = ClusterInventory::from_json(CAMPUS_JSON).unwrap();
+    let mut app = ClusterApp::new(inventory.hosts().to_vec());
+    app.apply(ClusterCommand::OpenHelp);
+
+    let command = app.handle_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('?'),
+        crossterm::event::KeyModifiers::NONE,
+    ));
+
+    assert_eq!(command, None);
+    assert_eq!(app.mode(), tersh::cluster::ClusterMode::Normal);
+
+    app.apply(ClusterCommand::OpenHelp);
+    let command = app.handle_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+
+    assert_eq!(command, None);
+    assert_eq!(app.mode(), tersh::cluster::ClusterMode::Normal);
+}
+
+#[test]
 fn cluster_app_does_not_open_workbench_from_help_overlay() {
     let inventory = ClusterInventory::from_json(CAMPUS_JSON).unwrap();
     let mut app = ClusterApp::new(inventory.hosts().to_vec());
@@ -321,6 +345,132 @@ fn cluster_app_ignores_duplicate_refresh_for_in_flight_host() {
 }
 
 #[test]
+fn begin_refresh_caps_concurrent_hosts() {
+    let inventory = ClusterInventory::from_json(CAMPUS_JSON).unwrap();
+    let mut app = ClusterApp::new(inventory.hosts().to_vec());
+    let aliases = (0..40)
+        .map(|index| format!("host-{index:02}"))
+        .collect::<Vec<_>>();
+
+    let started = app.begin_refresh(&aliases);
+
+    assert_eq!(started.len(), 16);
+}
+
+#[test]
+fn begin_refresh_rotates_after_capped_batch_completes() {
+    let inventory = ClusterInventory::from_json(CAMPUS_JSON).unwrap();
+    let mut app = ClusterApp::new(inventory.hosts().to_vec());
+    let aliases = (0..40)
+        .map(|index| format!("host-{index:02}"))
+        .collect::<Vec<_>>();
+
+    let first = app.begin_refresh(&aliases);
+    for alias in first {
+        app.apply_snapshot(HostSnapshot::offline(alias, "offline"));
+    }
+    let second = app.begin_refresh(&aliases);
+
+    assert!(second.iter().any(|alias| alias == "host-16"));
+    assert!(!second.iter().any(|alias| alias == "host-00"));
+}
+
+#[test]
+fn inventory_rejects_duplicate_aliases() {
+    let json = r#"
+{
+  "servers": [
+    { "alias": "dup", "ssh_user": "ops", "campus_ip": "203.0.113.10" },
+    { "alias": "dup", "ssh_user": "ops", "campus_ip": "203.0.113.11" }
+  ]
+}
+"#;
+
+    let err = ClusterInventory::from_json(json).unwrap_err();
+
+    assert!(err.to_string().contains("duplicate alias"));
+}
+
+#[test]
+fn inventory_rejects_option_like_ssh_fields() {
+    let json = r#"
+{
+  "servers": [
+    { "alias": "bad", "ssh_user": "-oProxyCommand=bad", "campus_ip": "203.0.113.10" }
+  ]
+}
+"#;
+
+    let err = ClusterInventory::from_json(json).unwrap_err();
+
+    assert!(err.to_string().contains("ssh_user"));
+}
+
+#[test]
+fn inventory_rejects_option_like_address_fields() {
+    let json = r#"
+{
+  "servers": [
+    { "alias": "bad", "ssh_user": "ops", "campus_ip": "-bad" }
+  ]
+}
+"#;
+
+    let err = ClusterInventory::from_json(json).unwrap_err();
+
+    assert!(err.to_string().contains("address"));
+}
+
+#[test]
+fn inventory_rejects_control_characters_in_alias_role_and_workdir() {
+    let json = "{ \"servers\": [ { \"alias\": \"bad\\nname\", \"role\": \"ops\", \"workdir\": \"/srv/app\" } ] }";
+    let err = ClusterInventory::from_json(json).unwrap_err();
+    assert!(err.to_string().contains("alias"));
+
+    let json = "{ \"servers\": [ { \"alias\": \"server\", \"role\": \"ops\\nteam\", \"workdir\": \"/srv/app\" } ] }";
+    let err = ClusterInventory::from_json(json).unwrap_err();
+    assert!(err.to_string().contains("role"));
+
+    let json = "{ \"servers\": [ { \"alias\": \"server\", \"role\": \"ops\", \"workdir\": \"/srv/app\\nnext\" } ] }";
+    let err = ClusterInventory::from_json(json).unwrap_err();
+    assert!(err.to_string().contains("workdir"));
+}
+
+#[test]
+fn inventory_rejects_duplicate_alias_across_local_jump_and_servers() {
+    let json = r#"
+{
+  "main_machine": { "alias": "dup" },
+  "jump_host": { "alias": "dup", "tailscale_ip": "100.90.116.54" }
+}
+"#;
+
+    let err = ClusterInventory::from_json(json).unwrap_err();
+
+    assert!(err.to_string().contains("duplicate alias"));
+}
+
+#[test]
+fn inventory_rejects_unresolved_proxy_jump() {
+    let json = r#"
+{
+  "servers": [
+    {
+      "alias": "server",
+      "ssh_user": "ops",
+      "campus_ip": "203.0.113.10",
+      "proxy_jump": "missing-jump"
+    }
+  ]
+}
+"#;
+
+    let err = ClusterInventory::from_json(json).unwrap_err();
+
+    assert!(err.to_string().contains("proxy_jump"));
+}
+
+#[test]
 fn cluster_render_shows_host_list_detail_metrics_and_footer_keys() {
     let inventory = ClusterInventory::from_json(CAMPUS_JSON).unwrap();
     let mut app = ClusterApp::new(inventory.hosts().to_vec());
@@ -371,6 +521,76 @@ fn cluster_render_shows_host_list_detail_metrics_and_footer_keys() {
     assert!(buffer.contains("s shell/ssh"));
     assert!(buffer.contains("t tersh"));
     assert!(buffer.contains("q quit"));
+}
+
+#[test]
+fn cluster_render_tiny_keeps_exit_visible() {
+    let inventory = ClusterInventory::from_json(CAMPUS_JSON).unwrap();
+    let app = ClusterApp::new(inventory.hosts().to_vec());
+
+    let backend = TestBackend::new(40, 10);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| cluster_ui::draw(frame, &app))
+        .unwrap();
+
+    let buffer = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(buffer.contains("q quit"));
+    assert!(buffer.contains("? help"));
+    assert!(buffer.contains("^G"));
+    assert!(buffer.contains("^C"));
+}
+
+#[test]
+fn cluster_help_footer_is_mode_specific() {
+    let inventory = ClusterInventory::from_json(CAMPUS_JSON).unwrap();
+    let mut app = ClusterApp::new(inventory.hosts().to_vec());
+    app.apply(ClusterCommand::OpenHelp);
+
+    let backend = TestBackend::new(80, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| cluster_ui::draw(frame, &app))
+        .unwrap();
+
+    let buffer = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(buffer.contains("help | q close"));
+    assert!(!buffer.contains("q quit | ? help | ^G back | ^C force | r refresh"));
+}
+
+#[test]
+fn cluster_detail_footer_describes_back_action() {
+    let inventory = ClusterInventory::from_json(CAMPUS_JSON).unwrap();
+    let mut app = ClusterApp::new(inventory.hosts().to_vec());
+    app.apply(ClusterCommand::OpenDetail);
+
+    let backend = TestBackend::new(80, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| cluster_ui::draw(frame, &app))
+        .unwrap();
+
+    let buffer = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(buffer.contains("detail | q back"));
+    assert!(!buffer.contains("q quit | ? help | ^G back | ^C force | r refresh"));
 }
 
 #[test]

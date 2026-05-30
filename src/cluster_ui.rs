@@ -24,7 +24,7 @@ pub fn draw(frame: &mut Frame, app: &ClusterApp) {
     } else {
         draw_body(frame, rows[1], app);
     }
-    draw_footer(frame, rows[2]);
+    draw_footer(frame, rows[2], app);
 
     if app.mode() == ClusterMode::Help {
         draw_help(frame, centered_rect(70, 60, area));
@@ -498,12 +498,23 @@ fn metric_style(percent: u16) -> Style {
     }
 }
 
-fn draw_footer(frame: &mut Frame, area: Rect) {
-    let paragraph = Paragraph::new(
-        "r refresh | Enter refresh host | s shell/ssh | t tersh | l detail | j/k move | Home/End | ? help | q quit | Ctrl+C force",
-    )
-    .style(Style::default().fg(Color::Gray))
-    .block(Block::default().borders(Borders::TOP));
+fn draw_footer(frame: &mut Frame, area: Rect, app: &ClusterApp) {
+    let compact = area.width < 64;
+    let text = match app.mode() {
+        ClusterMode::Help if compact => "help | q close | ^G | ^C",
+        ClusterMode::Help => "help | q close | ? close | Enter close | ^G close | ^C force",
+        ClusterMode::Detail if compact => "detail | q back | ^G | ^C",
+        ClusterMode::Detail => {
+            "detail | q back | ^G back | ^C force | r refresh | s shell/ssh | t tersh"
+        }
+        ClusterMode::Normal if compact => "q quit | ? help | ^G | ^C",
+        ClusterMode::Normal => {
+            "q quit | ? help | ^G back | ^C force | r refresh | Enter refresh host | s shell/ssh | t tersh | l detail | j/k move | Home/End"
+        }
+    };
+    let paragraph = Paragraph::new(text)
+        .style(Style::default().fg(Color::Gray))
+        .block(Block::default().borders(Borders::TOP));
     frame.render_widget(paragraph, area);
 }
 

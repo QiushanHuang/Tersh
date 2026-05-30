@@ -402,6 +402,7 @@ impl App {
                 KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('?') => {
                     self.handle_command(Command::Cancel)
                 }
+                KeyCode::Char('Q') => self.handle_command(Command::ForceQuit),
                 _ => {}
             }
             return;
@@ -421,8 +422,13 @@ impl App {
             }
             let command = match key.code {
                 KeyCode::Enter | KeyCode::Char('q') => Some(Command::Cancel),
-                KeyCode::Char('j') | KeyCode::Down => Some(Command::HalfDown),
-                KeyCode::Char('k') | KeyCode::Up => Some(Command::HalfUp),
+                KeyCode::Char('Q') => Some(Command::ForceQuit),
+                KeyCode::Char('j') => Some(Command::HalfDown),
+                KeyCode::Char('k') => Some(Command::HalfUp),
+                KeyCode::Down => Some(Command::Down),
+                KeyCode::Up => Some(Command::Up),
+                KeyCode::PageDown => Some(Command::HalfDown),
+                KeyCode::PageUp => Some(Command::HalfUp),
                 KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     Some(Command::Down)
                 }
@@ -547,6 +553,14 @@ impl App {
 
     pub fn last_clipboard_text(&self) -> Option<&str> {
         self.last_clipboard_text.as_deref()
+    }
+
+    pub fn operation_target_count(&self) -> usize {
+        self.operation_targets().len()
+    }
+
+    pub fn operation_target_first(&self) -> Option<PathBuf> {
+        self.operation_targets().into_iter().next()
     }
 
     pub fn take_clipboard_text(&mut self) -> Option<String> {
@@ -778,10 +792,10 @@ impl App {
     }
 
     fn toggle_selected(&mut self) {
-        if let Some(path) = self.focused().map(|entry| entry.path.clone()) {
-            if !self.selected.remove(&path) {
-                self.selected.insert(path);
-            }
+        if let Some(path) = self.focused().map(|entry| entry.path.clone())
+            && !self.selected.remove(&path)
+        {
+            self.selected.insert(path);
         }
     }
 
@@ -1106,12 +1120,12 @@ fn run_tui(path: PathBuf, output: TerminalOutput) -> Result<PathBuf> {
 
     while !app.should_quit() {
         terminal.draw(|frame| crate::ui::draw(frame, &app))?;
-        if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                app.handle_key(key);
-                if let Some(text) = app.take_clipboard_text() {
-                    crate::clipboard::write_clipboard(&mut output.writer(), &text)?;
-                }
+        if event::poll(Duration::from_millis(100))?
+            && let Event::Key(key) = event::read()?
+        {
+            app.handle_key(key);
+            if let Some(text) = app.take_clipboard_text() {
+                crate::clipboard::write_clipboard(&mut output.writer(), &text)?;
             }
         }
     }
@@ -1167,10 +1181,10 @@ fn expand_path(input: &str) -> PathBuf {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(input));
     }
-    if let Some(rest) = input.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-            return home.join(rest);
-        }
+    if let Some(rest) = input.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
+    {
+        return home.join(rest);
     }
     PathBuf::from(input)
 }

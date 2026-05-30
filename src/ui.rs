@@ -67,7 +67,22 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &App) {
         draw_files(frame, columns[0], app);
         draw_preview(frame, columns[1], app);
     } else {
-        draw_files(frame, area, app);
+        let rows = if area.height >= 7 && area.width >= 60 {
+            Some(
+                Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(3), Constraint::Length(3)])
+                    .split(area),
+            )
+        } else {
+            None
+        };
+        if let Some(rows) = rows {
+            draw_files(frame, rows[0], app);
+            draw_compact_info(frame, rows[1], app);
+        } else {
+            draw_files(frame, area, app);
+        }
     }
 }
 
@@ -225,17 +240,54 @@ fn draw_info(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(paragraph, area);
 }
 
+fn draw_compact_info(frame: &mut Frame, area: Rect, app: &App) {
+    let focused = app.entries().get(app.cursor());
+    let target = focused
+        .map(|entry| format!("{} {}", entry.kind_marker(), entry.name))
+        .unwrap_or_else(|| "no item".to_string());
+    let text = format!(
+        "{target} | selected {} | copy {}",
+        app.selected_len(),
+        app.copy_buffer_len()
+    );
+    let paragraph = Paragraph::new(text)
+        .style(Style::default().fg(Color::Gray))
+        .block(Block::default().title("Status").borders(Borders::ALL));
+    frame.render_widget(paragraph, area);
+}
+
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     let mode = format!("{:?}", app.mode()).to_lowercase();
+    let compact = area.width < 60;
     let text = match app.mode() {
-        Mode::Preview | Mode::PreviewSearch => {
-            "preview | j/k/↑/↓ scroll  PgUp/PgDn  gg top  G bottom  / search  n/N  e edit  q/^G close".to_string()
+        Mode::Normal if compact => "q quit | ? help | ^G | ^C".to_string(),
+        Mode::Normal => {
+            "normal | q quit | ^G clear | ^C force | ? help | j/k move | Enter open | h parent | / filter | Space mark | yy copy | p paste".to_string()
         }
-        _ => {
-            format!(
-                "{mode} | q quit | ^G cancel | ^C force | ? | PgUp/PgDn | : goto | / filter | yy/yf/yr/ya | x/p | c/m | d/D | e edit"
-            )
+        Mode::Preview if compact => "preview | q | Pg | ^G | ^C".to_string(),
+        Mode::Preview => {
+            "preview | q close | ^G close | ^C force | j/k page | ↑/↓ line | PgUp/PgDn | gg/G | / find | n/N | e edit".to_string()
         }
+        Mode::PreviewSearch if compact => "find | Enter | ^G | ^C".to_string(),
+        Mode::PreviewSearch => format!("{mode} | Enter find | Backspace | ^G cancel | ^C force"),
+        Mode::Filter if compact => "filter | Enter | ^G | ^C".to_string(),
+        Mode::Filter => "filter | type to narrow | Enter apply | Backspace | ^G cancel | ^C force".to_string(),
+        Mode::Goto if compact => "goto | Enter | ^G | ^C".to_string(),
+        Mode::Goto => "goto | type directory | Enter go | Backspace | ^G cancel | ^C force".to_string(),
+        Mode::Rename if compact => "rename | Enter | ^G | ^C".to_string(),
+        Mode::Rename => "rename | type name | Enter rename | Backspace | ^G cancel | ^C force".to_string(),
+        Mode::CopyTo if compact => "copy-to | Enter | ^G | ^C".to_string(),
+        Mode::CopyTo => "copy-to | type destination | Enter copy | Backspace | ^G cancel | ^C force".to_string(),
+        Mode::MoveTo if compact => "move-to | Enter | ^G | ^C".to_string(),
+        Mode::MoveTo => "move-to | type destination | Enter move | Backspace | ^G cancel | ^C force".to_string(),
+        Mode::ConfirmTrash if compact => "trash | Enter | ^G | ^C".to_string(),
+        Mode::ConfirmTrash => "trash | type trash | Enter confirm | ^G cancel | ^C force".to_string(),
+        Mode::ConfirmDelete if compact => "delete | Enter | ^G | ^C".to_string(),
+        Mode::ConfirmDelete => {
+            "delete | type delete | Enter confirm | ^G cancel | ^C force".to_string()
+        }
+        Mode::Help => "help | q/?/Enter close | ^G close | ^C force".to_string(),
+        Mode::Message => format!("{mode} | ^G close | ^C force"),
     };
     let paragraph = Paragraph::new(text)
         .style(Style::default().fg(Color::Gray))
@@ -261,7 +313,8 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("  d: trash, then type trash    D: delete, then type delete"),
         Line::from(""),
         Line::from("Preview mode"),
-        Line::from("  j/k/↑/↓: scroll    PageUp/PageDown: page    gg: top    G: bottom"),
+        Line::from("  j/k/PageUp/PageDown: page    arrows/Ctrl+F/Ctrl+B: line"),
+        Line::from("  gg: top    G: bottom"),
         Line::from("  /: search    n/N: next/prev match"),
         Line::from(""),
         Line::from("Exit"),
@@ -281,16 +334,23 @@ fn draw_input_modal(frame: &mut Frame, area: Rect, app: &App) {
         Mode::Rename => "Rename focused item",
         Mode::CopyTo => "Copy selected/focused item(s) to directory",
         Mode::MoveTo => "Move selected/focused item(s) to directory",
-        Mode::ConfirmTrash => "Type trash then Enter. Ctrl+G cancels.",
+        Mode::ConfirmTrash => "Move to .tersh-trash: type trash then Enter. Ctrl+G cancels.",
         Mode::ConfirmDelete => "Permanent delete: type delete then Enter. Ctrl+G cancels.",
         Mode::PreviewSearch => "Find in preview",
         _ => "",
     };
-    let lines = vec![
-        Line::from(prompt),
-        Line::from(""),
-        Line::from(app.input().to_string()),
-    ];
+    let mut lines = vec![Line::from(prompt)];
+    if matches!(app.mode(), Mode::ConfirmTrash | Mode::ConfirmDelete) {
+        lines.push(Line::from(format!(
+            "targets: {}",
+            app.operation_target_count()
+        )));
+        if let Some(path) = app.operation_target_first() {
+            lines.push(Line::from(format!("first: {}", path.display())));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(app.input().to_string()));
     let paragraph = Paragraph::new(lines)
         .block(Block::default().title("Command").borders(Borders::ALL))
         .wrap(Wrap { trim: false });

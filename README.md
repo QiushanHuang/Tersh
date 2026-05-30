@@ -8,7 +8,7 @@
 [![Shell Workflow](https://img.shields.io/badge/Workflow-Local%20%7C%20SSH%20Shell-0f766e)](#local-and-ssh-shell-sessions)
 [![Mobile Friendly](https://img.shields.io/badge/Focus-Mobile--Friendly-2563eb)](#mobile-first-remote-workflow)
 [![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Linux-475569)](#installation)
-[![Status](https://img.shields.io/badge/Status-Early%20Product-7c3aed)](#project-status)
+[![Status](https://img.shields.io/badge/Status-V1-16a34a)](#project-status)
 [![License](https://img.shields.io/badge/License-MIT-16a34a)](#license)
 
 <a id="english"></a>
@@ -71,6 +71,17 @@ This matters when your working environment is:
 - Compact info pane and operation log
 - Hidden file toggle
 - `tersh --c` multi-server status dashboard for local, jump, and remote hosts
+
+## V1 Release Highlights
+
+Tersh V1 is the first product baseline for the local file workbench and read-only cluster status dashboard.
+
+- Mode-aware shortcut footers now match the current screen: normal browsing, preview, search, prompts, delete confirmation, help, cluster list, and cluster detail no longer advertise inactive actions.
+- Narrow and mobile terminals get compact footer/status variants, so key actions and selected/copy context stay visible instead of being squeezed out.
+- Preview navigation is more predictable: `j` / `k` and `PageUp` / `PageDown` move by page, while arrow keys and `Ctrl+F` / `Ctrl+B` move by line.
+- File preview is safer: symlinks are not followed, directories and special files show safe messages, and preview content is capped by bytes, line length, and line count.
+- Trash and permanent delete now show target context before confirmation and reject unsafe targets such as filesystem roots, `$HOME`, the active work root, and `.tersh-trash` itself.
+- Cluster inventory loading now rejects duplicate aliases, invalid SSH fields, unresolved `proxy_jump` references, and control characters; refreshes are capped and rotated across hosts.
 
 ## Installation
 
@@ -249,9 +260,9 @@ It aims to keep the speed and portability of terminal work while removing repeti
 
 ## Project Status
 
-This project is in an early product stage.
+This repository is at V1.
 
-The current implementation focuses on a stable core workflow:
+The V1 implementation focuses on a stable terminal workflow:
 
 - browse
 - preview
@@ -260,13 +271,14 @@ The current implementation focuses on a stable core workflow:
 - rename
 - trash and delete
 - path handling
+- read-only cluster health checks
 
 The current scope does not try to be:
 
 - an SSH client
 - a background sync tool
 - a desktop GUI file manager
-- a remote host dashboard
+- a full remote-control platform
 
 ## Architecture
 
@@ -358,6 +370,17 @@ MIT
 - 紧凑的信息面板和操作日志
 - 隐藏文件开关
 - `tersh --c` 多服务器状态面板，可查看本机、跳板机和远端服务器
+
+## V1 更新重点
+
+Tersh V1 是本地文件工作台和只读多主机状态面板的第一个产品基线版本。
+
+- 底部快捷键现在会随模式变化：普通浏览、预览、查找、输入框、删除确认、帮助、集群列表和集群详情页只展示当前真正可用的动作。
+- 窄屏和移动端终端增加了紧凑版 footer 与状态区，关键快捷键、已选数量和复制队列状态不会被挤掉。
+- 预览区滚动逻辑更清楚：`j` / `k` 与 `PageUp` / `PageDown` 按页滚动，方向键和 `Ctrl+F` / `Ctrl+B` 按行滚动。
+- 文件预览更安全：不跟随符号链接，目录和特殊文件只显示安全提示，并同时限制字节数、单行长度和总行数。
+- 回收站和永久删除会在确认前展示目标数量和首个目标路径，并拒绝文件系统根目录、`$HOME`、当前工作根目录和 `.tersh-trash` 自身等高风险目标。
+- 集群主机清单会校验重复 alias、非法 SSH 字段、无法解析的 `proxy_jump` 和控制字符；刷新任务会限制并发并轮转主机，避免一次性压满。
 
 ## 安装
 
@@ -536,9 +559,9 @@ Tersh 处在原始 shell 命令和完整远程文件管理器之间。
 
 ## 项目状态
 
-项目目前处于早期产品阶段。
+项目目前已进入 V1。
 
-当前实现聚焦在一条稳定核心链路上：
+V1 实现聚焦在一条稳定的终端工作流上：
 
 - 浏览
 - 预览
@@ -547,13 +570,14 @@ Tersh 处在原始 shell 命令和完整远程文件管理器之间。
 - 重命名
 - 回收站与删除
 - 路径处理
+- 只读多主机健康检查
 
 当前范围不包含：
 
 - SSH 客户端
 - 后台同步工具
 - 桌面 GUI 文件管理器
-- 远程主机控制面板
+- 完整远程控制平台
 
 ## 架构说明
 

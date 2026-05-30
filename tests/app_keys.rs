@@ -61,6 +61,28 @@ fn filter_mode_treats_letters_and_backspace_as_text_input() {
 }
 
 #[test]
+fn q_is_text_inside_filter_mode() {
+    let mut app = App::for_test();
+
+    app.apply(Command::OpenFilter);
+    app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+
+    assert_eq!(app.input(), "q");
+    assert_eq!(app.mode(), Mode::Filter);
+    assert!(!app.should_quit());
+}
+
+#[test]
+fn ctrl_c_force_quits_from_input_mode() {
+    let mut app = App::for_test();
+
+    app.apply(Command::OpenFilter);
+    app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+
+    assert!(app.should_quit());
+}
+
+#[test]
 fn confirm_mode_accepts_delete_confirmation_text() {
     let mut app = App::for_test();
 
@@ -117,6 +139,74 @@ fn page_keys_move_directory_cursor_by_page() {
 
     app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
     assert_eq!(app.cursor(), 0);
+}
+
+#[test]
+fn preview_page_keys_scroll_fullscreen_preview() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = (0..40)
+        .map(|index| format!("line-{index:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(dir.path().join("long.txt"), body).unwrap();
+    let mut app = App::new(dir.path().to_path_buf()).unwrap();
+
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(app.mode(), Mode::Preview);
+
+    app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+    assert_eq!(app.preview_offset(), 10);
+
+    app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+    assert_eq!(app.preview_offset(), 0);
+}
+
+#[test]
+fn preview_q_closes_and_q_force_quits() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("item.txt"), "item").unwrap();
+    let mut app = App::new(dir.path().to_path_buf()).unwrap();
+
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+    assert_eq!(app.mode(), Mode::Normal);
+    assert!(!app.should_quit());
+
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('Q'), KeyModifiers::NONE));
+    assert!(app.should_quit());
+}
+
+#[test]
+fn help_q_closes_and_q_force_quits() {
+    let mut app = App::for_test();
+
+    app.apply(Command::OpenHelp);
+    app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+    assert_eq!(app.mode(), Mode::Normal);
+    assert!(!app.should_quit());
+
+    app.apply(Command::OpenHelp);
+    app.handle_key(KeyEvent::new(KeyCode::Char('Q'), KeyModifiers::NONE));
+    assert!(app.should_quit());
+}
+
+#[test]
+fn preview_arrow_keys_scroll_by_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = (0..20)
+        .map(|index| format!("line-{index:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(dir.path().join("long.txt"), body).unwrap();
+    let mut app = App::new(dir.path().to_path_buf()).unwrap();
+
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    assert_eq!(app.preview_offset(), 1);
+
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+    assert_eq!(app.preview_offset(), 0);
 }
 
 #[test]

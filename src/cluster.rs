@@ -18,6 +18,7 @@ use std::{
 
 const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(6);
+const MAX_CONCURRENT_PROBES: usize = 16;
 
 const PROBE_SCRIPT: &str = r#"
 printf 'hostname=%s\n' "$(hostname 2>/dev/null || echo unknown)"
@@ -195,6 +196,7 @@ impl ClusterInventory {
         if hosts.is_empty() {
             hosts.push(local_fallback_host());
         }
+        validate_hosts(&hosts)?;
 
         Ok(Self {
             hosts,
@@ -464,6 +466,7 @@ pub struct ClusterApp {
     refreshing: BTreeSet<String>,
     inventory_source: Option<PathBuf>,
     last_refresh_started: Option<Instant>,
+    refresh_cursor: usize,
 }
 
 impl ClusterApp {
@@ -491,6 +494,7 @@ impl ClusterApp {
             refreshing: BTreeSet::new(),
             inventory_source: None,
             last_refresh_started: None,
+            refresh_cursor: 0,
         }
     }
 
@@ -536,14 +540,30 @@ impl ClusterApp {
     pub fn begin_refresh(&mut self, aliases: &[String]) -> Vec<String> {
         self.last_refresh_started = Some(Instant::now());
         let mut started = Vec::new();
-        for alias in aliases {
+        if aliases.is_empty() || self.refreshing.len() >= MAX_CONCURRENT_PROBES {
+            self.log("refresh already in progress");
+            return started;
+        }
+        let slots = MAX_CONCURRENT_PROBES.saturating_sub(self.refreshing.len());
+        let start = self.refresh_cursor % aliases.len();
+        let mut last_index = start;
+        for offset in 0..aliases.len() {
+            if started.len() >= slots {
+                break;
+            }
+            let index = (start + offset) % aliases.len();
+            let alias = &aliases[index];
             if self.refreshing.contains(alias) {
                 continue;
             }
             self.refreshing.insert(alias.clone());
             started.push(alias.clone());
+            last_index = index;
             self.snapshots
                 .insert(alias.clone(), HostSnapshot::checking(alias.clone()));
+        }
+        if !started.is_empty() {
+            self.refresh_cursor = (last_index + 1) % aliases.len();
         }
         if started.is_empty() {
             self.log("refresh already in progress");
@@ -568,6 +588,15 @@ impl ClusterApp {
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<ClusterCommand> {
         let command = key_to_command(key)?;
+        if self.mode == ClusterMode::Help
+            && matches!(
+                command,
+                ClusterCommand::OpenHelp | ClusterCommand::RefreshSelected
+            )
+        {
+            self.apply(ClusterCommand::Cancel);
+            return None;
+        }
         if self.mode == ClusterMode::Help
             && !matches!(
                 command,
@@ -750,29 +779,29 @@ pub fn run_with_inventory(inventory: ClusterInventory) -> Result<()> {
         }
 
         terminal.draw(|frame| crate::cluster_ui::draw(frame, &app))?;
-        if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                match app.handle_key(key) {
-                    Some(ClusterCommand::RefreshAll) => start_refresh_all(&mut app, tx.clone()),
-                    Some(ClusterCommand::RefreshSelected) => {
-                        start_refresh_selected(&mut app, tx.clone())
-                    }
-                    Some(ClusterCommand::OpenSession) => {
-                        terminal.show_cursor()?;
-                        open_selected_session(&mut app, &guard)?;
-                        terminal.clear()?;
-                        drain_snapshots(&mut app, &rx);
-                        start_refresh_selected(&mut app, tx.clone());
-                    }
-                    Some(ClusterCommand::OpenWorkbench) => {
-                        terminal.show_cursor()?;
-                        open_selected_workbench(&mut app, &guard)?;
-                        terminal.clear()?;
-                        drain_snapshots(&mut app, &rx);
-                        start_refresh_selected(&mut app, tx.clone());
-                    }
-                    _ => {}
+        if event::poll(Duration::from_millis(100))?
+            && let Event::Key(key) = event::read()?
+        {
+            match app.handle_key(key) {
+                Some(ClusterCommand::RefreshAll) => start_refresh_all(&mut app, tx.clone()),
+                Some(ClusterCommand::RefreshSelected) => {
+                    start_refresh_selected(&mut app, tx.clone())
                 }
+                Some(ClusterCommand::OpenSession) => {
+                    terminal.show_cursor()?;
+                    open_selected_session(&mut app, &guard)?;
+                    terminal.clear()?;
+                    drain_snapshots(&mut app, &rx);
+                    start_refresh_selected(&mut app, tx.clone());
+                }
+                Some(ClusterCommand::OpenWorkbench) => {
+                    terminal.show_cursor()?;
+                    open_selected_workbench(&mut app, &guard)?;
+                    terminal.clear()?;
+                    drain_snapshots(&mut app, &rx);
+                    start_refresh_selected(&mut app, tx.clone());
+                }
+                _ => {}
             }
         }
     }
@@ -1103,6 +1132,66 @@ fn connection_target(user: Option<&str>, address: &str) -> String {
         Some(user) if !user.trim().is_empty() => format!("{}@{}", user.trim(), address),
         _ => address.to_string(),
     }
+}
+
+fn validate_hosts(hosts: &[HostConfig]) -> Result<()> {
+    let mut aliases = BTreeSet::new();
+    let jump_aliases = hosts
+        .iter()
+        .filter(|host| host.kind == HostKind::Jump)
+        .map(|host| host.alias.as_str())
+        .collect::<BTreeSet<_>>();
+    for host in hosts {
+        validate_label("alias", &host.alias)?;
+        if !aliases.insert(host.alias.clone()) {
+            anyhow::bail!("duplicate alias: {}", host.alias);
+        }
+        validate_ssh_field("address", &host.address)?;
+        if let Some(user) = &host.user {
+            validate_ssh_field("ssh_user", user)?;
+        }
+        validate_ssh_field("ssh_target", &host.ssh_target)?;
+        if let Some(proxy_jump) = &host.proxy_jump {
+            validate_ssh_field("proxy_jump", proxy_jump)?;
+            if !jump_aliases.contains(proxy_jump.as_str()) {
+                anyhow::bail!("unresolved proxy_jump: {proxy_jump}");
+            }
+        }
+        if let Some(proxy_target) = &host.proxy_jump_target {
+            validate_ssh_field("proxy_jump_target", proxy_target)?;
+        }
+        validate_display_field("role", &host.role)?;
+        if let Some(workdir) = &host.workdir {
+            validate_display_field("workdir", workdir)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_label(field: &'static str, value: &str) -> Result<()> {
+    let value = value.trim();
+    if value.is_empty() {
+        anyhow::bail!("{field} must not be empty");
+    }
+    if value.chars().any(char::is_control) {
+        anyhow::bail!("{field} contains control characters");
+    }
+    Ok(())
+}
+
+fn validate_ssh_field(field: &'static str, value: &str) -> Result<()> {
+    validate_label(field, value)?;
+    if value.trim_start().starts_with('-') {
+        anyhow::bail!("{field} must not start with '-'");
+    }
+    Ok(())
+}
+
+fn validate_display_field(field: &'static str, value: &str) -> Result<()> {
+    if value.chars().any(char::is_control) {
+        anyhow::bail!("{field} contains control characters");
+    }
+    Ok(())
 }
 
 fn classify_failure(error: &str) -> ConnectionState {
