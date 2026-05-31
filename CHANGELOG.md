@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Fixed cluster probe command execution to preserve stdout/stderr in timeout/error paths and report probe execution errors with context instead of silently dropping them.
+- Fixed timeout handling for remote/local probes so output is cleaned up deterministically and timeout errors remain visible in refresh logs.
+
 ## v1.1.0 - 2026-05-31
 
 v1.1.0 is a small product-quality update that makes Tersh denser, more inspectable, and safer for remote terminal work.

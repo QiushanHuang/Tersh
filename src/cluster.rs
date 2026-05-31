@@ -13,7 +13,7 @@ use std::{
     process::{Command as ProcessCommand, Stdio},
     sync::mpsc,
     thread,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
@@ -459,6 +459,7 @@ pub struct ClusterApp {
     hosts: Vec<HostConfig>,
     snapshots: BTreeMap<String, HostSnapshot>,
     last_good_reports: BTreeMap<String, ProbeReport>,
+    refresh_deadlines: BTreeMap<String, Instant>,
     cursor: usize,
     mode: ClusterMode,
     should_quit: bool,
@@ -487,6 +488,7 @@ impl ClusterApp {
             hosts,
             snapshots,
             last_good_reports: BTreeMap::new(),
+            refresh_deadlines: BTreeMap::new(),
             cursor: 0,
             mode: ClusterMode::Normal,
             should_quit: false,
@@ -523,15 +525,24 @@ impl ClusterApp {
             ClusterCommand::ForceQuit => self.should_quit = true,
             ClusterCommand::RefreshAll => self.log("refresh requested"),
             ClusterCommand::RefreshSelected => {
-                let alias = self.selected_host().alias().to_string();
+                let alias = match self.selected_host() {
+                    Some(host) => host.alias().to_string(),
+                    None => return,
+                };
                 self.log(format!("refresh requested: {alias}"));
             }
             ClusterCommand::OpenSession => {
-                let alias = self.selected_host().alias().to_string();
+                let alias = match self.selected_host() {
+                    Some(host) => host.alias().to_string(),
+                    None => return,
+                };
                 self.log(format!("opening session: {alias}"));
             }
             ClusterCommand::OpenWorkbench => {
-                let alias = self.selected_host().alias().to_string();
+                let alias = match self.selected_host() {
+                    Some(host) => host.alias().to_string(),
+                    None => return,
+                };
                 self.log(format!("opening tersh: {alias}"));
             }
         }
@@ -540,6 +551,7 @@ impl ClusterApp {
     pub fn begin_refresh(&mut self, aliases: &[String]) -> Vec<String> {
         self.last_refresh_started = Some(Instant::now());
         let mut started = Vec::new();
+        let now = Instant::now();
         if aliases.is_empty() || self.refreshing.len() >= MAX_CONCURRENT_PROBES {
             self.log("refresh already in progress");
             return started;
@@ -557,6 +569,8 @@ impl ClusterApp {
                 continue;
             }
             self.refreshing.insert(alias.clone());
+            self.refresh_deadlines
+                .insert(alias.clone(), now + PROBE_TIMEOUT);
             started.push(alias.clone());
             last_index = index;
             self.snapshots
@@ -574,7 +588,11 @@ impl ClusterApp {
     }
 
     pub fn apply_snapshot(&mut self, snapshot: HostSnapshot) {
+        if !self.refreshing.contains(&snapshot.alias) {
+            return;
+        }
         self.refreshing.remove(&snapshot.alias);
+        self.refresh_deadlines.remove(&snapshot.alias);
         let alias = snapshot.alias.clone();
         let snapshot = self.merge_last_good_snapshot(snapshot);
         let state = snapshot.connection.label();
@@ -633,12 +651,13 @@ impl ClusterApp {
         self.cursor
     }
 
-    pub fn selected_host(&self) -> &HostConfig {
-        &self.hosts[self.cursor]
+    pub fn selected_host(&self) -> Option<&HostConfig> {
+        self.hosts.get(self.cursor)
     }
 
     pub fn selected_snapshot(&self) -> Option<&HostSnapshot> {
-        self.snapshots.get(self.selected_host().alias())
+        self.selected_host()
+            .and_then(|host| self.snapshots.get(host.alias()))
     }
 
     pub fn snapshot_for(&self, alias: &str) -> Option<&HostSnapshot> {
@@ -699,6 +718,21 @@ impl ClusterApp {
             .values()
             .filter(|snapshot| snapshot.connection == state)
             .count()
+    }
+
+    fn mark_timed_out_refreshes(&mut self) {
+        let timed_out_aliases = self
+            .refresh_deadlines
+            .iter()
+            .filter_map(|(alias, deadline)| (Instant::now() >= *deadline).then(|| alias.clone()))
+            .collect::<Vec<_>>();
+
+        for alias in timed_out_aliases {
+            self.apply_snapshot(HostSnapshot::failed(
+                &alias,
+                format!("probe timed out after {}s", PROBE_TIMEOUT.as_secs()),
+            ));
+        }
     }
 
     fn merge_last_good_snapshot(&self, snapshot: HostSnapshot) -> HostSnapshot {
@@ -773,6 +807,7 @@ pub fn run_with_inventory(inventory: ClusterInventory) -> Result<()> {
 
     while !app.should_quit() {
         drain_snapshots(&mut app, &rx);
+        app.mark_timed_out_refreshes();
 
         if app.refresh_due(DEFAULT_REFRESH_INTERVAL) {
             start_refresh_all(&mut app, tx.clone());
@@ -853,7 +888,9 @@ fn start_refresh_all(app: &mut ClusterApp, tx: mpsc::Sender<HostSnapshot>) {
 }
 
 fn start_refresh_selected(app: &mut ClusterApp, tx: mpsc::Sender<HostSnapshot>) {
-    let host = app.selected_host().clone();
+    let Some(host) = app.selected_host().cloned() else {
+        return;
+    };
     if app.begin_refresh(&[host.alias().to_string()]).is_empty() {
         return;
     }
@@ -863,8 +900,10 @@ fn start_refresh_selected(app: &mut ClusterApp, tx: mpsc::Sender<HostSnapshot>) 
 }
 
 fn run_local_probe() -> Result<String> {
-    let mut command = ProcessCommand::new("sh");
-    command.arg("-lc").arg(PROBE_SCRIPT);
+    let (program, mut args) = local_probe_shell();
+    let mut command = ProcessCommand::new(program);
+    command.args(args.drain(..));
+    command.arg(PROBE_SCRIPT);
     run_command_with_timeout(command, PROBE_TIMEOUT)
 }
 
@@ -895,7 +934,7 @@ pub fn ssh_probe_args(host: &HostConfig) -> Vec<String> {
         args.push(host.proxy_jump_target().unwrap_or(proxy_jump).to_string());
     }
     args.push(host.ssh_target().to_string());
-    args.push(format!("sh -lc {}", shell_quote(PROBE_SCRIPT)));
+    args.push(remote_probe_command(PROBE_SCRIPT));
     args
 }
 
@@ -985,7 +1024,9 @@ pub fn ssh_workbench_args(host: &HostConfig) -> Vec<String> {
 }
 
 fn open_selected_session(app: &mut ClusterApp, guard: &TerminalGuard) -> Result<()> {
-    let host = app.selected_host().clone();
+    let Some(host) = app.selected_host().cloned() else {
+        return Ok(());
+    };
     let local_shell = env::var("SHELL").ok();
     let command = host_session_command(&host, local_shell.as_deref());
 
@@ -999,7 +1040,9 @@ fn open_selected_session(app: &mut ClusterApp, guard: &TerminalGuard) -> Result<
 }
 
 fn open_selected_workbench(app: &mut ClusterApp, guard: &TerminalGuard) -> Result<()> {
-    let host = app.selected_host().clone();
+    let Some(host) = app.selected_host().cloned() else {
+        return Ok(());
+    };
     let current_tersh = current_tersh_program();
     let command = host_workbench_command(&host, &current_tersh);
 
@@ -1034,38 +1077,95 @@ fn remote_workbench_command(workdir: Option<&str>) -> String {
         Some(workdir) => format!("cd -- {} && exec tersh", shell_quote(workdir)),
         None => "exec tersh".to_string(),
     };
-    format!("sh -lc {}", shell_quote(&script))
+    remote_probe_command(&script)
+}
+
+fn remote_probe_command(script: &str) -> String {
+    if cfg!(windows) {
+        format!("cmd /C \"{}\"", script.replace('"', "\\\""))
+    } else {
+        format!("sh -lc {}", shell_quote(script))
+    }
+}
+
+#[cfg(not(windows))]
+fn local_probe_shell() -> (&'static str, Vec<String>) {
+    ("sh", vec!["-lc".to_string()])
+}
+
+#[cfg(windows)]
+fn local_probe_shell() -> (&'static str, Vec<String>) {
+    ("cmd", vec!["/C".to_string()])
 }
 
 fn run_command_with_timeout(mut command: ProcessCommand, timeout: Duration) -> Result<String> {
+    let temp_stdout = tempfile_path("tersh-probe-stdout");
+    let temp_stderr = tempfile_path("tersh-probe-stderr");
+    let stdout = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .truncate(true)
+        .open(&temp_stdout)
+        .context("create temp stdout file")?;
+    let stderr = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .truncate(true)
+        .open(&temp_stderr)
+        .context("create temp stderr file")?;
+
     let mut child = command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
         .spawn()
         .context("start probe command")?;
     let started = Instant::now();
-
-    loop {
-        if child.try_wait()?.is_some() {
-            let output = child.wait_with_output()?;
-            if output.status.success() {
-                return Ok(String::from_utf8_lossy(&output.stdout).to_string());
-            }
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            if stderr.is_empty() {
-                anyhow::bail!("probe exited with {}", output.status);
-            }
-            anyhow::bail!("{stderr}");
+    let mut timed_out = false;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
         }
-
         if started.elapsed() >= timeout {
+            timed_out = true;
             let _ = child.kill();
-            let _ = child.wait_with_output();
-            anyhow::bail!("probe timed out after {}s", timeout.as_secs());
+            break child.wait().context("wait probe command after timeout")?;
         }
-
         thread::sleep(Duration::from_millis(50));
+    };
+
+    let stdout = fs::read_to_string(&temp_stdout)
+        .with_context(|| format!("failed to read {}", temp_stdout.display()))?;
+    let stderr = fs::read_to_string(&temp_stderr)
+        .with_context(|| format!("failed to read {}", temp_stderr.display()))?;
+    let _ = fs::remove_file(&temp_stdout);
+    let _ = fs::remove_file(&temp_stderr);
+
+    if timed_out {
+        let mut message = format!("probe timed out after {}s", timeout.as_secs());
+        let details = stderr.trim();
+        if !details.is_empty() {
+            message = format!("{message}: {details}");
+        }
+        anyhow::bail!(message);
     }
+
+    if status.success() {
+        return Ok(stdout);
+    }
+    let stderr = stderr.trim().to_string();
+    if stderr.is_empty() {
+        anyhow::bail!("probe exited with {}", status);
+    }
+    anyhow::bail!("{stderr}");
+}
+
+fn tempfile_path(prefix: &str) -> PathBuf {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|time| time.as_nanos())
+        .unwrap_or_default();
+    let pid = std::process::id();
+    std::env::temp_dir().join(format!("{prefix}-{pid}-{now}.log"))
 }
 
 fn key_to_command(key: KeyEvent) -> Option<ClusterCommand> {
