@@ -176,7 +176,10 @@ fn draw_dashboard(frame: &mut Frame, area: Rect, app: &ClusterApp) {
 }
 
 fn draw_compact_dashboard(frame: &mut Frame, area: Rect, app: &ClusterApp) {
-    let mut lines = compact_route_lines(app.selected_host());
+    let mut lines = match app.selected_host() {
+        Some(host) => compact_route_lines(host),
+        None => vec![Line::from("No cluster hosts available"), Line::from("")],
+    };
     lines.extend(compact_status_lines(app));
 
     let paragraph =
@@ -234,7 +237,9 @@ fn compact_route_lines(host: &crate::cluster::HostConfig) -> Vec<Line<'static>> 
 }
 
 fn compact_status_lines(app: &ClusterApp) -> Vec<Line<'static>> {
-    let host = app.selected_host();
+    let Some(host) = app.selected_host() else {
+        return vec![Line::from("Host: n/a")];
+    };
     let Some(snapshot) = app.selected_snapshot() else {
         return vec![
             Line::from(format!(
@@ -274,7 +279,10 @@ fn compact_status_lines(app: &ClusterApp) -> Vec<Line<'static>> {
 }
 
 fn draw_route(frame: &mut Frame, area: Rect, app: &ClusterApp) {
-    let paragraph = Paragraph::new(route_lines(app.selected_host()))
+    let paragraph = Paragraph::new(match app.selected_host() {
+        Some(host) => route_lines(host),
+        None => vec![Line::from("No route available")],
+    })
         .block(base_block().title("Route").borders(Borders::ALL))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
@@ -343,7 +351,9 @@ fn draw_detail_panel(frame: &mut Frame, area: Rect, app: &ClusterApp) {
 }
 
 fn detail_lines(app: &ClusterApp, include_logs: bool) -> Vec<Line<'static>> {
-    let host = app.selected_host();
+    let Some(host) = app.selected_host() else {
+        return vec![Line::from("No host selected")];
+    };
     let snapshot = app.selected_snapshot();
     let mut lines = vec![Line::from(vec![
         Span::styled(

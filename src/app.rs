@@ -14,9 +14,12 @@ use crossterm::{
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{
+    collections::hash_map::DefaultHasher,
     collections::BTreeSet,
+    ffi::{CStr, CString},
     fs,
-    io::{self, Write},
+    hash::{Hash, Hasher},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     process::Command as ProcessCommand,
     time::{Duration, SystemTime},
@@ -103,6 +106,7 @@ pub struct App {
     preview_search_index: Option<usize>,
     mode: Mode,
     should_quit: bool,
+    terminal_output: TerminalOutput,
     show_hidden: bool,
     filter: String,
     input: String,
@@ -138,6 +142,8 @@ struct PreviewSignature {
     len: u64,
     modified: Option<SystemTime>,
     kind: FileKind,
+    symlink_target: Option<PathBuf>,
+    sample_hash: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -149,6 +155,10 @@ struct CachedPreview {
 
 impl App {
     pub fn new(path: PathBuf) -> Result<Self> {
+        Self::new_with_output(path, TerminalOutput::Stdout)
+    }
+
+    fn new_with_output(path: PathBuf, terminal_output: TerminalOutput) -> Result<Self> {
         let cwd = path
             .canonicalize()
             .with_context(|| format!("failed to resolve {}", path.display()))?;
@@ -166,6 +176,7 @@ impl App {
             preview_search_index: None,
             mode: Mode::Normal,
             should_quit: false,
+            terminal_output,
             show_hidden: false,
             filter: String::new(),
             input: String::new(),
@@ -224,6 +235,7 @@ impl App {
             preview_search_index: None,
             mode: Mode::Normal,
             should_quit: false,
+            terminal_output: TerminalOutput::Stdout,
             show_hidden: false,
             filter: String::new(),
             input: String::new(),
@@ -852,22 +864,36 @@ impl App {
     }
 
     fn launch_editor(&self, path: &Path) -> Result<()> {
-        let mut stdout = io::stdout();
-        execute!(stdout, LeaveAlternateScreen)?;
-        disable_raw_mode()?;
-        let editor = std::env::var_os("VISUAL")
+        let editor_command = std::env::var_os("VISUAL")
             .or_else(|| std::env::var_os("EDITOR"))
-            .unwrap_or_else(|| "nano".into());
-        let status = ProcessCommand::new(editor).arg(path).status();
+            .unwrap_or_else(|| "nano".into())
+            .to_string_lossy()
+            .to_string();
+        let editor_parts = parse_command(editor_command).unwrap_or_else(|| vec!["nano".to_string()]);
+        let Some((editor, args)) = editor_parts.split_first() else {
+            return Err(anyhow::anyhow!("no editor command resolved"));
+        };
+
+        let mut output = self.terminal_output.writer();
+        execute!(output, LeaveAlternateScreen)?;
+        disable_raw_mode()?;
+
+        let status = ProcessCommand::new(editor)
+            .args(args)
+            .arg(path)
+            .status();
         let status = match status {
             Ok(status) => status,
             Err(err) => {
-                let _ = execute!(stdout, EnterAlternateScreen);
+                let mut output = self.terminal_output.writer();
+                let _ = execute!(output, EnterAlternateScreen);
                 let _ = enable_raw_mode();
                 return Err(err.into());
             }
         };
-        execute!(stdout, EnterAlternateScreen)?;
+
+        let mut output = self.terminal_output.writer();
+        execute!(output, EnterAlternateScreen)?;
         enable_raw_mode()?;
         if !status.success() {
             return Err(anyhow::anyhow!("editor exited with {status}"));
@@ -1289,7 +1315,7 @@ fn run_tui(path: PathBuf, output: TerminalOutput) -> Result<PathBuf> {
     let backend = CrosstermBackend::new(output.writer());
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
-    let mut app = App::new(path)?;
+    let mut app = App::new_with_output(path, output)?;
 
     while !app.should_quit() {
         terminal.draw(|frame| crate::ui::draw(frame, &app))?;
@@ -1361,11 +1387,43 @@ fn preview_signature(path: &Path) -> Option<PreviewSignature> {
     } else {
         FileKind::Other
     };
+
+    let symlink_target = if kind == FileKind::Symlink {
+        fs::read_link(path).ok()
+    } else {
+        None
+    };
+
+    let sample_hash = if kind == FileKind::File {
+        preview_file_hash(path)
+    } else {
+        None
+    };
+
     Some(PreviewSignature {
         len: metadata.len(),
         modified: metadata.modified().ok(),
         kind,
+        symlink_target,
+        sample_hash,
     })
+}
+
+fn preview_file_hash(path: &Path) -> Option<u64> {
+    let mut file = fs::File::open(path).ok()?;
+    let mut buffer = [0; 4096];
+    let read = file.read(&mut buffer).ok()?;
+    let bytes = &buffer[..read];
+    let mut hasher = DefaultHasher::new();
+    metadata_size(path).hash(&mut hasher);
+    bytes.hash(&mut hasher);
+    Some(hasher.finish())
+}
+
+fn metadata_size(path: &Path) -> u64 {
+    fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .unwrap_or_default()
 }
 
 fn kind_rank(kind: FileKind) -> u8 {
@@ -1379,16 +1437,115 @@ fn kind_rank(kind: FileKind) -> u8 {
 
 fn expand_path(input: &str) -> PathBuf {
     if input == "~" {
-        return std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(input));
+        return expand_user_home("~").unwrap_or_else(|| PathBuf::from(input));
     }
-    if let Some(rest) = input.strip_prefix("~/")
-        && let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
+    if let Some(rest) = input.strip_prefix("~/") {
+        return expand_user_home("~")
+            .unwrap_or_else(|| PathBuf::from("~"))
+            .join(rest);
+    }
+    if let Some((user, rest)) = input.split_once('/')
+        && user.starts_with('~')
+        && user.len() > 1
     {
-        return home.join(rest);
+        if let Some(home) = expand_user_home(user) {
+            return home.join(rest);
+        }
     }
     PathBuf::from(input)
+}
+
+#[cfg(unix)]
+fn expand_user_home(user: &str) -> Option<PathBuf> {
+    let name = user.strip_prefix('~')?;
+    let (c_name, is_current) = if name.is_empty() {
+        (None, true)
+    } else {
+        (Some(CString::new(name).ok()?), false)
+    };
+
+    // SAFETY: `libc::getpwuid` and `libc::getpwnam` return pointers that are valid until next call.
+    unsafe {
+        let entry = if is_current {
+            libc::getpwuid(libc::geteuid())
+        } else {
+            libc::getpwnam(c_name.map_or(std::ptr::null(), |value| value.as_ptr()))
+        };
+        if entry.is_null() {
+            return None;
+        }
+        let home = CStr::from_ptr((*entry).pw_dir);
+        Some(PathBuf::from(home.to_string_lossy().to_string()))
+    }
+}
+
+#[cfg(not(unix))]
+fn expand_user_home(user: &str) -> Option<PathBuf> {
+    if user != "~" {
+        return None;
+    }
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+fn parse_command(input: String) -> Option<Vec<String>> {
+    enum State {
+        Normal,
+        Single,
+        Double,
+    }
+    let mut state = State::Normal;
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match state {
+            State::Normal => match ch {
+                '\'' => state = State::Single,
+                '"' => state = State::Double,
+                '\\' => {
+                    if let Some(next) = chars.next() {
+                        current.push(next);
+                    }
+                }
+                c if c.is_whitespace() => {
+                    if !current.is_empty() {
+                        args.push(std::mem::take(&mut current));
+                    }
+                }
+                c => current.push(c),
+            },
+            State::Single => match ch {
+                '\'' => state = State::Normal,
+                _ => current.push(ch),
+            },
+            State::Double => match ch {
+                '"' => state = State::Normal,
+                '\\' => {
+                    if let Some(next) = chars.next() {
+                        match next {
+                            '\n' => current.push('\n'),
+                            '"' | '\\' => current.push(next),
+                            _ => {
+                                current.push('\\');
+                                current.push(next);
+                            }
+                        }
+                    }
+                }
+                _ => current.push(ch),
+            },
+        }
+    }
+
+    if !current.is_empty() {
+        args.push(current);
+    }
+
+    match state {
+        State::Normal if !args.is_empty() => Some(args),
+        _ => None,
+    }
 }
 
 fn is_cancel_key(key: KeyEvent) -> bool {

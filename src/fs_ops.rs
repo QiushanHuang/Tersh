@@ -11,7 +11,7 @@ pub enum DeleteDecision {
 }
 
 pub fn copy_path(source: &Path, target: &Path, replace: bool) -> Result<()> {
-    if path_exists_no_follow(target) {
+    if path_exists_no_follow(target)? {
         if replace {
             remove_existing(target)?;
         } else {
@@ -26,7 +26,8 @@ pub fn copy_path(source: &Path, target: &Path, replace: bool) -> Result<()> {
     if metadata.file_type().is_symlink() {
         let link_target = fs::read_link(source)
             .with_context(|| format!("failed to read symlink {}", source.display()))?;
-        create_symlink(&link_target, target, false)
+        let is_dir = symlink_target_is_dir(source, &link_target)?;
+        create_symlink(&link_target, target, is_dir)
     } else if metadata.is_dir() {
         copy_dir_recursive(source, target)
     } else if metadata.is_file() {
@@ -48,7 +49,7 @@ pub fn copy_path(source: &Path, target: &Path, replace: bool) -> Result<()> {
 }
 
 pub fn rename_path(source: &Path, target: &Path) -> Result<()> {
-    if path_exists_no_follow(target) {
+    if path_exists_no_follow(target)? {
         bail!("target already exists: {}", target.display());
     }
     fs::rename(source, target).with_context(|| {
@@ -67,7 +68,7 @@ pub fn trash_path(path: &Path, work_root: &Path) -> Result<DeleteDecision> {
         .file_name()
         .ok_or_else(|| anyhow!("cannot trash path without file name: {}", path.display()))?;
     let mut target = trash_dir.join(file_name);
-    if path_exists_no_follow(&target) {
+    if path_exists_no_follow(&target)? {
         target = trash_dir.join(format!(
             "{}.{}",
             file_name.to_string_lossy(),
@@ -174,10 +175,28 @@ fn reject_copy_into_self(source: &Path, target: &Path) -> Result<()> {
     Ok(())
 }
 
-fn path_exists_no_follow(path: &Path) -> bool {
+fn path_exists_no_follow(path: &Path) -> Result<bool> {
     match fs::symlink_metadata(path) {
-        Ok(_) => true,
-        Err(err) => err.kind() != std::io::ErrorKind::NotFound,
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err).with_context(|| format!("failed to inspect {}", path.display())),
+    }
+}
+
+fn symlink_target_is_dir(source: &Path, link_target: &Path) -> Result<bool> {
+    let target_path = if link_target.is_absolute() {
+        link_target.to_path_buf()
+    } else {
+        source
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join(link_target)
+    };
+    match fs::metadata(&target_path) {
+        Ok(metadata) => Ok(metadata.is_dir()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err)
+            .with_context(|| format!("failed to inspect symlink target {}", target_path.display())),
     }
 }
 

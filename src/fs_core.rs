@@ -85,9 +85,7 @@ pub fn read_dir_entries(path: &Path, show_hidden: bool, filter: &str) -> Result<
         if !filter.is_empty() && !name.to_lowercase().contains(&filter) {
             continue;
         }
-        if let Ok(entry) = FileEntry::from_path(entry.path()) {
-            entries.push(entry);
-        }
+        entries.push(FileEntry::from_path(entry.path())?);
     }
     entries.sort_by(|a, b| {
         let ak = match a.kind {

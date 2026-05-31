@@ -287,7 +287,7 @@ fn cluster_app_tracks_selection_updates_and_summary_counts() {
 
     app.apply(ClusterCommand::Down);
     app.apply(ClusterCommand::Down);
-    assert_eq!(app.selected_host().alias(), "school-star");
+    assert_eq!(app.selected_host().unwrap().alias(), "school-star");
 
     app.apply_snapshot(HostSnapshot::online(
         "school-star",
