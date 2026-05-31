@@ -1,4 +1,4 @@
-use crate::fs_core::{escape_display, format_size};
+use crate::fs_core::{display_path, escape_display, format_size};
 use anyhow::{Context, Result};
 use std::{
     fs::{self, File},
@@ -43,7 +43,7 @@ impl Preview {
 
 pub fn preview_file(path: &Path) -> Result<Preview> {
     let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("failed to preview {}", path.display()))?;
+        .with_context(|| format!("failed to preview {}", display_path(path)))?;
     let file_type = metadata.file_type();
     if file_type.is_symlink() {
         let target = fs::read_link(path)
@@ -53,7 +53,7 @@ pub fn preview_file(path: &Path) -> Result<Preview> {
             path: path.to_path_buf(),
             kind: PreviewKind::Symlink,
             lines: vec![
-                format!("Symlink · {}", format_size(metadata.len())),
+                format!("Symlink - {}", format_size(metadata.len())),
                 format!("Target: {}", escape_display(&target)),
                 "Preview does not follow symlinks.".to_string(),
             ],
@@ -99,7 +99,7 @@ pub fn preview_file(path: &Path) -> Result<Preview> {
             path: path.to_path_buf(),
             kind: PreviewKind::Binary,
             lines: vec![
-                format!("Binary file · {}", format_size(metadata.len())),
+                format!("Binary file - {}", format_size(metadata.len())),
                 format!("Hex preview: {hex}"),
             ],
             truncated: metadata.len() as usize > DETECT_LIMIT,
@@ -133,7 +133,7 @@ pub fn preview_file(path: &Path) -> Result<Preview> {
             path: path.to_path_buf(),
             kind: PreviewKind::Binary,
             lines: vec![
-                format!("Binary file · {}", format_size(metadata.len())),
+                format!("Binary file - {}", format_size(metadata.len())),
                 format!("Hex preview: {hex}"),
             ],
             truncated,
@@ -166,9 +166,9 @@ fn open_regular_file(path: &Path) -> Result<(File, fs::Metadata)> {
     let file = open_no_follow(path)?;
     let metadata = file
         .metadata()
-        .with_context(|| format!("failed to inspect opened file {}", path.display()))?;
+        .with_context(|| format!("failed to inspect opened file {}", display_path(path)))?;
     if !metadata.file_type().is_file() {
-        anyhow::bail!("unsupported file type for preview: {}", path.display());
+        anyhow::bail!("unsupported file type for preview: {}", display_path(path));
     }
     Ok((file, metadata))
 }
@@ -182,12 +182,12 @@ fn open_no_follow(path: &Path) -> Result<File> {
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
-        .with_context(|| format!("failed to open {}", path.display()))
+        .with_context(|| format!("failed to open {}", display_path(path)))
 }
 
 #[cfg(not(unix))]
 fn open_no_follow(path: &Path) -> Result<File> {
-    File::open(path).with_context(|| format!("failed to open {}", path.display()))
+    File::open(path).with_context(|| format!("failed to open {}", display_path(path)))
 }
 
 fn looks_binary(bytes: &[u8]) -> bool {

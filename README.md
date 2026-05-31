@@ -6,9 +6,9 @@
 [![Rust](https://img.shields.io/badge/Rust-2024-000000?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Terminal UI](https://img.shields.io/badge/TUI-ratatui-1f2937)](https://ratatui.rs/)
 [![Shell Workflow](https://img.shields.io/badge/Workflow-Local%20%7C%20SSH%20Shell-0f766e)](#local-and-ssh-shell-sessions)
-[![Mobile Friendly](https://img.shields.io/badge/Focus-Mobile--Friendly-2563eb)](#mobile-first-remote-workflow)
+[![Mobile Friendly](https://img.shields.io/badge/Focus-Mobile--Friendly-2563eb)](#mobile-friendly-terminal-workflow)
 [![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Linux-475569)](#installation)
-[![Status](https://img.shields.io/badge/Status-V1-16a34a)](#project-status)
+[![Status](https://img.shields.io/badge/Status-v1.1.0-16a34a)](#project-status)
 [![License](https://img.shields.io/badge/License-MIT-16a34a)](#license)
 
 <a id="english"></a>
@@ -59,18 +59,34 @@ This matters when your working environment is:
 ## Features
 
 - Full-screen terminal file workbench
+- btop-inspired status header, sortable file list, and inspector panel
 - Directory navigation with keyboard-first controls
 - Optional shell wrapper for visual `cd` from the terminal
 - Inline file preview
 - Enter fullscreen preview for files with full-content scrolling/search/jump
 - Filter the current directory
-- Quick file edit with `nano` (`e`)
+- Quick file edit with `$VISUAL`, `$EDITOR`, or `nano` fallback (`e`)
 - Copy, cut, paste, rename, and move workflows
 - Safe trash flow before permanent deletion
 - Copy file name, relative path, and absolute path
 - Compact info pane and operation log
 - Hidden file toggle
 - `tersh --c` multi-server status dashboard for local, jump, and remote hosts
+
+## v1.1.0 Release Highlights
+
+Tersh v1.1.0 is a small product-quality release focused on a denser, btop-inspired terminal interface and safer day-to-day remote file work.
+
+- Added a status header that keeps path, item count, selection size, copy/cut buffer state, hidden-file state, filter text, and sort mode visible.
+- Changed the file list into a denser operational table with selection, file kind, permission, size, name, and active sort context.
+- Added sortable browsing with `s` to cycle sort modes and `S` to reverse the current sort.
+- Reworked the side info pane into an Inspector with target, buffer, search/sort, and log sections.
+- Reworked cluster dashboard status into colored `OK` / `OLD` / `FAIL` / `CHK` tokens and added per-host latency, memory, and disk columns.
+- Added `Esc` as a cancel key alongside `Ctrl+G` for prompts, overlays, and cluster detail.
+- Strengthened terminal display safety by escaping control characters in rendered paths and prompt input.
+- Editing now refuses symlinks and special files, matching the safe preview model; `$VISUAL` and `$EDITOR` are respected before falling back to `nano`.
+- Multi-target delete/trash confirmations now show whether the operation comes from the focused item or selection and list the first affected paths.
+- Directory reloads skip transient metadata failures for individual entries instead of clearing the entire view.
 
 ## V1 Release Highlights
 
@@ -100,13 +116,18 @@ if ! command -v cargo >/dev/null 2>&1; then
 fi
 
 export PATH="$HOME/.cargo/bin:$PATH"
-cargo install --git https://github.com/QiushanHuang/Tersh.git --bin tersh --force
+if command -v rustup >/dev/null 2>&1; then
+  rustup update stable
+fi
+cargo install --git https://github.com/QiushanHuang/Tersh.git --tag v1.1.0 --bin tersh --force
 
 tersh --help
 tersh
 ```
 
 Run this same block on a remote server after SSH if you want `tersh --c` -> `t` to open the Tersh workbench on that remote host.
+
+Tersh v1.1.0 requires Rust 1.85 or newer.
 
 ### Clone And Install From Source
 
@@ -206,6 +227,8 @@ Then run `tcd`, browse from directory A to directory B, and quit. Your shell wil
 - `:`: go to directory
 - `.`: toggle hidden files
 - `r`: refresh
+- `s`: cycle sort mode
+- `S`: reverse current sort
 
 ### Preview Mode
 
@@ -217,7 +240,7 @@ Then run `tcd`, browse from directory A to directory B, and quit. Your shell wil
 - `End` or `G`: jump to bottom
 - `/`: find in preview
 - `n` / `N`: next / previous match
-- `e`: open current file in `nano`
+- `e`: open current regular file in `$VISUAL`, `$EDITOR`, or `nano`
 
 ### File Operations
 
@@ -240,7 +263,7 @@ Then run `tcd`, browse from directory A to directory B, and quit. Your shell wil
 ### Exit and Help
 
 - `?`: help
-- `Ctrl+G`: cancel
+- `Esc` or `Ctrl+G`: cancel
 - `q`: quit
 - `Q` or `Ctrl+C`: force quit
 
@@ -260,13 +283,14 @@ It aims to keep the speed and portability of terminal work while removing repeti
 
 ## Project Status
 
-This repository is at V1.
+This repository is at v1.1.0.
 
-The V1 implementation focuses on a stable terminal workflow:
+The current implementation focuses on a stable terminal workflow:
 
 - browse
 - preview
 - filter
+- sort
 - copy and move
 - rename
 - trash and delete
@@ -290,6 +314,8 @@ The codebase is organized around a small Rust TUI core:
 - `src/fs_ops.rs`: copy, rename, trash, delete, and path operations
 - `src/preview.rs`: file preview logic
 - `src/clipboard.rs`: clipboard integration helpers
+- `src/cluster.rs`: cluster inventory, probing, and state handling
+- `src/cluster_ui.rs`: cluster status dashboard rendering
 
 ## Roadmap
 
@@ -358,18 +384,34 @@ MIT
 ## 功能特性
 
 - 全屏终端文件工作台
+- 参考 btop 的状态栏、可排序文件列表和 Inspector 信息面板
 - 键盘优先的目录浏览
 - 可选 shell 包装函数，让 `tersh` 作为可视化 `cd` 使用
 - 文件内联预览
 - 回车进入全文预览，可快速滚动、跳转与查找
 - 当前目录筛选
-- 可在预览中用 `e` 快速调用 `nano` 编辑
+- 可在预览中用 `e` 调用 `$VISUAL`、`$EDITOR` 或 `nano` 进行编辑
 - 复制、剪切、粘贴、重命名与移动
 - 先入回收站再永久删除的安全流程
 - 复制文件名、相对路径和绝对路径
 - 紧凑的信息面板和操作日志
 - 隐藏文件开关
 - `tersh --c` 多服务器状态面板，可查看本机、跳板机和远端服务器
+
+## v1.1.0 更新重点
+
+Tersh v1.1.0 是一次小版本产品质量更新，重点是更接近 btop 的高密度终端界面，以及更安全、更稳定的远程文件工作流。
+
+- 新增顶部状态栏，持续展示路径、条目数量、已选大小、复制/剪切缓冲区、隐藏文件状态、筛选文本和排序模式。
+- 文件列表改为更紧凑的操作表格，显示选择状态、文件类型、权限、大小、名称和当前排序上下文。
+- 新增 `s` 循环排序模式，`S` 反转当前排序。
+- 侧边信息区改为 Inspector，分块展示目标、缓冲区、搜索/排序和日志。
+- 集群状态栏改为彩色 `OK` / `OLD` / `FAIL` / `CHK` 指标，并在主机列表中增加延迟、内存和磁盘列。
+- 新增 `Esc` 作为取消键，与 `Ctrl+G` 一起用于输入框、弹层和集群详情页。
+- 渲染路径和输入内容时会转义控制字符，避免异常文件名污染终端界面。
+- 编辑功能会拒绝符号链接和特殊文件，与安全预览模型保持一致；编辑器优先使用 `$VISUAL` 和 `$EDITOR`，最后回退到 `nano`。
+- 多目标删除/回收站确认会显示操作来源是当前焦点还是多选，并列出前几个目标路径。
+- 目录刷新遇到单个条目的临时 metadata 失败时会跳过该条目，不再清空整个列表。
 
 ## V1 更新重点
 
@@ -399,13 +441,18 @@ if ! command -v cargo >/dev/null 2>&1; then
 fi
 
 export PATH="$HOME/.cargo/bin:$PATH"
-cargo install --git https://github.com/QiushanHuang/Tersh.git --bin tersh --force
+if command -v rustup >/dev/null 2>&1; then
+  rustup update stable
+fi
+cargo install --git https://github.com/QiushanHuang/Tersh.git --tag v1.1.0 --bin tersh --force
 
 tersh --help
 tersh
 ```
 
 如果你已经 SSH 到服务器上，就在服务器终端里运行同一段命令；这样 `tersh --c` -> `t` 才能在那台远端主机上打开 Tersh 文件工作台。
+
+Tersh v1.1.0 需要 Rust 1.85 或更新版本。
 
 ### 克隆源码并安装
 
@@ -505,6 +552,8 @@ alias tcd=tersh-cd
 - `:`：跳转目录
 - `.`：切换隐藏文件显示
 - `r`：刷新
+- `s`：循环排序模式
+- `S`：反转当前排序
 
 ### 全屏预览
 
@@ -516,7 +565,7 @@ alias tcd=tersh-cd
 - `End` 或 `G`：跳到底部
 - `/`：在预览中查找
 - `n` / `N`：下一个 / 上一个匹配
-- `e`：使用 `nano` 打开当前文件编辑
+- `e`：使用 `$VISUAL`、`$EDITOR` 或 `nano` 打开当前普通文件编辑
 
 ### 文件操作
 
@@ -539,7 +588,7 @@ alias tcd=tersh-cd
 ### 退出与帮助
 
 - `?`：帮助
-- `Ctrl+G`：取消
+- `Esc` 或 `Ctrl+G`：取消
 - `q`：退出
 - `Q` 或 `Ctrl+C`：强制退出
 
@@ -559,13 +608,14 @@ Tersh 处在原始 shell 命令和完整远程文件管理器之间。
 
 ## 项目状态
 
-项目目前已进入 V1。
+项目目前已进入 v1.1.0。
 
-V1 实现聚焦在一条稳定的终端工作流上：
+当前实现聚焦在一条稳定的终端工作流上：
 
 - 浏览
 - 预览
 - 筛选
+- 排序
 - 复制与移动
 - 重命名
 - 回收站与删除
@@ -589,6 +639,8 @@ V1 实现聚焦在一条稳定的终端工作流上：
 - `src/fs_ops.rs`：复制、重命名、回收站、删除与路径操作
 - `src/preview.rs`：文件预览逻辑
 - `src/clipboard.rs`：剪贴板集成辅助
+- `src/cluster.rs`：集群清单、探测和状态处理
+- `src/cluster_ui.rs`：集群状态面板渲染
 
 ## 路线图
 

@@ -498,6 +498,10 @@ fn cluster_render_shows_host_list_detail_metrics_and_footer_keys() {
         .map(|cell| cell.symbol())
         .collect::<String>();
     assert!(buffer.contains("Cluster Status"));
+    assert!(buffer.contains("OK 1"));
+    assert!(buffer.contains("OLD 0"));
+    assert!(buffer.contains("FAIL 0"));
+    assert!(buffer.contains("CHK 0/4"));
     assert!(buffer.contains("Route"));
     assert!(buffer.contains("LOCAL"));
     assert!(buffer.contains("JUMP"));
@@ -505,6 +509,8 @@ fn cluster_render_shows_host_list_detail_metrics_and_footer_keys() {
     assert!(buffer.contains("ssh -J"));
     assert!(buffer.contains("joshua@100.90.116.54"));
     assert!(buffer.contains("school-star"));
+    assert!(buffer.contains("87ms"));
+    assert!(buffer.contains("50%"));
     assert!(buffer.contains("CPU load"));
     assert!(buffer.contains("CPU load: 0.12 0.20 0.30"));
     assert!(!buffer.contains("CPU load: ["));
@@ -516,11 +522,28 @@ fn cluster_render_shows_host_list_detail_metrics_and_footer_keys() {
     assert!(buffer.contains("8G/20G 40% used"));
     assert!(buffer.contains("Tasks"));
     assert!(buffer.contains("GPU: ["));
+    assert!(buffer.contains("Health"));
+    assert!(buffer.contains("System"));
     assert!(buffer.contains("Log"));
     assert!(buffer.contains("r refresh"));
     assert!(buffer.contains("s shell/ssh"));
     assert!(buffer.contains("t tersh"));
     assert!(buffer.contains("q quit"));
+}
+
+#[test]
+fn cluster_escape_closes_detail_view() {
+    let inventory = ClusterInventory::from_json(CAMPUS_JSON).unwrap();
+    let mut app = ClusterApp::new(inventory.hosts().to_vec());
+    app.apply(ClusterCommand::OpenDetail);
+
+    let command = app.handle_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Esc,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+
+    assert_eq!(command, None);
+    assert_eq!(app.mode(), tersh::cluster::ClusterMode::Normal);
 }
 
 #[test]
@@ -548,6 +571,155 @@ fn cluster_render_tiny_keeps_exit_visible() {
 }
 
 #[test]
+fn cluster_render_long_host_rows_stay_single_line() {
+    let json = r#"
+{
+  "servers": [
+    {
+      "alias": "very-long-host-alias-for-rendering",
+      "ssh_user": "ops",
+      "campus_ip": "203.0.113.12345678901234567890",
+      "role": "Long address test"
+    },
+    {
+      "alias": "second-host",
+      "ssh_user": "ops",
+      "campus_ip": "203.0.113.20",
+      "role": "Visible after long row"
+    }
+  ]
+}
+"#;
+    let inventory = ClusterInventory::from_json(json).unwrap();
+    let app = ClusterApp::new(inventory.hosts().to_vec());
+
+    let backend = TestBackend::new(70, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| cluster_ui::draw(frame, &app))
+        .unwrap();
+
+    let buffer = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+
+    assert!(buffer.contains("second-host"));
+    assert!(buffer.contains("..."));
+}
+
+#[test]
+fn cluster_render_unicode_host_rows_stay_ascii_and_truncated() {
+    let json = r#"
+{
+  "servers": [
+    {
+      "alias": "服务器服务器服务器服务器服务器",
+      "ssh_user": "ops",
+      "campus_ip": "地址地址地址地址地址地址地址",
+      "role": "unicode"
+    },
+    {
+      "alias": "after-unicode",
+      "ssh_user": "ops",
+      "campus_ip": "203.0.113.30",
+      "role": "Visible after unicode row"
+    }
+  ]
+}
+"#;
+    let inventory = ClusterInventory::from_json(json).unwrap();
+    let app = ClusterApp::new(inventory.hosts().to_vec());
+
+    let backend = TestBackend::new(70, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| cluster_ui::draw(frame, &app))
+        .unwrap();
+
+    let buffer = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+
+    assert!(buffer.is_ascii());
+    assert!(buffer.contains("after-unicode"));
+}
+
+#[test]
+fn cluster_detail_escapes_dynamic_probe_and_inventory_text() {
+    let json = r#"
+{
+  "servers": [
+    {
+      "alias": "unicode-detail",
+      "ssh_user": "ops",
+      "campus_ip": "203.0.113.40",
+      "role": "Detail"
+    }
+  ]
+}
+"#;
+    let inventory = ClusterInventory::from_json(json).unwrap();
+    let mut app = ClusterApp::new(inventory.hosts().to_vec());
+    app.apply_snapshot(HostSnapshot::stale(
+        "unicode-detail",
+        ProbeReport::parse(
+            "hostname=主机\nsystem=Linux\u{1b}[31m\nuptime=up\nload=0.12\u{1b}[31m\nmemory=42% free\nstorage=8G/20G 40% used\ntasks=72\u{1b}[31m processes\ngpu=GPU😀 9%\n",
+        ),
+        "bad\n\u{1b}[31m error",
+    ));
+    app.apply(ClusterCommand::OpenDetail);
+
+    let backend = TestBackend::new(120, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| cluster_ui::draw(frame, &app))
+        .unwrap();
+
+    let buffer = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+
+    assert!(buffer.is_ascii());
+    assert!(buffer.contains("Error: bad"));
+    assert!(buffer.contains("?[31m"));
+    assert!(buffer.contains("Hostname: ??"));
+}
+
+#[test]
+fn cluster_operational_chrome_is_ascii() {
+    let inventory = ClusterInventory::from_json(CAMPUS_JSON).unwrap();
+    let app = ClusterApp::new(inventory.hosts().to_vec());
+
+    let backend = TestBackend::new(120, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| cluster_ui::draw(frame, &app))
+        .unwrap();
+
+    let buffer = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+
+    assert!(buffer.is_ascii());
+}
+
+#[test]
 fn cluster_help_footer_is_mode_specific() {
     let inventory = ClusterInventory::from_json(CAMPUS_JSON).unwrap();
     let mut app = ClusterApp::new(inventory.hosts().to_vec());
@@ -566,7 +738,7 @@ fn cluster_help_footer_is_mode_specific() {
         .iter()
         .map(|cell| cell.symbol())
         .collect::<String>();
-    assert!(buffer.contains("help | q close"));
+    assert!(buffer.contains("help | q/?/Enter/Esc close"));
     assert!(!buffer.contains("q quit | ? help | ^G back | ^C force | r refresh"));
 }
 
@@ -589,7 +761,7 @@ fn cluster_detail_footer_describes_back_action() {
         .iter()
         .map(|cell| cell.symbol())
         .collect::<String>();
-    assert!(buffer.contains("detail | q back"));
+    assert!(buffer.contains("detail | q/Esc back"));
     assert!(!buffer.contains("q quit | ? help | ^G back | ^C force | r refresh"));
 }
 

@@ -1,5 +1,40 @@
 # Changelog
 
+## v1.1.0 - 2026-05-31
+
+v1.1.0 is a small product-quality update that makes Tersh denser, more inspectable, and safer for remote terminal work.
+
+### Added
+
+- Added a btop-inspired file workbench header showing cwd, item count, selected size, copy/cut buffer state, hidden-file state, filter text, and sort mode.
+- Added sortable file browsing with `s` to cycle sort modes and `S` to reverse the current sort.
+- Added an Inspector panel that separates target metadata, buffer state, search/sort context, and logs.
+- Added cluster dashboard health tokens (`OK`, `OLD`, `FAIL`, `CHK`) plus per-host latency, memory, and disk columns.
+- Added `Esc` as a cancel key alongside `Ctrl+G`.
+- Added release documentation in `docs/releases/v1.1.0.md`.
+
+### Changed
+
+- Changed file rows into a denser operational table with selection, kind, permission, size, and name columns.
+- Changed edit behavior to respect `$VISUAL` and `$EDITOR` before falling back to `nano`.
+- Changed multi-target trash/delete confirmation dialogs to show operation source and the first affected paths.
+- Updated crate metadata to version `1.1.0` and declared `rust-version = "1.85"`.
+
+### Fixed
+
+- Fixed terminal display safety gaps by escaping rendered paths and prompt input.
+- Fixed edit safety so symlinks and special files are rejected instead of being handed to the editor.
+- Fixed directory reload behavior so transient metadata failures for one entry do not clear the whole view.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo clippy --locked --all-targets -- -D warnings`
+- `cargo test --locked --all-targets`
+- `cargo build --locked --release --bin tersh`
+- `./target/release/tersh --help`
+- `./target/release/tersh --version`
+
 ## V1 - 2026-05-31
 
 V1 turns Tersh into a safer and clearer product baseline for terminal file work and read-only multi-host checks.
@@ -55,6 +90,41 @@ V1 turns Tersh into a safer and clearer product baseline for terminal file work 
 - `t` exits back to the dashboard when the nested Tersh workbench exits with `q`.
 
 ## 中文更新说明
+
+### v1.1.0 - 2026-05-31
+
+v1.1.0 是一次小版本产品质量更新，让 Tersh 的终端界面更高密度、更容易扫读，也更适合远程文件工作。
+
+### 新增
+
+- 新增参考 btop 的文件工作台顶部状态栏，展示 cwd、条目数量、已选大小、复制/剪切缓冲区、隐藏文件状态、筛选文本和排序模式。
+- 新增 `s` 循环排序模式、`S` 反转当前排序。
+- 新增 Inspector 面板，分块展示目标元数据、缓冲区状态、搜索/排序上下文和日志。
+- 集群面板新增 `OK`、`OLD`、`FAIL`、`CHK` 健康指标，并在主机列表中显示延迟、内存和磁盘列。
+- 新增 `Esc` 作为取消键，与 `Ctrl+G` 一起使用。
+- 新增 `docs/releases/v1.1.0.md` 发行说明。
+
+### 调整
+
+- 文件行改为更紧凑的操作表格，展示选择、类型、权限、大小和名称。
+- 编辑器优先使用 `$VISUAL` 和 `$EDITOR`，最后回退到 `nano`。
+- 多目标删除/回收站确认会显示操作来源和前几个受影响路径。
+- crate 版本更新为 `1.1.0`，并声明 `rust-version = "1.85"`。
+
+### 修复
+
+- 修复路径和输入内容中的控制字符可能污染终端显示的问题。
+- 修复编辑功能会把符号链接和特殊文件交给编辑器的问题。
+- 修复目录刷新时单个条目 metadata 临时失败会清空整个视图的问题。
+
+### 验证
+
+- `cargo fmt --check`
+- `cargo clippy --locked --all-targets -- -D warnings`
+- `cargo test --locked --all-targets`
+- `cargo build --locked --release --bin tersh`
+- `./target/release/tersh --help`
+- `./target/release/tersh --version`
 
 ### V1 - 2026-05-31
 

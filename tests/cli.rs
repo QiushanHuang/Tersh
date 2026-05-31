@@ -47,6 +47,20 @@ fn help_documents_cluster_status_manager_flag() {
 }
 
 #[test]
+fn version_reports_minor_release() {
+    let binary = std::env::var("CARGO_BIN_EXE_tersh").expect("tersh binary target exists");
+    let output = Command::new(binary)
+        .arg("--version")
+        .output()
+        .expect("run tersh --version");
+
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8(output.stdout).expect("version output is utf-8");
+    assert!(stdout.contains("tersh 1.1.0"));
+}
+
+#[test]
 fn cluster_status_conflicts_with_print_cwd_wrapper_mode() {
     let binary = std::env::var("CARGO_BIN_EXE_tersh").expect("tersh binary target exists");
     let output = Command::new(binary)

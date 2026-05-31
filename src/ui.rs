@@ -1,13 +1,25 @@
 use crate::{
     app::{App, Mode},
-    fs_core::format_size,
+    fs_core::{display_path, escape_display, format_size},
 };
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
+    symbols::border,
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
+};
+
+const ASCII_BORDER: border::Set = border::Set {
+    top_left: "+",
+    top_right: "+",
+    bottom_left: "+",
+    bottom_right: "+",
+    vertical_left: "|",
+    vertical_right: "|",
+    horizontal_top: "-",
+    horizontal_bottom: "-",
 };
 
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -16,21 +28,31 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Mode::Preview | Mode::PreviewSearch => {
             let rows = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Min(3), Constraint::Length(2)])
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Min(3),
+                    Constraint::Length(2),
+                ])
                 .split(area);
-            draw_fullscreen_preview(frame, rows[0], app);
+            draw_header(frame, rows[0], app);
+            draw_fullscreen_preview(frame, rows[1], app);
             if app.mode() == Mode::PreviewSearch {
                 draw_input_modal(frame, centered_rect(70, 30, area), app);
             }
-            draw_footer(frame, rows[1], app);
+            draw_footer(frame, rows[2], app);
         }
         _ => {
             let rows = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Min(3), Constraint::Length(2)])
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Min(3),
+                    Constraint::Length(2),
+                ])
                 .split(area);
-            draw_body(frame, rows[0], app);
-            draw_footer(frame, rows[1], app);
+            draw_header(frame, rows[0], app);
+            draw_body(frame, rows[1], app);
+            draw_footer(frame, rows[2], app);
             match app.mode() {
                 Mode::Help => draw_help(frame, centered_rect(70, 70, area)),
                 Mode::Filter
@@ -44,6 +66,55 @@ pub fn draw(frame: &mut Frame, app: &App) {
             }
         }
     }
+}
+
+fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
+    let hidden = if app.show_hidden() { "ON" } else { "OFF" };
+    let filter = if app.filter().is_empty() {
+        "-".to_string()
+    } else {
+        escape_display(app.filter())
+    };
+    let lines = vec![Line::from(vec![
+        Span::styled(
+            "Tersh",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" | "),
+        Span::styled(display_path(app.cwd()), Style::default().fg(Color::Yellow)),
+        Span::raw(" | "),
+        Span::styled(
+            format!("items {}", app.entries().len()),
+            Style::default().fg(Color::Green),
+        ),
+        Span::raw(" | "),
+        Span::styled(
+            format!(
+                "sel {} {}",
+                app.selected_len(),
+                format_size(app.selected_total_size())
+            ),
+            Style::default().fg(Color::Magenta),
+        ),
+        Span::raw(" | "),
+        Span::styled(
+            format!("buf {}", app.copy_buffer_label()),
+            Style::default().fg(Color::Cyan),
+        ),
+        Span::raw(" | "),
+        Span::raw(format!("hidden {hidden}")),
+        Span::raw(" | "),
+        Span::raw(format!("filter {filter}")),
+        Span::raw(" | "),
+        Span::styled(
+            format!("sort {}", app.sort_label()),
+            Style::default().fg(Color::Yellow),
+        ),
+    ])];
+    let paragraph = Paragraph::new(lines).block(base_block().borders(Borders::ALL));
+    frame.render_widget(paragraph, area);
 }
 
 fn draw_body(frame: &mut Frame, area: Rect, app: &App) {
@@ -88,11 +159,14 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &App) {
 
 fn draw_files(frame: &mut Frame, area: Rect, app: &App) {
     let mut lines = vec![Line::from(Span::styled(
-        app.cwd().display().to_string(),
-        Style::default().fg(Color::Cyan),
+        "S K PERM      SIZE NAME",
+        Style::default().fg(Color::Gray),
     ))];
     if !app.filter().is_empty() {
-        lines.push(Line::from(format!("filter: {}", app.filter())));
+        lines.push(Line::from(format!(
+            "filter: {}",
+            escape_display(app.filter())
+        )));
     }
     let entry_capacity = area
         .height
@@ -117,9 +191,11 @@ fn draw_files(frame: &mut Frame, area: Rect, app: &App) {
             crate::fs_core::FileKind::Symlink => "@",
             _ => "",
         };
+        let perm = if entry.readonly { "RO" } else { "RW" };
         let row = format!(
-            "{cursor}{mark} {:<5} {:>8} {}{}",
-            entry.kind_marker(),
+            "{cursor}{mark} {:<4} {:<4} {:>8} {}{}",
+            kind_icon(entry.kind),
+            perm,
             format_size(entry.size),
             entry.name,
             suffix
@@ -137,16 +213,16 @@ fn draw_files(frame: &mut Frame, area: Rect, app: &App) {
         }
     }
     let title = if app.entries().is_empty() {
-        "Files".to_string()
+        format!("Files | sort {}", app.sort_label())
     } else {
         format!(
-            "Files {}/{}",
+            "Files {}/{} | sort {}",
             app.cursor().saturating_add(1),
-            app.entries().len()
+            app.entries().len(),
+            app.sort_label()
         )
     };
-    let paragraph =
-        Paragraph::new(lines).block(Block::default().title(title).borders(Borders::ALL));
+    let paragraph = Paragraph::new(lines).block(base_block().title(title).borders(Borders::ALL));
     frame.render_widget(paragraph, area);
 }
 
@@ -165,16 +241,26 @@ fn draw_fullscreen_preview(frame: &mut Frame, area: Rect, app: &App) {
 
     let mut rendered = Vec::new();
     rendered.push(Line::from(Span::styled(
-        app.preview().path.display().to_string(),
+        display_path(&app.preview().path),
         Style::default()
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD),
     )));
+    let match_text = match active_match {
+        Some(index) => format!("{}/{}", index + 1, matches.len()),
+        None if matches.is_empty() && app.preview_search_query().is_empty() => "-".to_string(),
+        None => format!("0/{}", matches.len()),
+    };
     rendered.push(Line::from(format!(
-        "offset: {} / {} | search: {}",
+        "offset: {} / {} | match {match_text} | search: {}{}",
         offset.saturating_add(1),
         total_lines,
-        app.preview_search_query(),
+        escape_display(app.preview_search_query()),
+        if app.preview().truncated {
+            " | truncated"
+        } else {
+            ""
+        },
     )));
     for (index, line) in lines.iter().enumerate().skip(offset).take(view_lines) {
         let mut style = Style::default();
@@ -190,19 +276,19 @@ fn draw_fullscreen_preview(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     let paragraph = Paragraph::new(rendered)
-        .block(Block::default().title("Preview").borders(Borders::ALL))
+        .block(base_block().title("Preview").borders(Borders::ALL))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
 
 fn draw_preview(frame: &mut Frame, area: Rect, app: &App) {
     let mut lines = vec![Line::from(Span::styled(
-        app.preview().path.display().to_string(),
+        display_path(&app.preview().path),
         Style::default().fg(Color::Yellow),
     ))];
     lines.extend(app.preview().lines.iter().cloned().map(Line::from));
     let paragraph = Paragraph::new(lines)
-        .block(Block::default().title("Preview").borders(Borders::ALL))
+        .block(base_block().title("Preview").borders(Borders::ALL))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
@@ -210,6 +296,10 @@ fn draw_preview(frame: &mut Frame, area: Rect, app: &App) {
 fn draw_info(frame: &mut Frame, area: Rect, app: &App) {
     let focused = app.entries().get(app.cursor());
     let mut lines = Vec::new();
+    lines.push(Line::from(Span::styled(
+        "TARGET",
+        Style::default().fg(Color::Gray),
+    )));
     if let Some(entry) = focused {
         lines.push(Line::from(format!("kind: {}", entry.kind_marker())));
         lines.push(Line::from(format!("size: {}", format_size(entry.size))));
@@ -222,20 +312,42 @@ fn draw_info(frame: &mut Frame, area: Rect, app: &App) {
             }
         )));
         if let Some(target) = &entry.symlink_target {
-            lines.push(Line::from(format!("-> {}", target.display())));
+            lines.push(Line::from(format!("-> {}", display_path(target))));
         }
     } else {
         lines.push(Line::from("no item"));
     }
     lines.push(Line::from(""));
-    lines.push(Line::from(format!("copy: {}", app.copy_buffer_len())));
+    lines.push(Line::from(Span::styled(
+        "BUFFER",
+        Style::default().fg(Color::Gray),
+    )));
+    lines.push(Line::from(app.copy_buffer_label()));
+    lines.push(Line::from(format!("selected: {}", app.selected_len())));
     lines.push(Line::from(""));
-    lines.push(Line::from("Log"));
+    lines.push(Line::from(Span::styled(
+        "SEARCH",
+        Style::default().fg(Color::Gray),
+    )));
+    lines.push(Line::from(format!(
+        "filter: {}",
+        if app.filter().is_empty() {
+            "-".to_string()
+        } else {
+            escape_display(app.filter())
+        }
+    )));
+    lines.push(Line::from(format!("sort: {}", app.sort_label())));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "LOG",
+        Style::default().fg(Color::Gray),
+    )));
     for log in app.logs().iter().rev().take(5) {
-        lines.push(Line::from(log.clone()));
+        lines.push(Line::from(escape_display(log)));
     }
     let paragraph = Paragraph::new(lines)
-        .block(Block::default().title("Info").borders(Borders::ALL))
+        .block(base_block().title("Inspector").borders(Borders::ALL))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
@@ -252,7 +364,7 @@ fn draw_compact_info(frame: &mut Frame, area: Rect, app: &App) {
     );
     let paragraph = Paragraph::new(text)
         .style(Style::default().fg(Color::Gray))
-        .block(Block::default().title("Status").borders(Borders::ALL));
+        .block(base_block().title("Status").borders(Borders::ALL));
     frame.render_widget(paragraph, area);
 }
 
@@ -260,38 +372,42 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     let mode = format!("{:?}", app.mode()).to_lowercase();
     let compact = area.width < 60;
     let text = match app.mode() {
-        Mode::Normal if compact => "q quit | ? help | ^G | ^C".to_string(),
+        Mode::Normal if app.pending_y() => {
+            "y_ | y copy | f name | r rel | a abs | ^G cancel | ^C force".to_string()
+        }
+        Mode::Normal if app.pending_g() => "g_ | g top | G bottom | ^G cancel | ^C force".to_string(),
+        Mode::Normal if compact => "q quit | ? help | / | ^G | ^C".to_string(),
         Mode::Normal => {
-            "normal | q quit | ^G clear | ^C force | ? help | j/k move | Enter open | h parent | / filter | Space mark | yy copy | p paste".to_string()
+            "normal | q quit | Esc/^G clear | ^C force | ? help | j/k move | Enter open | h parent | / filter | Space mark | yy copy | p paste | s sort | S reverse".to_string()
         }
         Mode::Preview if compact => "preview | q | Pg | ^G | ^C".to_string(),
         Mode::Preview => {
-            "preview | q close | ^G close | ^C force | j/k page | ↑/↓ line | PgUp/PgDn | gg/G | / find | n/N | e edit".to_string()
+            "preview | q close | ^G close | ^C force | j/k page | Up/Down line | PgUp/PgDn | gg/G | / find | n/N | e edit".to_string()
         }
         Mode::PreviewSearch if compact => "find | Enter | ^G | ^C".to_string(),
-        Mode::PreviewSearch => format!("{mode} | Enter find | Backspace | ^G cancel | ^C force"),
+        Mode::PreviewSearch => format!("{mode} | Enter find | Backspace | Esc/^G cancel | ^C force"),
         Mode::Filter if compact => "filter | Enter | ^G | ^C".to_string(),
-        Mode::Filter => "filter | type to narrow | Enter apply | Backspace | ^G cancel | ^C force".to_string(),
+        Mode::Filter => "filter | type to narrow | Enter apply | Backspace | Esc/^G cancel | ^C force".to_string(),
         Mode::Goto if compact => "goto | Enter | ^G | ^C".to_string(),
-        Mode::Goto => "goto | type directory | Enter go | Backspace | ^G cancel | ^C force".to_string(),
+        Mode::Goto => "goto | type directory | Enter go | Backspace | Esc/^G cancel | ^C force".to_string(),
         Mode::Rename if compact => "rename | Enter | ^G | ^C".to_string(),
-        Mode::Rename => "rename | type name | Enter rename | Backspace | ^G cancel | ^C force".to_string(),
+        Mode::Rename => "rename | type name | Enter rename | Backspace | Esc/^G cancel | ^C force".to_string(),
         Mode::CopyTo if compact => "copy-to | Enter | ^G | ^C".to_string(),
-        Mode::CopyTo => "copy-to | type destination | Enter copy | Backspace | ^G cancel | ^C force".to_string(),
+        Mode::CopyTo => "copy-to | type destination | Enter copy | Backspace | Esc/^G cancel | ^C force".to_string(),
         Mode::MoveTo if compact => "move-to | Enter | ^G | ^C".to_string(),
-        Mode::MoveTo => "move-to | type destination | Enter move | Backspace | ^G cancel | ^C force".to_string(),
+        Mode::MoveTo => "move-to | type destination | Enter move | Backspace | Esc/^G cancel | ^C force".to_string(),
         Mode::ConfirmTrash if compact => "trash | Enter | ^G | ^C".to_string(),
-        Mode::ConfirmTrash => "trash | type trash | Enter confirm | ^G cancel | ^C force".to_string(),
+        Mode::ConfirmTrash => "trash | type trash | Enter confirm | Esc/^G cancel | ^C force".to_string(),
         Mode::ConfirmDelete if compact => "delete | Enter | ^G | ^C".to_string(),
         Mode::ConfirmDelete => {
-            "delete | type delete | Enter confirm | ^G cancel | ^C force".to_string()
+            "delete | type delete | Enter confirm | Esc/^G cancel | ^C force".to_string()
         }
         Mode::Help => "help | q/?/Enter close | ^G close | ^C force".to_string(),
-        Mode::Message => format!("{mode} | ^G close | ^C force"),
+        Mode::Message => format!("{mode} | Esc/^G close | ^C force"),
     };
     let paragraph = Paragraph::new(text)
         .style(Style::default().fg(Color::Gray))
-        .block(Block::default().borders(Borders::TOP));
+        .block(base_block().borders(Borders::TOP));
     frame.render_widget(paragraph, area);
 }
 
@@ -302,13 +418,13 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("  j/k or arrows: move    PageUp/PageDown: page    Home/End: first/last"),
         Line::from("  h: parent    l: open directory"),
         Line::from("  Enter on file: fullscreen preview"),
-        Line::from("  /: filter    .: hidden    r: refresh"),
+        Line::from("  /: filter    .: hidden    r: refresh    s/S: sort/reverse"),
         Line::from(""),
         Line::from("Operations"),
         Line::from("  Space: mark    yy: copy    x: cut    p: paste"),
         Line::from("  c: copy to...    m: move to...    n: rename"),
         Line::from("  yf: file name    yr: relative path    ya: absolute path"),
-        Line::from("  e: edit focused file with nano"),
+        Line::from("  e: edit focused regular file with $VISUAL/$EDITOR/nano"),
         Line::from("  :: goto directory"),
         Line::from("  d: trash, then type trash    D: delete, then type delete"),
         Line::from(""),
@@ -318,10 +434,10 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("  /: search    n/N: next/prev match"),
         Line::from(""),
         Line::from("Exit"),
-        Line::from("  q: quit/close    Ctrl+G: cancel    Q/Ctrl+C: force quit"),
+        Line::from("  q: quit/close    Esc/Ctrl+G: cancel    Q/Ctrl+C: force quit"),
     ];
     let paragraph = Paragraph::new(lines)
-        .block(Block::default().title("Help").borders(Borders::ALL))
+        .block(base_block().title("Help").borders(Borders::ALL))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
@@ -334,27 +450,44 @@ fn draw_input_modal(frame: &mut Frame, area: Rect, app: &App) {
         Mode::Rename => "Rename focused item",
         Mode::CopyTo => "Copy selected/focused item(s) to directory",
         Mode::MoveTo => "Move selected/focused item(s) to directory",
-        Mode::ConfirmTrash => "Move to .tersh-trash: type trash then Enter. Ctrl+G cancels.",
-        Mode::ConfirmDelete => "Permanent delete: type delete then Enter. Ctrl+G cancels.",
+        Mode::ConfirmTrash => "Move to .tersh-trash: type trash then Enter. Esc/Ctrl+G cancels.",
+        Mode::ConfirmDelete => "Permanent delete: type delete then Enter. Esc/Ctrl+G cancels.",
         Mode::PreviewSearch => "Find in preview",
         _ => "",
     };
     let mut lines = vec![Line::from(prompt)];
     if matches!(app.mode(), Mode::ConfirmTrash | Mode::ConfirmDelete) {
         lines.push(Line::from(format!(
-            "targets: {}",
-            app.operation_target_count()
+            "targets: {} {}",
+            app.operation_target_count(),
+            app.operation_target_source()
         )));
         if let Some(path) = app.operation_target_first() {
-            lines.push(Line::from(format!("first: {}", path.display())));
+            lines.push(Line::from(format!("first: {}", display_path(&path))));
+        }
+        for (index, label) in app.operation_target_labels(3).into_iter().enumerate() {
+            lines.push(Line::from(format!("{}. {}", index + 1, label)));
         }
     }
     lines.push(Line::from(""));
-    lines.push(Line::from(app.input().to_string()));
+    lines.push(Line::from(escape_display(app.input())));
     let paragraph = Paragraph::new(lines)
-        .block(Block::default().title("Command").borders(Borders::ALL))
+        .block(base_block().title("Command").borders(Borders::ALL))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
+}
+
+fn kind_icon(kind: crate::fs_core::FileKind) -> &'static str {
+    match kind {
+        crate::fs_core::FileKind::Directory => "D",
+        crate::fs_core::FileKind::File => "F",
+        crate::fs_core::FileKind::Symlink => "L",
+        crate::fs_core::FileKind::Other => "O",
+    }
+}
+
+fn base_block() -> Block<'static> {
+    Block::default().border_set(ASCII_BORDER)
 }
 
 fn visible_entry_start(cursor: usize, total_entries: usize, entry_capacity: usize) -> usize {

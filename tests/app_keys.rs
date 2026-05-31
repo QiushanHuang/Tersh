@@ -13,13 +13,13 @@ fn ctrl_g_closes_filter_before_quitting() {
 }
 
 #[test]
-fn escape_does_not_cancel_filter_mode() {
+fn escape_cancels_filter_mode() {
     let mut app = App::for_test();
 
     app.apply(Command::OpenFilter);
     app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
-    assert_eq!(app.mode(), Mode::Filter);
+    assert_eq!(app.mode(), Mode::Normal);
 }
 
 #[test]
@@ -127,6 +127,25 @@ fn gg_requires_two_g_keypresses_to_jump_to_first_item() {
 }
 
 #[test]
+fn cancel_clears_pending_y_and_g_prefixes() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "b").unwrap();
+    let mut app = App::new(dir.path().to_path_buf()).unwrap();
+    app.handle_command(Command::Last);
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
+    app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+    assert_eq!(app.last_clipboard_text(), None);
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+    assert_eq!(app.cursor(), 1);
+}
+
+#[test]
 fn page_keys_move_directory_cursor_by_page() {
     let dir = tempfile::tempdir().unwrap();
     for index in 0..25 {
@@ -139,6 +158,38 @@ fn page_keys_move_directory_cursor_by_page() {
 
     app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
     assert_eq!(app.cursor(), 0);
+}
+
+#[test]
+fn sort_keys_cycle_sort_and_reverse_file_order() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("small.txt"), "x").unwrap();
+    std::fs::write(dir.path().join("large.txt"), "xxxx").unwrap();
+    let mut app = App::new(dir.path().to_path_buf()).unwrap();
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+    assert_eq!(app.sort_label(), "size asc");
+    assert_eq!(app.entries()[0].name, "small.txt");
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT));
+    assert_eq!(app.sort_label(), "size desc");
+    assert_eq!(app.entries()[0].name, "large.txt");
+}
+
+#[cfg(unix)]
+#[test]
+fn edit_rejects_symlink_targets() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("target.txt");
+    let link = dir.path().join("link.txt");
+    std::fs::write(&target, "target").unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let mut app = App::new(dir.path().to_path_buf()).unwrap();
+
+    assert_eq!(app.entries()[app.cursor()].name, "link.txt");
+    app.handle_command(Command::Edit);
+
+    assert!(app.logs().iter().any(|log| log.contains("regular files")));
 }
 
 #[test]

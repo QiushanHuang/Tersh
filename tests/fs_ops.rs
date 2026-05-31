@@ -207,5 +207,7 @@ fn rename_validation_rejects_paths_and_empty_names() {
     assert!(validate_file_name("").is_err());
     assert!(validate_file_name("../escape").is_err());
     assert!(validate_file_name("/tmp/escape").is_err());
+    assert!(validate_file_name("bad\nname").is_err());
+    assert!(validate_file_name("bad\u{1b}name").is_err());
     assert!(validate_file_name("safe-name.txt").is_ok());
 }

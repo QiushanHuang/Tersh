@@ -3,8 +3,20 @@ use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
+    symbols::border,
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
+};
+
+const ASCII_BORDER: border::Set = border::Set {
+    top_left: "+",
+    top_right: "+",
+    bottom_left: "+",
+    bottom_right: "+",
+    vertical_left: "|",
+    vertical_right: "|",
+    horizontal_top: "-",
+    horizontal_bottom: "-",
 };
 
 pub fn draw(frame: &mut Frame, app: &ClusterApp) {
@@ -32,14 +44,6 @@ pub fn draw(frame: &mut Frame, app: &ClusterApp) {
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, app: &ClusterApp) {
-    let summary = format!(
-        "online {} | stale {} | failed {} | checking {} | source {}",
-        app.online_count(),
-        app.stale_count(),
-        app.offline_count(),
-        app.checking_count(),
-        app.inventory_label()
-    );
     let lines = vec![Line::from(vec![
         Span::styled(
             "Cluster Status",
@@ -48,9 +52,32 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &ClusterApp) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
-        Span::styled(summary, Style::default().fg(Color::Gray)),
+        Span::styled(
+            format!("OK {}", app.online_count()),
+            Style::default().fg(Color::Green),
+        ),
+        Span::raw(" | "),
+        Span::styled(
+            format!("OLD {}", app.stale_count()),
+            Style::default().fg(Color::Yellow),
+        ),
+        Span::raw(" | "),
+        Span::styled(
+            format!("FAIL {}", app.offline_count()),
+            Style::default().fg(Color::Red),
+        ),
+        Span::raw(" | "),
+        Span::styled(
+            format!("CHK {}/{}", app.checking_count(), app.hosts().len()),
+            Style::default().fg(Color::Cyan),
+        ),
+        Span::raw(" | src "),
+        Span::styled(
+            ascii_safe(&app.inventory_label()),
+            Style::default().fg(Color::Gray),
+        ),
     ])];
-    let paragraph = Paragraph::new(lines).block(Block::default().borders(Borders::ALL));
+    let paragraph = Paragraph::new(lines).block(base_block().borders(Borders::ALL));
     frame.render_widget(paragraph, area);
 }
 
@@ -76,7 +103,7 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &ClusterApp) {
 
 fn draw_hosts(frame: &mut Frame, area: Rect, app: &ClusterApp) {
     let mut lines = vec![Line::from(Span::styled(
-        "state  alias           role     address",
+        "state  alias           role     lat    mem   disk  address",
         Style::default().fg(Color::Gray),
     ))];
     let capacity = area.height.saturating_sub(3) as usize;
@@ -87,14 +114,32 @@ fn draw_hosts(frame: &mut Frame, area: Rect, app: &ClusterApp) {
         let state = snapshot
             .map(|snapshot| snapshot.connection)
             .unwrap_or(ConnectionState::Unknown);
+        let latency = snapshot
+            .and_then(|snapshot| snapshot.latency_ms)
+            .map(|value| format!("{value}ms"))
+            .unwrap_or_else(|| "--".to_string());
+        let memory = snapshot
+            .and_then(|snapshot| snapshot.report.memory.as_deref())
+            .and_then(percent_from_token)
+            .map(|value| format!("{value}%"))
+            .unwrap_or_else(|| "--".to_string());
+        let storage = snapshot
+            .and_then(|snapshot| snapshot.report.storage.as_deref())
+            .and_then(percent_from_token)
+            .map(|value| format!("{value}%"))
+            .unwrap_or_else(|| "--".to_string());
         let cursor = if index == app.cursor() { ">" } else { " " };
         let row = format!(
-            "{cursor} {:<5} {:<15} {:<8} {}",
+            "{cursor} {:<5} {:<15} {:<8} {:<6} {:<5} {:<5} {}",
             state_short(state),
-            host.alias(),
+            ascii_safe(host.alias()),
             host.kind().label(),
-            host.address()
+            latency,
+            memory,
+            storage,
+            ascii_safe(host.address())
         );
+        let row = truncate_to_width(&row, area.width.saturating_sub(2) as usize);
         let style = if index == app.cursor() {
             Style::default()
                 .fg(Color::Black)
@@ -111,9 +156,7 @@ fn draw_hosts(frame: &mut Frame, area: Rect, app: &ClusterApp) {
         app.cursor().saturating_add(1),
         app.hosts().len()
     );
-    let paragraph = Paragraph::new(lines)
-        .block(Block::default().title(title).borders(Borders::ALL))
-        .wrap(Wrap { trim: false });
+    let paragraph = Paragraph::new(lines).block(base_block().title(title).borders(Borders::ALL));
     frame.render_widget(paragraph, area);
 }
 
@@ -136,11 +179,8 @@ fn draw_compact_dashboard(frame: &mut Frame, area: Rect, app: &ClusterApp) {
     let mut lines = compact_route_lines(app.selected_host());
     lines.extend(compact_status_lines(app));
 
-    let paragraph = Paragraph::new(lines).block(
-        Block::default()
-            .title("Route / Detail")
-            .borders(Borders::ALL),
-    );
+    let paragraph =
+        Paragraph::new(lines).block(base_block().title("Route / Detail").borders(Borders::ALL));
     frame.render_widget(paragraph, area);
 }
 
@@ -153,7 +193,7 @@ fn compact_route_lines(host: &crate::cluster::HostConfig) -> Vec<Line<'static>> 
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             )),
-            Line::from(format!("Host: {}", host.alias())),
+            Line::from(format!("Host: {}", ascii_safe(host.alias()))),
         ],
         HostKind::Jump => vec![
             Line::from(vec![
@@ -161,7 +201,7 @@ fn compact_route_lines(host: &crate::cluster::HostConfig) -> Vec<Line<'static>> 
                 Span::raw(" => "),
                 Span::styled("JUMP", Style::default().fg(Color::Yellow)),
             ]),
-            Line::from(format!("Path: {}", host.ssh_target())),
+            Line::from(format!("Path: {}", ascii_safe(host.ssh_target()))),
         ],
         HostKind::Server => {
             if let Some(jump_target) = host.proxy_jump_target().or_else(|| host.proxy_jump()) {
@@ -173,7 +213,11 @@ fn compact_route_lines(host: &crate::cluster::HostConfig) -> Vec<Line<'static>> 
                         Span::raw(" => "),
                         Span::styled("SERVER", Style::default().fg(Color::Green)),
                     ]),
-                    Line::from(format!("Path: {jump_target} => {}", host.ssh_target())),
+                    Line::from(format!(
+                        "Path: {} => {}",
+                        ascii_safe(jump_target),
+                        ascii_safe(host.ssh_target())
+                    )),
                 ]
             } else {
                 vec![
@@ -182,7 +226,7 @@ fn compact_route_lines(host: &crate::cluster::HostConfig) -> Vec<Line<'static>> 
                         Span::raw(" => "),
                         Span::styled("SERVER", Style::default().fg(Color::Green)),
                     ]),
-                    Line::from(format!("Path: {}", host.ssh_target())),
+                    Line::from(format!("Path: {}", ascii_safe(host.ssh_target()))),
                 ]
             }
         }
@@ -193,7 +237,11 @@ fn compact_status_lines(app: &ClusterApp) -> Vec<Line<'static>> {
     let host = app.selected_host();
     let Some(snapshot) = app.selected_snapshot() else {
         return vec![
-            Line::from(format!("Host: {} {}", host.alias(), host.kind().label())),
+            Line::from(format!(
+                "Host: {} {}",
+                ascii_safe(host.alias()),
+                host.kind().label()
+            )),
             Line::from("Connection: unknown"),
         ];
     };
@@ -210,24 +258,24 @@ fn compact_status_lines(app: &ClusterApp) -> Vec<Line<'static>> {
     vec![
         Line::from(format!(
             "Host: {} {} | {} ({latency})",
-            host.alias(),
+            ascii_safe(host.alias()),
             host.kind().label(),
             snapshot.connection.label()
         )),
         Line::from(format!(
             "CPU load: {}",
-            report.cpu_load.as_deref().unwrap_or("unknown")
+            ascii_safe(report.cpu_load.as_deref().unwrap_or("unknown"))
         )),
         resource_line("Memory", report.memory.as_deref(), MetricKind::Memory),
         resource_line("Storage", report.storage.as_deref(), MetricKind::Storage),
         resource_line("GPU", report.gpu.as_deref(), MetricKind::Gpu),
-        Line::from(format!("Log: {latest_log}")),
+        Line::from(format!("Log: {}", ascii_safe(latest_log))),
     ]
 }
 
 fn draw_route(frame: &mut Frame, area: Rect, app: &ClusterApp) {
     let paragraph = Paragraph::new(route_lines(app.selected_host()))
-        .block(Block::default().title("Route").borders(Borders::ALL))
+        .block(base_block().title("Route").borders(Borders::ALL))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
@@ -241,8 +289,8 @@ fn route_lines(host: &crate::cluster::HostConfig) -> Vec<Line<'static>> {
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             )),
-            Line::from(format!("local: {}", host.alias())),
-            Line::from(format!("address: {}", host.address())),
+            Line::from(format!("local: {}", ascii_safe(host.alias()))),
+            Line::from(format!("address: {}", ascii_safe(host.address()))),
         ],
         HostKind::Jump => vec![
             Line::from(vec![
@@ -250,8 +298,8 @@ fn route_lines(host: &crate::cluster::HostConfig) -> Vec<Line<'static>> {
                 Span::raw(" => "),
                 Span::styled("JUMP", Style::default().fg(Color::Yellow)),
             ]),
-            Line::from(format!("jump: {}", host.ssh_target())),
-            Line::from(format!("command: ssh {}", host.ssh_target())),
+            Line::from(format!("jump: {}", ascii_safe(host.ssh_target()))),
+            Line::from(format!("command: ssh {}", ascii_safe(host.ssh_target()))),
         ],
         HostKind::Server => {
             if let Some(jump_target) = host.proxy_jump_target().or_else(|| host.proxy_jump()) {
@@ -263,11 +311,12 @@ fn route_lines(host: &crate::cluster::HostConfig) -> Vec<Line<'static>> {
                         Span::raw(" => "),
                         Span::styled("SERVER", Style::default().fg(Color::Green)),
                     ]),
-                    Line::from(format!("jump: {jump_target}")),
-                    Line::from(format!("server: {}", host.ssh_target())),
+                    Line::from(format!("jump: {}", ascii_safe(jump_target))),
+                    Line::from(format!("server: {}", ascii_safe(host.ssh_target()))),
                     Line::from(format!(
-                        "command: ssh -J {jump_target} {}",
-                        host.ssh_target()
+                        "command: ssh -J {} {}",
+                        ascii_safe(jump_target),
+                        ascii_safe(host.ssh_target())
                     )),
                 ]
             } else {
@@ -277,8 +326,8 @@ fn route_lines(host: &crate::cluster::HostConfig) -> Vec<Line<'static>> {
                         Span::raw(" => "),
                         Span::styled("SERVER", Style::default().fg(Color::Green)),
                     ]),
-                    Line::from(format!("server: {}", host.ssh_target())),
-                    Line::from(format!("command: ssh {}", host.ssh_target())),
+                    Line::from(format!("server: {}", ascii_safe(host.ssh_target()))),
+                    Line::from(format!("command: ssh {}", ascii_safe(host.ssh_target()))),
                 ]
             }
         }
@@ -288,7 +337,7 @@ fn route_lines(host: &crate::cluster::HostConfig) -> Vec<Line<'static>> {
 fn draw_detail_panel(frame: &mut Frame, area: Rect, app: &ClusterApp) {
     let lines = detail_lines(app, true);
     let paragraph = Paragraph::new(lines)
-        .block(Block::default().title("Detail").borders(Borders::ALL))
+        .block(base_block().title("Detail").borders(Borders::ALL))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
@@ -298,7 +347,7 @@ fn detail_lines(app: &ClusterApp, include_logs: bool) -> Vec<Line<'static>> {
     let snapshot = app.selected_snapshot();
     let mut lines = vec![Line::from(vec![
         Span::styled(
-            host.alias().to_string(),
+            ascii_safe(host.alias()),
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -319,33 +368,39 @@ fn detail_lines(app: &ClusterApp, include_logs: bool) -> Vec<Line<'static>> {
             Style::default().fg(Color::Gray),
         )));
         for log in app.logs().iter().rev().take(4) {
-            lines.push(Line::from(log.clone()));
+            lines.push(Line::from(ascii_safe(log)));
         }
     }
 
     if let Some(workdir) = host.workdir() {
-        lines.push(Line::from(format!("Tersh dir: {workdir}")));
+        lines.push(Line::from(format!("Tersh dir: {}", ascii_safe(workdir))));
     }
 
     lines.push(Line::from(""));
-    lines.push(Line::from(format!("Role: {}", host.role())));
-    lines.push(Line::from(format!("Address: {}", host.address())));
-    lines.push(Line::from(format!("SSH target: {}", host.ssh_target())));
+    lines.push(Line::from(format!("Role: {}", ascii_safe(host.role()))));
+    lines.push(Line::from(format!(
+        "Address: {}",
+        ascii_safe(host.address())
+    )));
+    lines.push(Line::from(format!(
+        "SSH target: {}",
+        ascii_safe(host.ssh_target())
+    )));
     if let Some(user) = host.user() {
-        lines.push(Line::from(format!("User: {user}")));
+        lines.push(Line::from(format!("User: {}", ascii_safe(user))));
     }
     if host.kind() == HostKind::Server {
         lines.push(Line::from(format!(
             "ProxyJump: {}",
-            host.proxy_jump().unwrap_or("none")
+            ascii_safe(host.proxy_jump().unwrap_or("none"))
         )));
         if let Some(target) = host.proxy_jump_target() {
-            lines.push(Line::from(format!("Jump target: {target}")));
+            lines.push(Line::from(format!("Jump target: {}", ascii_safe(target))));
         }
     }
     let route = host
         .proxy_jump_target()
-        .map(|jump| format!("via {jump}"))
+        .map(|jump| format!("via {}", ascii_safe(jump)))
         .unwrap_or_else(|| "direct/local".to_string());
     lines.push(Line::from(format!("Network route: {route}")));
     lines
@@ -362,7 +417,7 @@ fn push_snapshot_lines(lines: &mut Vec<Line<'static>>, snapshot: &HostSnapshot) 
     )));
     if let Some(error) = &snapshot.error {
         lines.push(Line::from(Span::styled(
-            format!("Error: {error}"),
+            format!("Error: {}", ascii_safe(error)),
             Style::default().fg(Color::Red),
         )));
         if snapshot.report.is_empty() {
@@ -371,9 +426,13 @@ fn push_snapshot_lines(lines: &mut Vec<Line<'static>>, snapshot: &HostSnapshot) 
     }
 
     let report = &snapshot.report;
+    lines.push(Line::from(Span::styled(
+        "Health",
+        Style::default().fg(Color::Gray),
+    )));
     lines.push(Line::from(format!(
         "CPU load: {}",
-        report.cpu_load.as_deref().unwrap_or("unknown")
+        ascii_safe(report.cpu_load.as_deref().unwrap_or("unknown"))
     )));
     lines.push(resource_line(
         "Memory",
@@ -387,20 +446,24 @@ fn push_snapshot_lines(lines: &mut Vec<Line<'static>>, snapshot: &HostSnapshot) 
     ));
     lines.push(Line::from(format!(
         "Tasks: {}",
-        report.tasks.as_deref().unwrap_or("unknown")
+        ascii_safe(report.tasks.as_deref().unwrap_or("unknown"))
     )));
     lines.push(resource_line("GPU", report.gpu.as_deref(), MetricKind::Gpu));
+    lines.push(Line::from(Span::styled(
+        "System",
+        Style::default().fg(Color::Gray),
+    )));
     lines.push(Line::from(format!(
         "Hostname: {}",
-        report.hostname.as_deref().unwrap_or("unknown")
+        ascii_safe(report.hostname.as_deref().unwrap_or("unknown"))
     )));
     lines.push(Line::from(format!(
         "System: {}",
-        report.system.as_deref().unwrap_or("unknown")
+        ascii_safe(report.system.as_deref().unwrap_or("unknown"))
     )));
     lines.push(Line::from(format!(
         "Uptime: {}",
-        report.uptime.as_deref().unwrap_or("unknown")
+        ascii_safe(report.uptime.as_deref().unwrap_or("unknown"))
     )));
 }
 
@@ -440,7 +503,7 @@ fn resource_line(label: &'static str, value: Option<&str>, kind: MetricKind) -> 
     Line::from(vec![
         Span::raw(format!("{label}: ")),
         Span::styled(bar, style),
-        Span::raw(format!(" {percent_text}  {raw}")),
+        Span::raw(format!(" {percent_text}  {}", ascii_safe(raw))),
     ])
 }
 
@@ -501,11 +564,11 @@ fn metric_style(percent: u16) -> Style {
 fn draw_footer(frame: &mut Frame, area: Rect, app: &ClusterApp) {
     let compact = area.width < 64;
     let text = match app.mode() {
-        ClusterMode::Help if compact => "help | q close | ^G | ^C",
-        ClusterMode::Help => "help | q close | ? close | Enter close | ^G close | ^C force",
-        ClusterMode::Detail if compact => "detail | q back | ^G | ^C",
+        ClusterMode::Help if compact => "help | q/Esc | ^G | ^C",
+        ClusterMode::Help => "help | q/?/Enter/Esc close | ^G close | ^C force",
+        ClusterMode::Detail if compact => "detail | q/Esc | ^G | ^C",
         ClusterMode::Detail => {
-            "detail | q back | ^G back | ^C force | r refresh | s shell/ssh | t tersh"
+            "detail | q/Esc back | ^G back | ^C force | r refresh | s shell/ssh | t tersh"
         }
         ClusterMode::Normal if compact => "q quit | ? help | ^G | ^C",
         ClusterMode::Normal => {
@@ -514,7 +577,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &ClusterApp) {
     };
     let paragraph = Paragraph::new(text)
         .style(Style::default().fg(Color::Gray))
-        .block(Block::default().borders(Borders::TOP));
+        .block(base_block().borders(Borders::TOP));
     frame.render_widget(paragraph, area);
 }
 
@@ -530,14 +593,14 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("  j/k or arrows: move selection"),
         Line::from("  Home/End: jump to first/last host"),
         Line::from("  q: close help or quit"),
-        Line::from("  Ctrl+G: close help"),
+        Line::from("  Esc/Ctrl+G: close help"),
         Line::from("  Ctrl+C: force quit"),
         Line::from(""),
         Line::from("Inventory"),
         Line::from("  TERSH_SERVERS_JSON overrides the default servers.json path."),
     ];
     let paragraph = Paragraph::new(lines)
-        .block(Block::default().title("Help").borders(Borders::ALL))
+        .block(base_block().title("Help").borders(Borders::ALL))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
@@ -552,6 +615,10 @@ fn state_short(state: ConnectionState) -> &'static str {
         ConnectionState::AuthFailed => "auth",
         ConnectionState::Offline => "down",
     }
+}
+
+fn base_block() -> Block<'static> {
+    Block::default().border_set(ASCII_BORDER)
 }
 
 fn state_style(state: ConnectionState) -> Style {
@@ -574,6 +641,31 @@ fn visible_start(cursor: usize, total: usize, capacity: usize) -> usize {
         .saturating_add(1)
         .saturating_sub(capacity)
         .min(total.saturating_sub(capacity))
+}
+
+fn truncate_to_width(value: &str, width: usize) -> String {
+    if value.chars().count() <= width {
+        return value.to_string();
+    }
+    if width <= 3 {
+        return ".".repeat(width);
+    }
+    let mut truncated = value.chars().take(width - 3).collect::<String>();
+    truncated.push_str("...");
+    truncated
+}
+
+fn ascii_safe(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii() && !ch.is_control() {
+                ch
+            } else {
+                '?'
+            }
+        })
+        .collect()
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {

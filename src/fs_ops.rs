@@ -132,6 +132,9 @@ pub fn validate_file_name(name: &str) -> Result<()> {
     if name.is_empty() {
         bail!("file name cannot be empty");
     }
+    if name.chars().any(char::is_control) {
+        bail!("file name must not contain control characters");
+    }
     let path = Path::new(name);
     if path.is_absolute() {
         bail!("file name must not be an absolute path");

@@ -15,10 +15,11 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{
     collections::BTreeSet,
+    fs,
     io::{self, Write},
     path::{Path, PathBuf},
     process::Command as ProcessCommand,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +70,8 @@ pub enum Command {
     OpenHelp,
     PreviewSearchNext,
     PreviewSearchPrev,
+    CycleSort,
+    ReverseSort,
     Cancel,
     Quit,
     ForceQuit,
@@ -76,6 +79,13 @@ pub enum Command {
     Edit,
     Backspace,
     Submit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortKey {
+    Kind,
+    Size,
+    Modified,
 }
 
 #[derive(Debug, Clone)]
@@ -101,6 +111,9 @@ pub struct App {
     pending_y: bool,
     clipboard_text: Option<String>,
     last_clipboard_text: Option<String>,
+    sort_key: SortKey,
+    sort_reverse: bool,
+    preview_cache: Option<CachedPreview>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -118,6 +131,20 @@ enum TransferKind {
 struct TransferBuffer {
     kind: TransferKind,
     paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreviewSignature {
+    len: u64,
+    modified: Option<SystemTime>,
+    kind: FileKind,
+}
+
+#[derive(Debug, Clone)]
+struct CachedPreview {
+    path: PathBuf,
+    signature: PreviewSignature,
+    preview: Preview,
 }
 
 impl App {
@@ -147,6 +174,9 @@ impl App {
             pending_y: false,
             clipboard_text: None,
             last_clipboard_text: None,
+            sort_key: SortKey::Kind,
+            sort_reverse: false,
+            preview_cache: None,
         };
         app.reload();
         Ok(app)
@@ -202,6 +232,9 @@ impl App {
             pending_y: false,
             clipboard_text: None,
             last_clipboard_text: None,
+            sort_key: SortKey::Kind,
+            sort_reverse: false,
+            preview_cache: None,
         }
     }
 
@@ -320,6 +353,8 @@ impl App {
             }
             Command::PreviewSearchNext => self.preview_search_next(),
             Command::PreviewSearchPrev => self.preview_search_prev(),
+            Command::CycleSort => self.cycle_sort(),
+            Command::ReverseSort => self.reverse_sort(),
             Command::Rename => {
                 if let Some(entry) = self.focused() {
                     if let Some(name) = entry.raw_name.to_str() {
@@ -358,6 +393,10 @@ impl App {
     pub fn handle_key(&mut self, key: KeyEvent) {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.handle_command(Command::ForceQuit);
+            return;
+        }
+        if key.code == KeyCode::Esc {
+            self.handle_command(Command::Cancel);
             return;
         }
         if is_cancel_key(key) {
@@ -519,6 +558,49 @@ impl App {
             .unwrap_or(0)
     }
 
+    pub fn copy_buffer_label(&self) -> String {
+        self.transfer_buffer
+            .as_ref()
+            .map(|buffer| {
+                let kind = match buffer.kind {
+                    TransferKind::Copy => "COPY",
+                    TransferKind::Cut => "CUT",
+                };
+                format!("{kind} {}", buffer.paths.len())
+            })
+            .unwrap_or_else(|| "EMPTY 0".to_string())
+    }
+
+    pub fn sort_label(&self) -> String {
+        let key = match self.sort_key {
+            SortKey::Kind => "kind",
+            SortKey::Size => "size",
+            SortKey::Modified => "mtime",
+        };
+        let direction = if self.sort_reverse { "desc" } else { "asc" };
+        format!("{key} {direction}")
+    }
+
+    pub fn show_hidden(&self) -> bool {
+        self.show_hidden
+    }
+
+    pub fn pending_y(&self) -> bool {
+        self.pending_y
+    }
+
+    pub fn pending_g(&self) -> bool {
+        self.pending_g
+    }
+
+    pub fn selected_total_size(&self) -> u64 {
+        self.entries
+            .iter()
+            .filter(|entry| self.selected.contains(&entry.path))
+            .map(|entry| entry.size)
+            .sum()
+    }
+
     pub fn selected_len(&self) -> usize {
         self.selected.len()
     }
@@ -563,6 +645,22 @@ impl App {
         self.operation_targets().into_iter().next()
     }
 
+    pub fn operation_target_source(&self) -> &'static str {
+        if self.selected.is_empty() {
+            "focused"
+        } else {
+            "selected"
+        }
+    }
+
+    pub fn operation_target_labels(&self, limit: usize) -> Vec<String> {
+        self.operation_targets()
+            .into_iter()
+            .take(limit)
+            .map(|path| crate::fs_core::display_path(&path))
+            .collect()
+    }
+
     pub fn take_clipboard_text(&mut self) -> Option<String> {
         self.clipboard_text.take()
     }
@@ -576,6 +674,7 @@ impl App {
         match read_dir_entries(&self.cwd, self.show_hidden, &self.filter) {
             Ok(entries) => {
                 self.entries = entries;
+                self.sort_entries();
                 self.retain_visible_selection();
                 self.cursor = self.cursor.min(self.entries.len().saturating_sub(1));
                 self.update_preview();
@@ -592,17 +691,38 @@ impl App {
     }
 
     fn update_preview(&mut self) {
-        if let Some(entry) = self.focused() {
-            self.preview = match preview_file(&entry.path) {
-                Ok(preview) => preview,
-                Err(err) => {
-                    Preview::message(entry.path.clone(), PreviewKind::Error, err.to_string())
-                }
-            };
+        if let Some(path) = self.focused().map(|entry| entry.path.clone()) {
+            self.preview = self.preview_for_path(&path);
         } else {
             self.preview =
                 Preview::message(self.cwd.clone(), PreviewKind::Empty, "No file selected");
         }
+    }
+
+    fn preview_for_path(&mut self, path: &Path) -> Preview {
+        let signature = preview_signature(path);
+        if let (Some(signature), Some(cache)) = (&signature, &self.preview_cache)
+            && cache.path == path
+            && &cache.signature == signature
+        {
+            return cache.preview.clone();
+        }
+        let preview = match preview_file(path) {
+            Ok(preview) => preview,
+            Err(err) => Preview::message(
+                path.to_path_buf(),
+                PreviewKind::Error,
+                crate::fs_core::escape_display(&err.to_string()),
+            ),
+        };
+        if let Some(signature) = signature {
+            self.preview_cache = Some(CachedPreview {
+                path: path.to_path_buf(),
+                signature,
+                preview: preview.clone(),
+            });
+        }
+        preview
     }
 
     fn scroll_preview(&mut self, delta: isize) {
@@ -710,14 +830,17 @@ impl App {
             self.log("no file selected");
             return;
         };
-        if entry.kind == FileKind::Directory {
-            self.log("can only edit files");
+        if entry.kind != FileKind::File {
+            self.log("can only edit regular files");
             return;
         }
         let path = entry.path.clone();
         match self.launch_editor(&path) {
             Ok(()) => {
-                self.log(format!("saved in nano: {}", path.display()));
+                self.log(format!(
+                    "saved in editor: {}",
+                    crate::fs_core::display_path(&path)
+                ));
             }
             Err(err) => {
                 self.log(format!("edit failed: {err}"));
@@ -732,7 +855,10 @@ impl App {
         let mut stdout = io::stdout();
         execute!(stdout, LeaveAlternateScreen)?;
         disable_raw_mode()?;
-        let status = ProcessCommand::new("nano").arg(path).status();
+        let editor = std::env::var_os("VISUAL")
+            .or_else(|| std::env::var_os("EDITOR"))
+            .unwrap_or_else(|| "nano".into());
+        let status = ProcessCommand::new(editor).arg(path).status();
         let status = match status {
             Ok(status) => status,
             Err(err) => {
@@ -744,7 +870,7 @@ impl App {
         execute!(stdout, EnterAlternateScreen)?;
         enable_raw_mode()?;
         if !status.success() {
-            return Err(anyhow::anyhow!("nano exited with {status}"));
+            return Err(anyhow::anyhow!("editor exited with {status}"));
         }
         Ok(())
     }
@@ -759,6 +885,51 @@ impl App {
             .saturating_add_signed(delta)
             .min(self.entries.len() - 1);
         self.update_preview();
+    }
+
+    fn cycle_sort(&mut self) {
+        self.sort_key = match self.sort_key {
+            SortKey::Kind => SortKey::Size,
+            SortKey::Size => SortKey::Modified,
+            SortKey::Modified => SortKey::Kind,
+        };
+        self.sort_reverse = false;
+        self.sort_entries();
+        self.cursor = self.cursor.min(self.entries.len().saturating_sub(1));
+        self.update_preview();
+        self.log(format!("sort {}", self.sort_label()));
+    }
+
+    fn reverse_sort(&mut self) {
+        self.sort_reverse = !self.sort_reverse;
+        self.sort_entries();
+        self.cursor = self.cursor.min(self.entries.len().saturating_sub(1));
+        self.update_preview();
+        self.log(format!("sort {}", self.sort_label()));
+    }
+
+    fn sort_entries(&mut self) {
+        let key = self.sort_key;
+        self.entries.sort_by(|a, b| {
+            let ordering = match key {
+                SortKey::Kind => kind_rank(a.kind)
+                    .cmp(&kind_rank(b.kind))
+                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+                SortKey::Size => a
+                    .size
+                    .cmp(&b.size)
+                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+                SortKey::Modified => a
+                    .modified
+                    .cmp(&b.modified)
+                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+            };
+            if self.sort_reverse {
+                ordering.reverse()
+            } else {
+                ordering
+            }
+        });
     }
 
     fn go_parent(&mut self) {
@@ -1002,6 +1173,8 @@ impl App {
     }
 
     fn cancel(&mut self) {
+        self.pending_g = false;
+        self.pending_y = false;
         match self.mode {
             Mode::Normal => {
                 self.selected.clear();
@@ -1166,12 +1339,41 @@ fn key_to_command(key: KeyEvent) -> Option<Command> {
         KeyCode::Char('d') => Some(Command::Trash),
         KeyCode::Char('D') => Some(Command::PermanentDelete),
         KeyCode::Char('r') => Some(Command::Refresh),
+        KeyCode::Char('s') => Some(Command::CycleSort),
+        KeyCode::Char('S') => Some(Command::ReverseSort),
         KeyCode::Char('e') => Some(Command::Edit),
         KeyCode::Char('?') => Some(Command::OpenHelp),
         KeyCode::Char('q') => Some(Command::Quit),
         KeyCode::Char('Q') => Some(Command::ForceQuit),
         KeyCode::Char(ch) => Some(Command::Input(ch)),
         _ => None,
+    }
+}
+
+fn preview_signature(path: &Path) -> Option<PreviewSignature> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    let kind = if metadata.is_dir() {
+        FileKind::Directory
+    } else if metadata.is_file() {
+        FileKind::File
+    } else if metadata.file_type().is_symlink() {
+        FileKind::Symlink
+    } else {
+        FileKind::Other
+    };
+    Some(PreviewSignature {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+        kind,
+    })
+}
+
+fn kind_rank(kind: FileKind) -> u8 {
+    match kind {
+        FileKind::Directory => 0,
+        FileKind::Symlink => 1,
+        FileKind::File => 2,
+        FileKind::Other => 3,
     }
 }
 

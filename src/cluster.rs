@@ -1077,6 +1077,7 @@ fn key_to_command(key: KeyEvent) -> Option<ClusterCommand> {
         };
     }
     match key.code {
+        KeyCode::Esc => Some(ClusterCommand::Cancel),
         KeyCode::Char('j') | KeyCode::Down => Some(ClusterCommand::Down),
         KeyCode::Char('k') | KeyCode::Up => Some(ClusterCommand::Up),
         KeyCode::Home => Some(ClusterCommand::First),
@@ -1100,11 +1101,6 @@ fn default_inventory_candidates() -> Vec<PathBuf> {
     }
     if let Some(home) = home_dir() {
         paths.push(home.join(".config/tersh/servers.json"));
-        paths.push(
-            home.join(
-                "Desktop/Qiushan_Studio/7_Computer/codex-campus-server-access/ssh/servers.json",
-            ),
-        );
     }
     paths
 }

@@ -23,9 +23,12 @@ fn wide_layout_contains_compact_info_pane_and_quit_keys() {
     let app = App::for_test();
 
     let buffer = render_app(&app, 120, 30);
+    assert!(buffer.contains("Tersh"));
+    assert!(buffer.contains("items 2"));
+    assert!(buffer.contains("sort kind asc"));
     assert!(buffer.contains("Files"));
     assert!(buffer.contains("Preview"));
-    assert!(buffer.contains("Info"));
+    assert!(buffer.contains("Inspector"));
     assert!(buffer.contains("q quit"));
     assert!(buffer.contains("^C"));
 }
@@ -53,6 +56,28 @@ fn prompt_footer_is_mode_specific() {
     assert!(buffer.contains("^C force"));
     assert!(!buffer.contains("yy/"));
     assert!(!buffer.contains("q quit"));
+}
+
+#[test]
+fn y_prefix_footer_shows_chord_options() {
+    let mut app = App::for_test();
+    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+
+    let buffer = render_app(&app, 100, 30);
+
+    assert!(buffer.contains("y_"));
+    assert!(buffer.contains("f name"));
+    assert!(buffer.contains("r rel"));
+    assert!(buffer.contains("a abs"));
+}
+
+#[test]
+fn workbench_operational_chrome_is_ascii() {
+    let app = App::for_test();
+
+    let buffer = render_app(&app, 120, 30);
+
+    assert!(buffer.is_ascii());
 }
 
 #[test]
@@ -111,6 +136,50 @@ fn delete_confirmation_names_target() {
     assert!(buffer.contains("targets: 1"));
     assert!(buffer.contains("/tmp/tersh-test/src"));
     assert!(buffer.contains("type delete"));
+}
+
+#[test]
+fn delete_confirmation_lists_multiple_targets() {
+    let mut app = App::for_test();
+    app.handle_command(Command::ToggleSelect);
+    app.handle_command(Command::Down);
+    app.handle_command(Command::ToggleSelect);
+    app.apply(Command::PermanentDelete);
+
+    let buffer = render_app(&app, 100, 30);
+
+    assert!(buffer.contains("targets: 2 selected"));
+    assert!(buffer.contains("1. /tmp/tersh-test/README.md"));
+    assert!(buffer.contains("2. /tmp/tersh-test/src"));
+}
+
+#[test]
+fn render_escapes_paths_and_prompt_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let weird = dir.path().join("line\n\u{1b}[31m");
+    std::fs::create_dir(&weird).unwrap();
+    std::fs::write(weird.join("file.txt"), "body").unwrap();
+    let mut app = App::new(weird).unwrap();
+    app.apply(Command::OpenFilter);
+    app.handle_key(KeyEvent::new(KeyCode::Char('\u{1b}'), KeyModifiers::NONE));
+
+    let buffer = render_app(&app, 100, 30);
+
+    assert!(buffer.contains("\\n"));
+    assert!(buffer.contains("\\u{1b}"));
+}
+
+#[test]
+fn preview_errors_and_logs_escape_control_characters() {
+    let dir = tempfile::tempdir().unwrap();
+    let weird = dir.path().join("bad\n\u{1b}[31m");
+    let mut app = App::new(dir.path().to_path_buf()).unwrap();
+    app.force_cwd_for_test(weird);
+
+    let buffer = render_app(&app, 100, 30);
+
+    assert!(buffer.contains("\\n"));
+    assert!(buffer.contains("\\u{1b}"));
 }
 
 #[test]
