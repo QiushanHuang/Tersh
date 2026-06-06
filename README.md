@@ -175,7 +175,7 @@ Use a specific JSON inventory:
 tersh --c --cluster-config /path/to/servers.json
 ```
 
-The dashboard also checks `TERSH_SERVERS_JSON`, `./ssh/servers.json`, and `~/.config/tersh/servers.json`. The campus access layout from the companion runbook is supported: a local host, a Tailscale jump host, and campus servers reached through `ProxyJump`.
+The dashboard also checks `TERSH_SERVERS_JSON`, `./ssh/servers.json`, and `~/.config/tersh/servers.json`. The campus access layout from the companion runbook is supported: a local host, a Tailscale jump host, and campus servers reached through `ProxyJump`. Health probes require SSH host keys to already be trusted; run a normal `ssh user@host` first for new hosts.
 
 Inside the dashboard, select a host and press `s` to leave the status screen temporarily and open a local shell or interactive `ssh` session. Press `t` to open the Tersh file workbench on that host instead; remote hosts use `ssh -t` so the remote TUI has a real terminal. When that shell or workbench exits, Tersh returns to the dashboard and refreshes the selected host.
 
@@ -500,7 +500,7 @@ tersh --c
 tersh --c --cluster-config /path/to/servers.json
 ```
 
-状态面板也会检查 `TERSH_SERVERS_JSON`、`./ssh/servers.json` 和 `~/.config/tersh/servers.json`。之前运行指南里的校园网布局可以直接使用：本机、Tailscale 跳板机，以及通过 `ProxyJump` 访问的校园服务器。
+状态面板也会检查 `TERSH_SERVERS_JSON`、`./ssh/servers.json` 和 `~/.config/tersh/servers.json`。之前运行指南里的校园网布局可以直接使用：本机、Tailscale 跳板机，以及通过 `ProxyJump` 访问的校园服务器。健康探测要求 SSH host key 已经受信任；新主机请先手动运行一次 `ssh user@host`。
 
 在状态面板里选中主机后按 `s`，会临时离开状态页并打开本地 shell 或交互式 `ssh` 会话。按 `t` 则是在这台主机上打开 Tersh 文件工作台；远端主机会使用 `ssh -t`，这样远端 TUI 有真实终端。退出 shell 或工作台后，Tersh 会回到状态面板并刷新当前主机。
 

@@ -10,6 +10,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const ASCII_BORDER: border::Set = border::Set {
     top_left: "+",
@@ -200,11 +201,11 @@ fn draw_files(frame: &mut Frame, area: Rect, app: &App) {
         );
         let inner_width = area.width.saturating_sub(2) as usize;
         let name_width = inner_width
-            .saturating_sub(prefix.chars().count())
-            .saturating_sub(suffix.chars().count());
+            .saturating_sub(display_width(&prefix))
+            .saturating_sub(display_width(suffix));
         let row = format!(
             "{prefix}{}{}",
-            truncate_chars(&entry.name, name_width),
+            truncate_display_width(&entry.name, name_width),
             suffix
         );
         if index == app.cursor() {
@@ -288,14 +289,28 @@ fn draw_fullscreen_preview(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(paragraph, area);
 }
 
-fn truncate_chars(value: &str, max_chars: usize) -> String {
-    if value.chars().count() <= max_chars {
+fn display_width(value: &str) -> usize {
+    UnicodeWidthStr::width(value)
+}
+
+fn truncate_display_width(value: &str, max_width: usize) -> String {
+    if display_width(value) <= max_width {
         return value.to_string();
     }
-    if max_chars <= 3 {
-        return ".".repeat(max_chars);
+    if max_width <= 3 {
+        return ".".repeat(max_width);
     }
-    let mut truncated = value.chars().take(max_chars - 3).collect::<String>();
+    let content_width = max_width - 3;
+    let mut used = 0;
+    let mut truncated = String::new();
+    for ch in value.chars() {
+        let width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + width > content_width {
+            break;
+        }
+        truncated.push(ch);
+        used += width;
+    }
     truncated.push_str("...");
     truncated
 }
@@ -381,9 +396,12 @@ fn draw_compact_info(frame: &mut Frame, area: Rect, app: &App) {
         app.selected_len(),
         app.copy_buffer_len()
     );
-    let paragraph = Paragraph::new(text)
-        .style(Style::default().fg(Color::Gray))
-        .block(base_block().title("Status").borders(Borders::ALL));
+    let paragraph = Paragraph::new(truncate_display_width(
+        &text,
+        area.width.saturating_sub(2) as usize,
+    ))
+    .style(Style::default().fg(Color::Gray))
+    .block(base_block().title("Status").borders(Borders::ALL));
     frame.render_widget(paragraph, area);
 }
 

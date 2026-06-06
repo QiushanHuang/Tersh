@@ -4,16 +4,23 @@
 
 ### Fixed
 
-- Fixed file operation races by creating copied files/directories with no-clobber semantics and moving/renaming paths with no-replace platform APIs.
+- Hardened file operation race windows with source identity rechecks, no-follow regular-file opens, safer trash/delete target checks, no-clobber copy targets, and no-replace rename APIs where supported.
+- Fixed copy failure cleanup so failed regular-file and recursive-directory copies do not leave partial targets behind.
+- Fixed replace-copy behavior so an invalid source no longer deletes an existing target before source validation succeeds.
 - Fixed edit and preview safety by revalidating regular files with no-follow opens before editor launch or preview cache hashing.
 - Fixed cut/paste retry behavior so failed cut items remain in the transfer buffer instead of being discarded.
 - Fixed cluster refresh generations so timed-out probe results cannot overwrite newer timeout/stale state, while real in-flight probes continue to count toward the concurrency cap.
+- Fixed cluster refresh retry throttling so timed-out active probes do not cause repeated no-eligible-host refresh attempts.
 - Fixed cluster inventory parsing to reject unknown JSON fields and store trimmed aliases, SSH fields, roles, and work directories.
+- Fixed cluster inventory validation to reject whitespace inside SSH target fields.
+- Changed cluster probes to require known SSH host keys instead of auto-accepting new keys during read-only health checks.
+- Fixed cluster probe cleanup by capping captured stdout/stderr and killing timed-out Unix probe process groups.
 - Fixed cluster probe output handling so non-UTF-8 stdout/stderr is preserved lossily instead of being reported as a read failure.
 - Fixed terminal suspension recovery paths to avoid half-restored alternate-screen/raw-mode states.
 - Fixed narrow file-list rendering by truncating long file names in-row.
+- Fixed file-list truncation to use terminal display width for wide Unicode characters.
 - Fixed OSC52 clipboard writes to reject oversized payloads before emitting terminal escape sequences.
-- Fixed install script failures for unwritable install directories with an explicit remediation message.
+- Fixed install script failures for unwritable install directories with an explicit remediation message and atomic temporary-file installation.
 - Fixed cluster snapshots so known host updates are applied even when injected outside an active refresh, restoring summary counts, stale metrics, and detail rendering.
 - Fixed cluster refresh scheduling so empty or fully saturated refresh attempts do not reset the automatic refresh timer.
 - Fixed cluster probe command execution to preserve stdout/stderr in timeout/error paths and report probe execution errors with context instead of silently dropping them.
@@ -21,6 +28,7 @@
 - Fixed directory listings so transient failures for individual entries are skipped instead of clearing the entire view.
 - Fixed named home expansion for `~user` paths, including the no-trailing-slash form.
 - Fixed preview cache invalidation to hash the visible preview range instead of only the first 4 KiB.
+- Fixed preview handling for size-zero virtual regular files by attempting a bounded read before reporting an empty file.
 - Fixed editor launch recovery so alternate screen and raw mode are restored consistently after editor spawn/status failures.
 - Fixed resource percentage parsing for fullwidth percent signs and rounded percentage values.
 

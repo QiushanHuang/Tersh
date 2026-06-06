@@ -176,6 +176,24 @@ fn trash_rejects_symlinked_tersh_trash_directory() {
 
 #[cfg(unix)]
 #[test]
+fn delete_and_trash_reject_paths_inside_symlinked_trash_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let trash = dir.path().join(".tersh-trash");
+    std::os::unix::fs::symlink(outside.path(), &trash).unwrap();
+    let trashed_file = trash.join("old.txt");
+    std::fs::write(outside.path().join("old.txt"), "old").unwrap();
+
+    let delete_err = permanent_delete(&trashed_file, dir.path()).unwrap_err();
+    let trash_err = trash_path(&trashed_file, dir.path()).unwrap_err();
+
+    assert!(delete_err.to_string().contains(".tersh-trash"));
+    assert!(trash_err.to_string().contains(".tersh-trash"));
+    assert!(outside.path().join("old.txt").exists());
+}
+
+#[cfg(unix)]
+#[test]
 fn permanent_delete_removes_symlink_without_deleting_target_directory() {
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("target-dir");
@@ -243,6 +261,38 @@ fn copy_refuses_to_overwrite_dangling_symlink() {
     let err = copy_path(&source, &dangling, false).unwrap_err();
 
     assert!(err.to_string().contains("already exists"));
+}
+
+#[test]
+fn copy_replace_preserves_existing_target_when_source_is_invalid() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing.txt");
+    let target = dir.path().join("target.txt");
+    std::fs::write(&target, "keep").unwrap();
+
+    let err = copy_path(&missing, &target, true).unwrap_err();
+
+    assert!(err.to_string().contains("failed to inspect"));
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_directory_copy_cleans_partial_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    let target = dir.path().join("target");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(source.join("copied-before-error.txt"), "partial").unwrap();
+    let fifo = source.join("unsupported-fifo");
+    let fifo_c =
+        std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(fifo.as_os_str())).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+
+    let err = copy_path(&source, &target, false).unwrap_err();
+
+    assert!(err.to_string().contains("unsupported file type"));
+    assert!(!target.exists());
 }
 
 #[test]

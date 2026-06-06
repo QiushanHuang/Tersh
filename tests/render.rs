@@ -248,3 +248,15 @@ fn file_rows_truncate_long_names_in_narrow_layout() {
 
     assert!(buffer.contains("..."));
 }
+
+#[test]
+fn file_rows_truncate_wide_unicode_names_by_display_width() {
+    let dir = tempfile::tempdir().unwrap();
+    let wide_name = format!("{}.txt", "界".repeat(12));
+    std::fs::write(dir.path().join(wide_name), "x").unwrap();
+    let app = App::new(dir.path().to_path_buf()).unwrap();
+
+    let buffer = render_app(&app, 50, 10);
+
+    assert!(buffer.contains("..."));
+}

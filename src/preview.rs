@@ -76,15 +76,12 @@ pub fn preview_file(path: &Path) -> Result<Preview> {
     }
     let (mut file, metadata) = open_regular_file(path)?;
 
-    if metadata.len() == 0 {
-        return Ok(Preview::message(
-            path.to_path_buf(),
-            PreviewKind::Empty,
-            "Empty file",
-        ));
-    }
-
-    let mut detect_bytes = vec![0; DETECT_LIMIT.min(metadata.len() as usize)];
+    let detect_capacity = if metadata.len() == 0 {
+        DETECT_LIMIT
+    } else {
+        DETECT_LIMIT.min(metadata.len() as usize)
+    };
+    let mut detect_bytes = vec![0; detect_capacity];
     let detected = file.read(&mut detect_bytes)?;
     detect_bytes.truncate(detected);
 

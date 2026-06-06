@@ -7,6 +7,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const ASCII_BORDER: border::Set = border::Set {
     top_left: "+",
@@ -654,13 +655,22 @@ fn visible_start(cursor: usize, total: usize, capacity: usize) -> usize {
 }
 
 fn truncate_to_width(value: &str, width: usize) -> String {
-    if value.chars().count() <= width {
+    if UnicodeWidthStr::width(value) <= width {
         return value.to_string();
     }
     if width <= 3 {
         return ".".repeat(width);
     }
-    let mut truncated = value.chars().take(width - 3).collect::<String>();
+    let mut used = 0;
+    let mut truncated = String::new();
+    for ch in value.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + ch_width > width - 3 {
+            break;
+        }
+        truncated.push(ch);
+        used += ch_width;
+    }
     truncated.push_str("...");
     truncated
 }

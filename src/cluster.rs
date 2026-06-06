@@ -10,7 +10,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs, io,
     path::{Path, PathBuf},
-    process::{Command as ProcessCommand, Stdio},
+    process::{Child, Command as ProcessCommand, Stdio},
     sync::mpsc,
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -19,6 +19,7 @@ use std::{
 const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(6);
 const MAX_CONCURRENT_PROBES: usize = 16;
+const MAX_PROBE_OUTPUT_BYTES: u64 = 1024 * 1024;
 
 const PROBE_SCRIPT: &str = r#"
 printf 'hostname=%s\n' "$(hostname 2>/dev/null || echo unknown)"
@@ -576,19 +577,25 @@ impl ClusterApp {
             return started;
         }
         if self.active_probes.len() >= MAX_CONCURRENT_PROBES {
+            self.last_refresh_started = Some(now);
             self.log("refresh already in progress");
             return started;
         }
         let slots = MAX_CONCURRENT_PROBES.saturating_sub(self.active_probes.len());
         let start = self.refresh_cursor % aliases.len();
         let mut last_index = start;
+        let mut skipped_active = false;
         for offset in 0..aliases.len() {
             if started.len() >= slots {
                 break;
             }
             let index = (start + offset) % aliases.len();
             let alias = &aliases[index];
-            if !self.has_host_alias(alias) || self.active_probes.contains_key(alias) {
+            if !self.has_host_alias(alias) {
+                continue;
+            }
+            if self.active_probes.contains_key(alias) {
+                skipped_active = true;
                 continue;
             }
             let token = self.next_refresh_token();
@@ -611,7 +618,12 @@ impl ClusterApp {
             self.refresh_cursor = (last_index + 1) % aliases.len();
         }
         if started.is_empty() {
-            self.log("no eligible hosts to refresh");
+            if skipped_active {
+                self.last_refresh_started = Some(now);
+                self.log("refresh already in progress");
+            } else {
+                self.log("no eligible hosts to refresh");
+            }
         } else {
             self.last_refresh_started = Some(now);
             self.log(format!("refreshing {} host(s)", started.len()));
@@ -620,6 +632,14 @@ impl ClusterApp {
     }
 
     pub fn apply_snapshot(&mut self, snapshot: HostSnapshot) {
+        if !self.has_host_alias(&snapshot.alias) {
+            return;
+        }
+        self.apply_snapshot_inner(snapshot);
+    }
+
+    #[doc(hidden)]
+    pub fn apply_completed_refresh_snapshot(&mut self, snapshot: HostSnapshot) {
         if !self.has_host_alias(&snapshot.alias) {
             return;
         }
@@ -1018,7 +1038,7 @@ pub fn ssh_probe_args(host: &HostConfig) -> Vec<String> {
         "-o".to_string(),
         "ConnectionAttempts=1".to_string(),
         "-o".to_string(),
-        "StrictHostKeyChecking=accept-new".to_string(),
+        "StrictHostKeyChecking=yes".to_string(),
         "-o".to_string(),
         "ServerAliveInterval=2".to_string(),
         "-o".to_string(),
@@ -1208,6 +1228,8 @@ fn run_command_with_timeout(mut command: ProcessCommand, timeout: Duration) -> R
         .open(&temp_files.stderr)
         .context("create temp stderr file")?;
 
+    configure_probe_command(&mut command);
+
     let mut child = command
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
@@ -1221,14 +1243,14 @@ fn run_command_with_timeout(mut command: ProcessCommand, timeout: Duration) -> R
         }
         if started.elapsed() >= timeout {
             timed_out = true;
-            let _ = child.kill();
+            terminate_probe_child(&mut child);
             break child.wait().context("wait probe command after timeout")?;
         }
         thread::sleep(Duration::from_millis(50));
     };
 
-    let stdout = read_lossy(&temp_files.stdout)?;
-    let stderr = read_lossy(&temp_files.stderr)?;
+    let stdout = read_lossy_limited(&temp_files.stdout, "stdout")?;
+    let stderr = read_lossy_limited(&temp_files.stderr, "stderr")?;
 
     if timed_out {
         let mut message = format!("probe timed out after {}s", timeout.as_secs());
@@ -1249,9 +1271,50 @@ fn run_command_with_timeout(mut command: ProcessCommand, timeout: Duration) -> R
     anyhow::bail!("{stderr}");
 }
 
-fn read_lossy(path: &Path) -> Result<String> {
+fn read_lossy_limited(path: &Path, stream: &str) -> Result<String> {
+    let metadata =
+        fs::metadata(path).with_context(|| format!("failed to inspect {}", path.display()))?;
+    if metadata.len() > MAX_PROBE_OUTPUT_BYTES {
+        anyhow::bail!(
+            "probe output too large: {stream} exceeded {} bytes",
+            MAX_PROBE_OUTPUT_BYTES
+        );
+    }
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+#[cfg(unix)]
+fn configure_probe_command(command: &mut ProcessCommand) {
+    use std::os::unix::process::CommandExt;
+
+    // Put each probe in its own process group so timeout cleanup reaches shell children too.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn configure_probe_command(_command: &mut ProcessCommand) {}
+
+#[cfg(unix)]
+fn terminate_probe_child(child: &mut Child) {
+    let pid = child.id() as libc::pid_t;
+    unsafe {
+        let _ = libc::killpg(pid, libc::SIGKILL);
+    }
+    let _ = child.kill();
+}
+
+#[cfg(not(unix))]
+fn terminate_probe_child(child: &mut Child) {
+    let _ = child.kill();
 }
 
 struct TempProbeFiles {
@@ -1400,6 +1463,9 @@ fn validate_label(field: &'static str, value: &str) -> Result<()> {
 
 fn validate_ssh_field(field: &'static str, value: &str) -> Result<()> {
     validate_label(field, value)?;
+    if value.chars().any(char::is_whitespace) {
+        anyhow::bail!("{field} must not contain whitespace");
+    }
     if value.trim_start().starts_with('-') {
         anyhow::bail!("{field} must not start with '-'");
     }
@@ -1537,6 +1603,35 @@ mod tests {
     }
 
     #[test]
+    fn timed_out_active_probe_retry_is_throttled_when_no_host_is_eligible() {
+        let mut app = ClusterApp::new(vec![test_host("school-star")]);
+        let aliases = vec!["school-star".to_string()];
+        assert_eq!(app.begin_refresh(&aliases), aliases);
+        app.refresh_deadlines.insert(
+            "school-star".to_string(),
+            Instant::now() - Duration::from_secs(1),
+        );
+        app.last_refresh_started = Some(Instant::now() - Duration::from_secs(120));
+
+        app.mark_timed_out_refreshes();
+        assert!(app.refresh_due(Duration::from_secs(60)));
+        assert!(app.begin_refresh(&aliases).is_empty());
+
+        assert!(!app.refresh_due(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn external_snapshot_does_not_clear_active_refresh_accounting() {
+        let mut app = ClusterApp::new(vec![test_host("school-star")]);
+        let aliases = vec!["school-star".to_string()];
+        assert_eq!(app.begin_refresh(&aliases), aliases);
+
+        app.apply_snapshot(HostSnapshot::offline("school-star", "manual update"));
+
+        assert!(app.begin_refresh(&aliases).is_empty());
+    }
+
+    #[test]
     fn cluster_app_deduplicates_constructor_hosts() {
         let app = ClusterApp::new(vec![test_host("dup"), test_host("dup")]);
 
@@ -1566,6 +1661,20 @@ mod tests {
 
         assert!(err.to_string().contains('\u{fffd}'));
         assert!(!err.to_string().contains("failed to read"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_output_over_limit_is_rejected() {
+        let mut command = ProcessCommand::new("sh");
+        command.args([
+            "-c",
+            "dd if=/dev/zero bs=1024 count=1100 2>/dev/null | tr '\\0' x",
+        ]);
+
+        let err = run_command_with_timeout(command, Duration::from_secs(2)).unwrap_err();
+
+        assert!(err.to_string().contains("probe output too large"));
     }
 
     fn probe_temp_files() -> BTreeSet<PathBuf> {

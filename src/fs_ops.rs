@@ -14,29 +14,59 @@ pub enum DeleteDecision {
 pub fn copy_path(source: &Path, target: &Path, replace: bool) -> Result<()> {
     if path_exists_no_follow(target)? {
         if replace {
-            remove_existing(target)?;
+            return replace_path(source, target);
         } else {
             bail!("target already exists: {}", target.display());
         }
     }
+    copy_path_no_replace(source, target)
+}
+
+fn copy_path_no_replace(source: &Path, target: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(source)
         .with_context(|| format!("failed to inspect {}", source.display()))?;
+    let identity = FileIdentity::from_metadata(&metadata);
     if metadata.is_dir() {
         reject_copy_into_self(source, target)?;
     }
     if metadata.file_type().is_symlink() {
+        ensure_path_identity(source, &identity)?;
         let link_target = fs::read_link(source)
             .with_context(|| format!("failed to read symlink {}", source.display()))?;
+        ensure_path_identity(source, &identity)?;
         create_parent_dir(target)?;
         let is_dir = symlink_target_is_dir_for_creation(source, &link_target)?;
         create_symlink(&link_target, target, is_dir)
     } else if metadata.is_dir() {
-        copy_dir_recursive(source, target, &metadata)
+        copy_dir_recursive(source, target, &metadata, &identity)
     } else if metadata.is_file() {
-        copy_regular_file(source, target, &metadata)
+        copy_regular_file(source, target, &metadata, &identity)
     } else {
         bail!("unsupported file type: {}", source.display());
     }
+}
+
+fn replace_path(source: &Path, target: &Path) -> Result<()> {
+    let temp = temp_sibling_path(target)?;
+    let copy_result = copy_path_no_replace(source, &temp);
+    if let Err(err) = copy_result {
+        let _ = remove_existing(&temp);
+        return Err(err);
+    }
+
+    remove_existing(target)
+        .with_context(|| format!("failed to remove existing {}", target.display()))?;
+    if let Err(err) = rename_no_replace(&temp, target) {
+        let _ = remove_existing(&temp);
+        return Err(err).with_context(|| {
+            format!(
+                "failed to replace {} with {}",
+                target.display(),
+                source.display()
+            )
+        });
+    }
+    Ok(())
 }
 
 pub fn rename_path(source: &Path, target: &Path) -> Result<()> {
@@ -53,7 +83,7 @@ pub fn rename_path(source: &Path, target: &Path) -> Result<()> {
 }
 
 pub fn trash_path(path: &Path, work_root: &Path) -> Result<DeleteDecision> {
-    guard_delete_target(path, work_root)?;
+    let guarded = guard_delete_target(path, work_root)?;
     let trash_dir = prepare_trash_dir(work_root)?;
     let file_name = path
         .file_name()
@@ -68,6 +98,7 @@ pub fn trash_path(path: &Path, work_root: &Path) -> Result<DeleteDecision> {
                 unique_suffix()
             ))
         };
+        ensure_path_identity(path, &guarded.identity)?;
         match rename_no_replace(path, &target) {
             Ok(()) => {
                 return Ok(DeleteDecision::MovedToTrash {
@@ -117,9 +148,9 @@ fn prepare_trash_dir(work_root: &Path) -> Result<PathBuf> {
 }
 
 pub fn permanent_delete(path: &Path, work_root: &Path) -> Result<()> {
-    guard_delete_target(path, work_root)?;
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+    let guarded = guard_delete_target(path, work_root)?;
+    ensure_path_identity(path, &guarded.identity)?;
+    if guarded.identity.is_dir && !guarded.identity.is_symlink {
         fs::remove_dir_all(path)
             .with_context(|| format!("failed to delete directory {}", path.display()))
     } else {
@@ -152,38 +183,65 @@ pub fn validate_file_name(name: &str) -> Result<()> {
     }
 }
 
-fn copy_regular_file(source: &Path, target: &Path, metadata: &fs::Metadata) -> Result<()> {
+fn copy_regular_file(
+    source: &Path,
+    target: &Path,
+    metadata: &fs::Metadata,
+    identity: &FileIdentity,
+) -> Result<()> {
     create_parent_dir(target)?;
-    let mut input =
-        File::open(source).with_context(|| format!("failed to open {}", source.display()))?;
+    ensure_path_identity(source, identity)?;
+    let mut input = open_regular_source(source)
+        .with_context(|| format!("failed to open {}", source.display()))?;
+    let opened_metadata = input
+        .metadata()
+        .with_context(|| format!("failed to inspect opened {}", source.display()))?;
+    if FileIdentity::from_metadata(&opened_metadata) != *identity {
+        bail!("source changed during copy: {}", source.display());
+    }
     let mut output = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(target)
         .with_context(|| format!("failed to create {}", target.display()))?;
-    io::copy(&mut input, &mut output).with_context(|| {
+    if let Err(err) = io::copy(&mut input, &mut output).with_context(|| {
         format!(
             "failed to copy {} to {}",
             source.display(),
             target.display()
         )
-    })?;
+    }) {
+        let _ = fs::remove_file(target);
+        return Err(err);
+    }
     fs::set_permissions(target, metadata.permissions()).ok();
     Ok(())
 }
 
-fn copy_dir_recursive(source: &Path, target: &Path, metadata: &fs::Metadata) -> Result<()> {
+fn copy_dir_recursive(
+    source: &Path,
+    target: &Path,
+    metadata: &fs::Metadata,
+    identity: &FileIdentity,
+) -> Result<()> {
     create_parent_dir(target)?;
     fs::create_dir(target)
         .with_context(|| format!("failed to create directory {}", target.display()))?;
     fs::set_permissions(target, metadata.permissions()).ok();
-    for entry in fs::read_dir(source)? {
-        let entry = entry?;
-        let child_source = entry.path();
-        let child_target = target.join(entry.file_name());
-        copy_path(&child_source, &child_target, false)?;
+    let result = (|| {
+        ensure_path_identity(source, identity)?;
+        for entry in fs::read_dir(source)? {
+            let entry = entry?;
+            let child_source = entry.path();
+            let child_target = target.join(entry.file_name());
+            copy_path(&child_source, &child_target, false)?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = remove_existing(target);
     }
-    Ok(())
+    result
 }
 
 fn create_parent_dir(target: &Path) -> Result<()> {
@@ -218,6 +276,88 @@ fn path_exists_no_follow(path: &Path) -> Result<bool> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileIdentity {
+    is_dir: bool,
+    is_file: bool,
+    is_symlink: bool,
+    len: u64,
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+}
+
+impl FileIdentity {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+
+        Self {
+            is_dir: metadata.is_dir(),
+            is_file: metadata.is_file(),
+            is_symlink: metadata.file_type().is_symlink(),
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            dev: metadata.dev(),
+            #[cfg(unix)]
+            ino: metadata.ino(),
+        }
+    }
+}
+
+fn capture_path_identity(path: &Path) -> Result<FileIdentity> {
+    fs::symlink_metadata(path)
+        .map(|metadata| FileIdentity::from_metadata(&metadata))
+        .with_context(|| format!("failed to inspect {}", path.display()))
+}
+
+fn ensure_path_identity(path: &Path, expected: &FileIdentity) -> Result<()> {
+    let actual = capture_path_identity(path)?;
+    if &actual != expected {
+        bail!("path changed during operation: {}", path.display());
+    }
+    Ok(())
+}
+
+fn temp_sibling_path(target: &Path) -> Result<PathBuf> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| anyhow!("target has no parent: {}", target.display()))?;
+    let name = target
+        .file_name()
+        .ok_or_else(|| anyhow!("target has no file name: {}", target.display()))?
+        .to_string_lossy();
+    for _ in 0..100 {
+        let candidate = parent.join(format!(".{name}.tersh-copy-{}", unique_suffix()));
+        if !path_exists_no_follow(&candidate)? {
+            return Ok(candidate);
+        }
+    }
+    bail!(
+        "failed to allocate temporary copy target for {}",
+        target.display()
+    );
+}
+
+#[cfg(unix)]
+fn open_regular_source(path: &Path) -> Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("failed to open {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn open_regular_source(path: &Path) -> Result<File> {
+    File::open(path).with_context(|| format!("failed to open {}", path.display()))
+}
+
 #[cfg(unix)]
 fn symlink_target_is_dir_for_creation(_source: &Path, _link_target: &Path) -> Result<bool> {
     Ok(false)
@@ -248,9 +388,17 @@ fn remove_existing(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn guard_delete_target(path: &Path, work_root: &Path) -> Result<()> {
+struct GuardedDeleteTarget {
+    identity: FileIdentity,
+}
+
+fn guard_delete_target(path: &Path, work_root: &Path) -> Result<GuardedDeleteTarget> {
     if path.as_os_str().is_empty() || !path.is_absolute() {
         bail!("refusing to delete non-absolute path: {}", path.display());
+    }
+    let input_trash_root = work_root.join(".tersh-trash");
+    if path == input_trash_root || path.starts_with(&input_trash_root) {
+        bail!("refusing to delete .tersh-trash");
     }
     let target = delete_identity(path)?;
     if target.parent().is_none() {
@@ -269,10 +417,15 @@ fn guard_delete_target(path: &Path, work_root: &Path) -> Result<()> {
         bail!("refusing to delete active work root");
     }
     let trash_root = work_root.join(".tersh-trash");
+    if path == trash_root || path.starts_with(&trash_root) {
+        bail!("refusing to delete .tersh-trash");
+    }
     if target == trash_root || target.starts_with(&trash_root) {
         bail!("refusing to delete .tersh-trash");
     }
-    Ok(())
+    Ok(GuardedDeleteTarget {
+        identity: capture_path_identity(path)?,
+    })
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]

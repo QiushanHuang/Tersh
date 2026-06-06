@@ -121,7 +121,7 @@ fn ssh_probe_args_are_non_interactive_and_use_configured_proxy_jump() {
     );
     assert!(
         args.windows(2)
-            .any(|pair| pair == ["-o", "StrictHostKeyChecking=accept-new"])
+            .any(|pair| pair == ["-o", "StrictHostKeyChecking=yes"])
     );
     assert!(args.iter().any(|arg| arg == "star@10.13.7.138"));
 }
@@ -321,7 +321,7 @@ fn cluster_app_keeps_last_good_metrics_when_refresh_fails() {
 
     let aliases = vec!["school-star".to_string()];
     assert_eq!(app.begin_refresh(&aliases), aliases);
-    app.apply_snapshot(HostSnapshot::offline(
+    app.apply_completed_refresh_snapshot(HostSnapshot::offline(
         "school-star",
         "probe timed out after 6s",
     ));
@@ -367,7 +367,7 @@ fn begin_refresh_rotates_after_capped_batch_completes() {
 
     let first = app.begin_refresh(&aliases);
     for alias in first {
-        app.apply_snapshot(HostSnapshot::offline(alias, "offline"));
+        app.apply_completed_refresh_snapshot(HostSnapshot::offline(alias, "offline"));
     }
     let second = app.begin_refresh(&aliases);
 
@@ -432,6 +432,21 @@ fn inventory_rejects_option_like_address_fields() {
     let err = ClusterInventory::from_json(json).unwrap_err();
 
     assert!(err.to_string().contains("address"));
+}
+
+#[test]
+fn inventory_rejects_whitespace_in_ssh_fields() {
+    let json = r#"
+{
+  "servers": [
+    { "alias": "bad", "ssh_user": "ops team", "campus_ip": "203.0.113.10" }
+  ]
+}
+"#;
+
+    let err = ClusterInventory::from_json(json).unwrap_err();
+
+    assert!(err.to_string().contains("ssh_user"));
 }
 
 #[test]
