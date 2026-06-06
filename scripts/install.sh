@@ -31,7 +31,7 @@ choose_install_dir() {
 install_dir=$(choose_install_dir)
 
 cd "$project_dir"
-cargo build --release --bin tersh
+cargo build --locked --release --bin tersh
 
 mkdir -p "$install_dir"
 if [ ! -w "$install_dir" ]; then

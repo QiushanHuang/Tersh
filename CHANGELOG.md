@@ -2,8 +2,21 @@
 
 ## Unreleased
 
+### Added
+
+- Added direct file startup support so `tersh <file>` opens the file's parent directory, focuses the file, and enters preview for regular files.
+- Added remote workbench diagnostics for `tersh --c` so remote `t` sessions report missing `tersh` binaries and invalid `workdir` paths with actionable messages.
+- Added compact workbench help and confirmation layouts for very narrow terminal screens.
+
+### Changed
+
+- Changed filter input to use the current in-memory directory listing while typing, avoiding a full directory scan on every character.
+- Changed compact workbench and cluster chrome to keep selection/buffer state and the cluster detail action visible on narrow terminals.
+- Changed the install script to build with `--locked`, and enabled release stripping plus thin LTO for smaller optimized local rebuilds.
+
 ### Fixed
 
+- Fixed parallel test instability in probe temporary-file cleanup checks by isolating the probe-output tests from each other.
 - Hardened file operation race windows with source identity rechecks, no-follow regular-file opens, safer trash/delete target checks, no-clobber copy targets, and no-replace rename APIs where supported.
 - Fixed copy failure cleanup so failed regular-file and recursive-directory copies do not leave partial targets behind.
 - Fixed replace-copy behavior so an invalid source no longer deletes an existing target before source validation succeeds.

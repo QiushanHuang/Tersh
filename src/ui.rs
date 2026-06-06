@@ -38,7 +38,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
             draw_header(frame, rows[0], app);
             draw_fullscreen_preview(frame, rows[1], app);
             if app.mode() == Mode::PreviewSearch {
-                draw_input_modal(frame, centered_rect(70, 30, area), app);
+                draw_input_modal(frame, command_overlay_rect(area, app.mode()), app);
             }
             draw_footer(frame, rows[2], app);
         }
@@ -55,14 +55,16 @@ pub fn draw(frame: &mut Frame, app: &App) {
             draw_body(frame, rows[1], app);
             draw_footer(frame, rows[2], app);
             match app.mode() {
-                Mode::Help => draw_help(frame, centered_rect(70, 70, area)),
+                Mode::Help => draw_help(frame, help_overlay_rect(area)),
                 Mode::Filter
                 | Mode::Goto
                 | Mode::Rename
                 | Mode::CopyTo
                 | Mode::MoveTo
                 | Mode::ConfirmTrash
-                | Mode::ConfirmDelete => draw_input_modal(frame, centered_rect(70, 30, area), app),
+                | Mode::ConfirmDelete => {
+                    draw_input_modal(frame, command_overlay_rect(area, app.mode()), app)
+                }
                 Mode::Message | Mode::Normal | Mode::Preview | Mode::PreviewSearch => {}
             }
         }
@@ -70,6 +72,10 @@ pub fn draw(frame: &mut Frame, app: &App) {
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
+    if area.width < 80 {
+        draw_compact_header(frame, area, app);
+        return;
+    }
     let hidden = if app.show_hidden() { "ON" } else { "OFF" };
     let filter = if app.filter().is_empty() {
         "-".to_string()
@@ -115,6 +121,23 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
         ),
     ])];
     let paragraph = Paragraph::new(lines).block(base_block().borders(Borders::ALL));
+    frame.render_widget(paragraph, area);
+}
+
+fn draw_compact_header(frame: &mut Frame, area: Rect, app: &App) {
+    let filter = if app.filter().is_empty() { "-" } else { "*" };
+    let text = format!(
+        "Tersh | sel {} | buf {} | f {} | {}",
+        app.selected_len(),
+        app.copy_buffer_label(),
+        filter,
+        compact_path(app.cwd(), area.width.saturating_sub(34) as usize)
+    );
+    let paragraph = Paragraph::new(truncate_display_width(
+        &text,
+        area.width.saturating_sub(2) as usize,
+    ))
+    .block(base_block().borders(Borders::ALL));
     frame.render_widget(paragraph, area);
 }
 
@@ -315,6 +338,21 @@ fn truncate_display_width(value: &str, max_width: usize) -> String {
     truncated
 }
 
+fn compact_path(path: &std::path::Path, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    let full = display_path(path);
+    if display_width(&full) <= max_width {
+        return full;
+    }
+    let Some(name) = path.file_name() else {
+        return truncate_display_width(&full, max_width);
+    };
+    let compact = format!(".../{}", escape_display(&name.to_string_lossy()));
+    truncate_display_width(&compact, max_width)
+}
+
 fn draw_preview(frame: &mut Frame, area: Rect, app: &App) {
     let mut lines = vec![Line::from(Span::styled(
         display_path(&app.preview().path),
@@ -450,29 +488,41 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
 
 fn draw_help(frame: &mut Frame, area: Rect) {
     frame.render_widget(Clear, area);
-    let lines = vec![
-        Line::from("Navigation"),
-        Line::from("  j/k or arrows: move    PageUp/PageDown: page    Home/End: first/last"),
-        Line::from("  h: parent    l: open directory"),
-        Line::from("  Enter on file: fullscreen preview"),
-        Line::from("  /: filter    .: hidden    r: refresh    s/S: sort/reverse"),
-        Line::from(""),
-        Line::from("Operations"),
-        Line::from("  Space: mark    yy: copy    x: cut    p: paste"),
-        Line::from("  c: copy to...    m: move to...    n: rename"),
-        Line::from("  yf: file name    yr: relative path    ya: absolute path"),
-        Line::from("  e: edit focused regular file with $VISUAL/$EDITOR/nano"),
-        Line::from("  :: goto directory"),
-        Line::from("  d: trash, then type trash    D: delete, then type delete"),
-        Line::from(""),
-        Line::from("Preview mode"),
-        Line::from("  j/k/PageUp/PageDown: page    arrows/Ctrl+F/Ctrl+B: line"),
-        Line::from("  gg: top    G: bottom"),
-        Line::from("  /: search    n/N: next/prev match"),
-        Line::from(""),
-        Line::from("Exit"),
-        Line::from("  q: quit/close    Esc/Ctrl+G: cancel    Q/Ctrl+C: force quit"),
-    ];
+    let lines = if area.width < 60 || area.height < 14 {
+        vec![
+            Line::from("Move: j/k arrows PgUp/PgDn"),
+            Line::from("Open: h parent, l/Enter preview"),
+            Line::from("Find: / filter, . hidden, r refresh"),
+            Line::from("Ops: Space, y..., x cut, p paste"),
+            Line::from("More: c copy-to, m move-to, n rename"),
+            Line::from("Delete: d trash, D delete"),
+            Line::from("Preview: / find, n/N, e edit"),
+            Line::from("Exit: q, Esc/^G, ^C"),
+        ]
+    } else {
+        vec![
+            Line::from("Navigation"),
+            Line::from("  j/k or arrows: move    PageUp/PageDown: page    Home/End: first/last"),
+            Line::from("  h: parent    l/Enter: open directory or preview file"),
+            Line::from("  /: filter    .: hidden    r: refresh    s/S: sort/reverse"),
+            Line::from(""),
+            Line::from("Operations"),
+            Line::from("  Space: mark    yy: copy    x: cut    p: paste"),
+            Line::from("  c: copy to...    m: move to...    n: rename"),
+            Line::from("  yf: file name    yr: relative path    ya: absolute path"),
+            Line::from("  e: edit focused regular file with $VISUAL/$EDITOR/nano"),
+            Line::from("  :: goto directory"),
+            Line::from("  d: trash, then type trash    D: delete, then type delete"),
+            Line::from(""),
+            Line::from("Preview mode"),
+            Line::from("  j/k/PageUp/PageDown: page    arrows/Ctrl+F/Ctrl+B: line"),
+            Line::from("  gg: top    G: bottom"),
+            Line::from("  /: search    n/N: next/prev match"),
+            Line::from(""),
+            Line::from("Exit"),
+            Line::from("  q: quit/close    Esc/Ctrl+G: cancel    Q/Ctrl+C: force quit"),
+        ]
+    };
     let paragraph = Paragraph::new(lines)
         .block(base_block().title("Help").borders(Borders::ALL))
         .wrap(Wrap { trim: false });
@@ -508,8 +558,13 @@ fn draw_input_modal(frame: &mut Frame, area: Rect, app: &App) {
     }
     lines.push(Line::from(""));
     lines.push(Line::from(escape_display(app.input())));
+    let title = match app.mode() {
+        Mode::ConfirmDelete => "DANGER",
+        Mode::ConfirmTrash => "TRASH",
+        _ => "Command",
+    };
     let paragraph = Paragraph::new(lines)
-        .block(base_block().title("Command").borders(Borders::ALL))
+        .block(base_block().title(title).borders(Borders::ALL))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
@@ -554,4 +609,22 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(popup_layout[1])[1]
+}
+
+fn help_overlay_rect(area: Rect) -> Rect {
+    if area.width < 60 || area.height < 14 {
+        area
+    } else {
+        centered_rect(70, 70, area)
+    }
+}
+
+fn command_overlay_rect(area: Rect, mode: Mode) -> Rect {
+    if matches!(mode, Mode::ConfirmTrash | Mode::ConfirmDelete)
+        && (area.width < 60 || area.height < 14)
+    {
+        area
+    } else {
+        centered_rect(70, 30, area)
+    }
 }

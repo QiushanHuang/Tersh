@@ -1188,10 +1188,20 @@ fn current_tersh_program() -> String {
 }
 
 fn remote_workbench_command(workdir: Option<&str>) -> String {
-    let script = match workdir.map(str::trim).filter(|workdir| !workdir.is_empty()) {
-        Some(workdir) => format!("cd -- {} && exec tersh", shell_quote(workdir)),
-        None => "exec tersh".to_string(),
-    };
+    let mut script = format!(
+        "if ! command -v tersh >/dev/null 2>&1; then printf '%s\\n' {} >&2; exit 127; fi",
+        shell_quote(
+            "tersh is not installed or not in PATH. Install: cargo install --git https://github.com/QiushanHuang/Tersh.git --tag v1.1.0 --bin tersh --force"
+        )
+    );
+    if let Some(workdir) = workdir.map(str::trim).filter(|workdir| !workdir.is_empty()) {
+        script.push_str(&format!(
+            "; cd -- {} || {{ printf '%s\\n' {} >&2; exit 1; }}",
+            shell_quote(workdir),
+            shell_quote(&format!("tersh workdir not found: {workdir}"))
+        ));
+    }
+    script.push_str("; exec tersh");
     remote_probe_command(&script)
 }
 
@@ -1567,7 +1577,9 @@ impl Drop for TerminalGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeSet;
+    use std::{collections::BTreeSet, sync::Mutex};
+
+    static PROBE_TEMP_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn begin_refresh_empty_aliases_does_not_reset_refresh_timer() {
@@ -1641,6 +1653,7 @@ mod tests {
 
     #[test]
     fn failed_probe_spawn_cleans_temp_files() {
+        let _guard = PROBE_TEMP_LOCK.lock().unwrap();
         let before = probe_temp_files();
         let command = ProcessCommand::new("__tersh_missing_probe_binary__");
 
@@ -1654,6 +1667,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn probe_failure_preserves_non_utf8_stderr_lossily() {
+        let _guard = PROBE_TEMP_LOCK.lock().unwrap();
         let mut command = ProcessCommand::new("sh");
         command.args(["-c", "printf '\\377' >&2; exit 2"]);
 
@@ -1666,6 +1680,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn probe_output_over_limit_is_rejected() {
+        let _guard = PROBE_TEMP_LOCK.lock().unwrap();
         let mut command = ProcessCommand::new("sh");
         command.args([
             "-c",

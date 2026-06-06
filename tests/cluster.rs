@@ -197,6 +197,8 @@ fn host_workbench_command_opens_local_or_remote_tersh() {
             .any(|pair| pair == ["-J", "joshua@100.90.116.54"])
     );
     assert!(args.iter().any(|arg| arg == "star@10.13.7.138"));
+    assert!(args.last().unwrap().contains("command -v tersh"));
+    assert!(args.last().unwrap().contains("tersh is not installed"));
     assert!(args.last().unwrap().contains("exec tersh"));
     assert!(args.last().unwrap().contains("/srv/star"));
     assert!(!args.windows(2).any(|pair| pair == ["-o", "BatchMode=yes"]));
@@ -648,6 +650,7 @@ fn cluster_render_tiny_keeps_exit_visible() {
         .collect::<String>();
     assert!(buffer.contains("q quit"));
     assert!(buffer.contains("? help"));
+    assert!(buffer.contains("l detail"));
     assert!(buffer.contains("^G"));
     assert!(buffer.contains("^C"));
 }

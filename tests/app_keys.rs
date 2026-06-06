@@ -5,6 +5,42 @@ use tersh::app::{App, Command, Mode};
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
+fn starting_from_file_path_focuses_parent_and_opens_preview() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("note.txt");
+    std::fs::write(&path, "hello").unwrap();
+
+    let app = App::new(path).unwrap();
+
+    assert_eq!(app.cwd(), dir.path().canonicalize().unwrap());
+    assert_eq!(app.entries()[app.cursor()].name, "note.txt");
+    assert_eq!(app.mode(), Mode::Preview);
+    assert!(
+        app.preview()
+            .lines
+            .iter()
+            .any(|line| line.contains("hello"))
+    );
+}
+
+#[test]
+fn filter_input_uses_cached_entries_until_refresh() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("alpha.txt"), "a").unwrap();
+    std::fs::write(dir.path().join("beta.txt"), "b").unwrap();
+    let mut app = App::new(dir.path().to_path_buf()).unwrap();
+
+    app.apply(Command::OpenFilter);
+    std::fs::write(dir.path().join("zeta.txt"), "z").unwrap();
+    app.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+
+    assert!(app.entries().is_empty());
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    app.handle_command(Command::Refresh);
+    assert!(app.entries().iter().any(|entry| entry.name == "zeta.txt"));
+}
+
+#[test]
 fn ctrl_g_closes_filter_before_quitting() {
     let mut app = App::for_test();
 

@@ -581,7 +581,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &ClusterApp) {
         ClusterMode::Detail => {
             "detail | q/Esc back | ^G back | ^C force | r refresh | s shell/ssh | t tersh"
         }
-        ClusterMode::Normal if compact => "q quit | ? help | ^G | ^C",
+        ClusterMode::Normal if compact => "q quit | ? help | l detail | ^G | ^C",
         ClusterMode::Normal => {
             "q quit | ? help | ^G back | ^C force | r refresh | Enter refresh host | s shell/ssh | t tersh | l detail | j/k move | Home/End"
         }

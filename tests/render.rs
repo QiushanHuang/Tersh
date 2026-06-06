@@ -211,6 +211,42 @@ fn compact_layout_keeps_survival_controls_visible() {
 }
 
 #[test]
+fn compact_header_keeps_selection_and_buffer_visible() {
+    let mut app = App::for_test();
+    app.handle_command(Command::ToggleSelect);
+    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+
+    let buffer = render_app(&app, 40, 10);
+
+    assert!(buffer.contains("sel 1"));
+    assert!(buffer.contains("buf COPY 1"));
+}
+
+#[test]
+fn compact_help_uses_readable_fullscreen_summary() {
+    let mut app = App::for_test();
+    app.apply(Command::OpenHelp);
+
+    let buffer = render_app(&app, 40, 10);
+
+    assert!(buffer.contains("Ops:"));
+    assert!(buffer.contains("Exit:"));
+}
+
+#[test]
+fn compact_delete_confirmation_keeps_target_and_input_visible() {
+    let mut app = App::for_test();
+    app.apply(Command::PermanentDelete);
+
+    let buffer = render_app(&app, 40, 10);
+
+    assert!(buffer.contains("DANGER"));
+    assert!(buffer.contains("targets: 1"));
+    assert!(buffer.contains("type delete"));
+}
+
+#[test]
 fn compact_layout_shows_focused_status_context() {
     let app = App::for_test();
 

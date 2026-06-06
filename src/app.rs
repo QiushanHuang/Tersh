@@ -16,7 +16,7 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{
     collections::BTreeSet,
     collections::hash_map::DefaultHasher,
-    ffi::{CStr, CString},
+    ffi::{CStr, CString, OsStr, OsString},
     fs,
     hash::{Hash, Hasher},
     io::{self, Read, Write},
@@ -97,6 +97,7 @@ pub enum SortKey {
 pub struct App {
     cwd: PathBuf,
     work_root: PathBuf,
+    all_entries: Vec<FileEntry>,
     entries: Vec<FileEntry>,
     cursor: usize,
     selected: BTreeSet<PathBuf>,
@@ -155,18 +156,60 @@ struct CachedPreview {
     preview: Preview,
 }
 
+struct InitialLocation {
+    cwd: PathBuf,
+    focus_name: Option<OsString>,
+    open_preview: bool,
+    show_hidden: bool,
+}
+
+fn resolve_initial_location(path: &Path) -> Result<InitialLocation> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to resolve {}", path.display()))?;
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        return Ok(InitialLocation {
+            cwd: path
+                .canonicalize()
+                .with_context(|| format!("failed to resolve {}", path.display()))?,
+            focus_name: None,
+            open_preview: false,
+            show_hidden: false,
+        });
+    }
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let focus_name = path
+        .file_name()
+        .map(OsStr::to_os_string)
+        .ok_or_else(|| anyhow::anyhow!("path has no file name: {}", path.display()))?;
+    let show_hidden = focus_name
+        .to_string_lossy()
+        .chars()
+        .next()
+        .map(|ch| ch == '.')
+        .unwrap_or(false);
+
+    Ok(InitialLocation {
+        cwd: parent
+            .canonicalize()
+            .with_context(|| format!("failed to resolve {}", parent.display()))?,
+        focus_name: Some(focus_name),
+        open_preview: metadata.file_type().is_file(),
+        show_hidden,
+    })
+}
+
 impl App {
     pub fn new(path: PathBuf) -> Result<Self> {
         Self::new_with_output(path, TerminalOutput::Stdout)
     }
 
     fn new_with_output(path: PathBuf, terminal_output: TerminalOutput) -> Result<Self> {
-        let cwd = path
-            .canonicalize()
-            .with_context(|| format!("failed to resolve {}", path.display()))?;
+        let initial = resolve_initial_location(&path)?;
         let mut app = Self {
-            work_root: cwd.clone(),
-            cwd,
+            work_root: initial.cwd.clone(),
+            cwd: initial.cwd,
+            all_entries: Vec::new(),
             entries: Vec::new(),
             cursor: 0,
             selected: BTreeSet::new(),
@@ -179,7 +222,7 @@ impl App {
             mode: Mode::Normal,
             should_quit: false,
             terminal_output,
-            show_hidden: false,
+            show_hidden: initial.show_hidden,
             filter: String::new(),
             input: String::new(),
             logs: Vec::new(),
@@ -192,36 +235,49 @@ impl App {
             preview_cache: None,
         };
         app.reload();
+        if let Some(name) = initial.focus_name {
+            app.focus_raw_name(&name);
+            if initial.open_preview
+                && app
+                    .focused()
+                    .map(|entry| entry.kind == FileKind::File)
+                    .unwrap_or(false)
+            {
+                app.mode = Mode::Preview;
+            }
+        }
         Ok(app)
     }
 
     pub fn for_test() -> Self {
         let cwd = PathBuf::from("/tmp/tersh-test");
+        let entries = vec![
+            FileEntry {
+                path: PathBuf::from("/tmp/tersh-test/src"),
+                raw_name: "src".into(),
+                name: "src".to_string(),
+                kind: FileKind::Directory,
+                size: 0,
+                readonly: false,
+                modified: None,
+                symlink_target: None,
+            },
+            FileEntry {
+                path: PathBuf::from("/tmp/tersh-test/README.md"),
+                raw_name: "README.md".into(),
+                name: "README.md".to_string(),
+                kind: FileKind::File,
+                size: 128,
+                readonly: false,
+                modified: None,
+                symlink_target: None,
+            },
+        ];
         Self {
             work_root: cwd.clone(),
             cwd,
-            entries: vec![
-                FileEntry {
-                    path: PathBuf::from("/tmp/tersh-test/src"),
-                    raw_name: "src".into(),
-                    name: "src".to_string(),
-                    kind: FileKind::Directory,
-                    size: 0,
-                    readonly: false,
-                    modified: None,
-                    symlink_target: None,
-                },
-                FileEntry {
-                    path: PathBuf::from("/tmp/tersh-test/README.md"),
-                    raw_name: "README.md".into(),
-                    name: "README.md".to_string(),
-                    kind: FileKind::File,
-                    size: 128,
-                    readonly: false,
-                    modified: None,
-                    symlink_target: None,
-                },
-            ],
+            all_entries: entries.clone(),
+            entries,
             cursor: 0,
             selected: BTreeSet::new(),
             transfer_buffer: None,
@@ -397,7 +453,8 @@ impl App {
                 self.input.pop();
                 if self.mode == Mode::Filter {
                     self.filter = self.input.clone();
-                    self.reload();
+                    self.refresh_visible_entries();
+                    self.preview_offset = 0;
                 }
             }
             Command::Submit => self.submit(),
@@ -685,13 +742,11 @@ impl App {
     }
 
     fn reload(&mut self) {
-        match read_dir_entries_with_diagnostics(&self.cwd, self.show_hidden, &self.filter) {
+        match read_dir_entries_with_diagnostics(&self.cwd, self.show_hidden, "") {
             Ok(result) => {
-                self.entries = result.entries;
-                self.sort_entries();
-                self.retain_visible_selection();
-                self.cursor = self.cursor.min(self.entries.len().saturating_sub(1));
-                self.update_preview();
+                self.all_entries = result.entries;
+                self.sort_all_entries();
+                self.refresh_visible_entries();
                 self.preview_offset = 0;
                 if result.skipped > 0 {
                     self.log(format!("skipped {} unreadable item(s)", result.skipped));
@@ -699,6 +754,7 @@ impl App {
             }
             Err(err) => {
                 self.log(format!("error: {err}"));
+                self.all_entries.clear();
                 self.entries.clear();
                 self.selected.clear();
                 self.update_preview();
@@ -924,8 +980,13 @@ impl App {
     }
 
     fn sort_entries(&mut self) {
+        self.sort_all_entries();
+        self.refresh_visible_entries();
+    }
+
+    fn sort_all_entries(&mut self) {
         let key = self.sort_key;
-        self.entries.sort_by(|a, b| {
+        self.all_entries.sort_by(|a, b| {
             let ordering = match key {
                 SortKey::Kind => kind_rank(a.kind)
                     .cmp(&kind_rank(b.kind))
@@ -945,6 +1006,23 @@ impl App {
                 ordering
             }
         });
+    }
+
+    fn refresh_visible_entries(&mut self) {
+        if self.filter.is_empty() {
+            self.entries = self.all_entries.clone();
+        } else {
+            let filter = self.filter.to_lowercase();
+            self.entries = self
+                .all_entries
+                .iter()
+                .filter(|entry| entry.name.to_lowercase().contains(&filter))
+                .cloned()
+                .collect();
+        }
+        self.retain_visible_selection();
+        self.cursor = self.cursor.min(self.entries.len().saturating_sub(1));
+        self.update_preview();
     }
 
     fn go_parent(&mut self) {
@@ -1193,7 +1271,8 @@ impl App {
                 self.input.push(ch);
                 if self.mode == Mode::Filter {
                     self.filter = self.input.clone();
-                    self.reload();
+                    self.refresh_visible_entries();
+                    self.preview_offset = 0;
                 }
             }
             _ => {}
@@ -1231,6 +1310,18 @@ impl App {
 
     fn focused(&self) -> Option<&FileEntry> {
         self.entries.get(self.cursor)
+    }
+
+    fn focus_raw_name(&mut self, name: &OsStr) {
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.raw_name.as_os_str() == name)
+        {
+            self.cursor = index;
+            self.update_preview();
+            self.preview_offset = 0;
+        }
     }
 
     fn copy_focused_name(&mut self) {
