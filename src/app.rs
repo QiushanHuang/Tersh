@@ -14,8 +14,8 @@ use crossterm::{
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{
-    collections::hash_map::DefaultHasher,
     collections::BTreeSet,
+    collections::hash_map::DefaultHasher,
     ffi::{CStr, CString},
     fs,
     hash::{Hash, Hasher},
@@ -24,6 +24,8 @@ use std::{
     process::Command as ProcessCommand,
     time::{Duration, SystemTime},
 };
+
+const PREVIEW_SIGNATURE_HASH_LIMIT: u64 = (2 * 1024 * 1024) + 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -864,37 +866,15 @@ impl App {
     }
 
     fn launch_editor(&self, path: &Path) -> Result<()> {
-        let editor_command = std::env::var_os("VISUAL")
-            .or_else(|| std::env::var_os("EDITOR"))
-            .unwrap_or_else(|| "nano".into())
-            .to_string_lossy()
-            .to_string();
-        let editor_parts = parse_command(editor_command).unwrap_or_else(|| vec!["nano".to_string()]);
+        let editor_parts = editor_command_parts()?;
         let Some((editor, args)) = editor_parts.split_first() else {
             return Err(anyhow::anyhow!("no editor command resolved"));
         };
 
-        let mut output = self.terminal_output.writer();
-        execute!(output, LeaveAlternateScreen)?;
-        disable_raw_mode()?;
-
-        let status = ProcessCommand::new(editor)
-            .args(args)
-            .arg(path)
-            .status();
-        let status = match status {
-            Ok(status) => status,
-            Err(err) => {
-                let mut output = self.terminal_output.writer();
-                let _ = execute!(output, EnterAlternateScreen);
-                let _ = enable_raw_mode();
-                return Err(err.into());
-            }
-        };
-
-        let mut output = self.terminal_output.writer();
-        execute!(output, EnterAlternateScreen)?;
-        enable_raw_mode()?;
+        let mut suspension = TerminalSuspension::suspend(self.terminal_output)?;
+        let status = ProcessCommand::new(editor).args(args).arg(path).status();
+        suspension.restore()?;
+        let status = status?;
         if !status.success() {
             return Err(anyhow::anyhow!("editor exited with {status}"));
         }
@@ -1411,12 +1391,17 @@ fn preview_signature(path: &Path) -> Option<PreviewSignature> {
 
 fn preview_file_hash(path: &Path) -> Option<u64> {
     let mut file = fs::File::open(path).ok()?;
-    let mut buffer = [0; 4096];
-    let read = file.read(&mut buffer).ok()?;
-    let bytes = &buffer[..read];
+    let mut reader = std::io::Read::by_ref(&mut file).take(PREVIEW_SIGNATURE_HASH_LIMIT);
+    let mut buffer = [0; 64 * 1024];
     let mut hasher = DefaultHasher::new();
     metadata_size(path).hash(&mut hasher);
-    bytes.hash(&mut hasher);
+    loop {
+        let read = reader.read(&mut buffer).ok()?;
+        if read == 0 {
+            break;
+        }
+        buffer[..read].hash(&mut hasher);
+    }
     Some(hasher.finish())
 }
 
@@ -1452,6 +1437,12 @@ fn expand_path(input: &str) -> PathBuf {
             return home.join(rest);
         }
     }
+    if input.starts_with('~')
+        && input.len() > 1
+        && let Some(home) = expand_user_home(input)
+    {
+        return home;
+    }
     PathBuf::from(input)
 }
 
@@ -1469,7 +1460,11 @@ fn expand_user_home(user: &str) -> Option<PathBuf> {
         let entry = if is_current {
             libc::getpwuid(libc::geteuid())
         } else {
-            libc::getpwnam(c_name.map_or(std::ptr::null(), |value| value.as_ptr()))
+            libc::getpwnam(
+                c_name
+                    .as_ref()
+                    .map_or(std::ptr::null(), |value| value.as_ptr()),
+            )
         };
         if entry.is_null() {
             return None;
@@ -1548,6 +1543,14 @@ fn parse_command(input: String) -> Option<Vec<String>> {
     }
 }
 
+fn editor_command_parts() -> Result<Vec<String>> {
+    let Some(command) = std::env::var_os("VISUAL").or_else(|| std::env::var_os("EDITOR")) else {
+        return Ok(vec!["nano".to_string()]);
+    };
+    let command = command.to_string_lossy().to_string();
+    parse_command(command).ok_or_else(|| anyhow::anyhow!("invalid editor command"))
+}
+
 fn is_cancel_key(key: KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(key.code, KeyCode::Char('g') | KeyCode::Char('G'))
@@ -1587,5 +1590,81 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
         let _ = execute!(self.output.writer(), LeaveAlternateScreen);
+    }
+}
+
+struct TerminalSuspension {
+    output: TerminalOutput,
+    restored: bool,
+}
+
+impl TerminalSuspension {
+    fn suspend(output: TerminalOutput) -> Result<Self> {
+        execute!(output.writer(), LeaveAlternateScreen)?;
+        if let Err(err) = disable_raw_mode() {
+            let _ = execute!(output.writer(), EnterAlternateScreen);
+            return Err(err.into());
+        }
+        Ok(Self {
+            output,
+            restored: false,
+        })
+    }
+
+    fn restore(&mut self) -> Result<()> {
+        execute!(self.output.writer(), EnterAlternateScreen)?;
+        enable_raw_mode()?;
+        self.restored = true;
+        Ok(())
+    }
+}
+
+impl Drop for TerminalSuspension {
+    fn drop(&mut self) {
+        if !self.restored {
+            let _ = execute!(self.output.writer(), EnterAlternateScreen);
+            let _ = enable_raw_mode();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Seek, SeekFrom, Write};
+
+    #[test]
+    fn preview_hash_covers_bytes_after_first_four_kib() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("body.txt");
+        let body = vec![b'a'; 8 * 1024];
+        fs::write(&path, body).unwrap();
+        let first = preview_file_hash(&path).unwrap();
+
+        let mut file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::Start(5 * 1024)).unwrap();
+        file.write_all(b"b").unwrap();
+
+        assert_ne!(first, preview_file_hash(&path).unwrap());
+    }
+
+    #[test]
+    fn parse_command_rejects_unclosed_quotes() {
+        assert_eq!(parse_command("\"vim".to_string()), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expand_path_supports_named_user_without_trailing_slash() {
+        let home = expand_user_home("~").unwrap();
+        let user = unsafe {
+            let entry = libc::getpwuid(libc::geteuid());
+            assert!(!entry.is_null());
+            CStr::from_ptr((*entry).pw_name)
+                .to_string_lossy()
+                .to_string()
+        };
+
+        assert_eq!(expand_path(&format!("~{user}")), home);
     }
 }

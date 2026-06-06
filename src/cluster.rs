@@ -549,10 +549,13 @@ impl ClusterApp {
     }
 
     pub fn begin_refresh(&mut self, aliases: &[String]) -> Vec<String> {
-        self.last_refresh_started = Some(Instant::now());
         let mut started = Vec::new();
         let now = Instant::now();
-        if aliases.is_empty() || self.refreshing.len() >= MAX_CONCURRENT_PROBES {
+        if aliases.is_empty() {
+            self.log("no hosts to refresh");
+            return started;
+        }
+        if self.refreshing.len() >= MAX_CONCURRENT_PROBES {
             self.log("refresh already in progress");
             return started;
         }
@@ -582,17 +585,19 @@ impl ClusterApp {
         if started.is_empty() {
             self.log("refresh already in progress");
         } else {
+            self.last_refresh_started = Some(now);
             self.log(format!("refreshing {} host(s)", started.len()));
         }
         started
     }
 
     pub fn apply_snapshot(&mut self, snapshot: HostSnapshot) {
-        if !self.refreshing.contains(&snapshot.alias) {
+        let was_refreshing = self.refreshing.remove(&snapshot.alias);
+        if was_refreshing {
+            self.refresh_deadlines.remove(&snapshot.alias);
+        } else if !self.snapshots.contains_key(&snapshot.alias) {
             return;
         }
-        self.refreshing.remove(&snapshot.alias);
-        self.refresh_deadlines.remove(&snapshot.alias);
         let alias = snapshot.alias.clone();
         let snapshot = self.merge_last_good_snapshot(snapshot);
         let state = snapshot.connection.label();
@@ -721,10 +726,12 @@ impl ClusterApp {
     }
 
     fn mark_timed_out_refreshes(&mut self) {
+        let now = Instant::now();
         let timed_out_aliases = self
             .refresh_deadlines
             .iter()
-            .filter_map(|(alias, deadline)| (Instant::now() >= *deadline).then(|| alias.clone()))
+            .filter(|(_, deadline)| now >= **deadline)
+            .map(|(alias, _)| alias.clone())
             .collect::<Vec<_>>();
 
         for alias in timed_out_aliases {
@@ -1099,19 +1106,18 @@ fn local_probe_shell() -> (&'static str, Vec<String>) {
 }
 
 fn run_command_with_timeout(mut command: ProcessCommand, timeout: Duration) -> Result<String> {
-    let temp_stdout = tempfile_path("tersh-probe-stdout");
-    let temp_stderr = tempfile_path("tersh-probe-stderr");
+    let temp_files = TempProbeFiles::new();
     let stdout = fs::OpenOptions::new()
         .create_new(true)
         .write(true)
         .truncate(true)
-        .open(&temp_stdout)
+        .open(&temp_files.stdout)
         .context("create temp stdout file")?;
     let stderr = fs::OpenOptions::new()
         .create_new(true)
         .write(true)
         .truncate(true)
-        .open(&temp_stderr)
+        .open(&temp_files.stderr)
         .context("create temp stderr file")?;
 
     let mut child = command
@@ -1133,12 +1139,10 @@ fn run_command_with_timeout(mut command: ProcessCommand, timeout: Duration) -> R
         thread::sleep(Duration::from_millis(50));
     };
 
-    let stdout = fs::read_to_string(&temp_stdout)
-        .with_context(|| format!("failed to read {}", temp_stdout.display()))?;
-    let stderr = fs::read_to_string(&temp_stderr)
-        .with_context(|| format!("failed to read {}", temp_stderr.display()))?;
-    let _ = fs::remove_file(&temp_stdout);
-    let _ = fs::remove_file(&temp_stderr);
+    let stdout = fs::read_to_string(&temp_files.stdout)
+        .with_context(|| format!("failed to read {}", temp_files.stdout.display()))?;
+    let stderr = fs::read_to_string(&temp_files.stderr)
+        .with_context(|| format!("failed to read {}", temp_files.stderr.display()))?;
 
     if timed_out {
         let mut message = format!("probe timed out after {}s", timeout.as_secs());
@@ -1157,6 +1161,27 @@ fn run_command_with_timeout(mut command: ProcessCommand, timeout: Duration) -> R
         anyhow::bail!("probe exited with {}", status);
     }
     anyhow::bail!("{stderr}");
+}
+
+struct TempProbeFiles {
+    stdout: PathBuf,
+    stderr: PathBuf,
+}
+
+impl TempProbeFiles {
+    fn new() -> Self {
+        Self {
+            stdout: tempfile_path("tersh-probe-stdout"),
+            stderr: tempfile_path("tersh-probe-stderr"),
+        }
+    }
+}
+
+impl Drop for TempProbeFiles {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.stdout);
+        let _ = fs::remove_file(&self.stderr);
+    }
 }
 
 fn tempfile_path(prefix: &str) -> PathBuf {
@@ -1342,5 +1367,52 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
         let _ = execute!(io::stdout(), LeaveAlternateScreen);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn begin_refresh_empty_aliases_does_not_reset_refresh_timer() {
+        let mut app = ClusterApp::new(Vec::new());
+
+        assert!(app.refresh_due(Duration::from_secs(60)));
+        assert!(app.begin_refresh(&[]).is_empty());
+        assert!(app.refresh_due(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn failed_probe_spawn_cleans_temp_files() {
+        let before = probe_temp_files();
+        let command = ProcessCommand::new("__tersh_missing_probe_binary__");
+
+        let result = run_command_with_timeout(command, Duration::from_millis(1));
+
+        assert!(result.is_err());
+        let after = probe_temp_files();
+        assert_eq!(after.difference(&before).count(), 0);
+    }
+
+    fn probe_temp_files() -> BTreeSet<PathBuf> {
+        let pid = std::process::id();
+        let prefixes = [
+            format!("tersh-probe-stdout-{pid}-"),
+            format!("tersh-probe-stderr-{pid}-"),
+        ];
+        fs::read_dir(std::env::temp_dir())
+            .into_iter()
+            .flatten()
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .map(|name| prefixes.iter().any(|prefix| name.starts_with(prefix)))
+                    .unwrap_or(false)
+            })
+            .collect()
     }
 }

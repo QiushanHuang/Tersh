@@ -283,8 +283,8 @@ fn draw_route(frame: &mut Frame, area: Rect, app: &ClusterApp) {
         Some(host) => route_lines(host),
         None => vec![Line::from("No route available")],
     })
-        .block(base_block().title("Route").borders(Borders::ALL))
-        .wrap(Wrap { trim: false });
+    .block(base_block().title("Route").borders(Borders::ALL))
+    .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
 
@@ -537,7 +537,7 @@ fn ascii_bar(percent: Option<u16>) -> String {
 
 fn percent_from_token(input: &str) -> Option<u16> {
     for (index, ch) in input.char_indices() {
-        if ch != '%' {
+        if ch != '%' && ch != '％' {
             continue;
         }
         let before = input[..index].trim_end();
@@ -553,7 +553,7 @@ fn percent_from_token(input: &str) -> Option<u16> {
             continue;
         }
         if let Ok(value) = number.parse::<f64>() {
-            return Some(clamp_percent(value.round() as u16));
+            return Some(clamp_percent(value.round().max(0.0) as u16));
         }
     }
     None
@@ -695,4 +695,16 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(popup_layout[1])[1]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn percent_parser_handles_ascii_and_fullwidth_percent_tokens() {
+        assert_eq!(percent_from_token("memory=42% free"), Some(42));
+        assert_eq!(percent_from_token("memory=42％ free"), Some(42));
+        assert_eq!(percent_from_token("gpu util 99.6%"), Some(100));
+    }
 }

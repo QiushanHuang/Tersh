@@ -187,10 +187,7 @@ fn symlink_target_is_dir(source: &Path, link_target: &Path) -> Result<bool> {
     let target_path = if link_target.is_absolute() {
         link_target.to_path_buf()
     } else {
-        source
-            .parent()
-            .unwrap_or(Path::new("."))
-            .join(link_target)
+        source.parent().unwrap_or(Path::new(".")).join(link_target)
     };
     match fs::metadata(&target_path) {
         Ok(metadata) => Ok(metadata.is_dir()),

@@ -4,8 +4,15 @@
 
 ### Fixed
 
+- Fixed cluster snapshots so known host updates are applied even when injected outside an active refresh, restoring summary counts, stale metrics, and detail rendering.
+- Fixed cluster refresh scheduling so empty or fully saturated refresh attempts do not reset the automatic refresh timer.
 - Fixed cluster probe command execution to preserve stdout/stderr in timeout/error paths and report probe execution errors with context instead of silently dropping them.
 - Fixed timeout handling for remote/local probes so output is cleaned up deterministically and timeout errors remain visible in refresh logs.
+- Fixed directory listings so transient failures for individual entries are skipped instead of clearing the entire view.
+- Fixed named home expansion for `~user` paths, including the no-trailing-slash form.
+- Fixed preview cache invalidation to hash the visible preview range instead of only the first 4 KiB.
+- Fixed editor launch recovery so alternate screen and raw mode are restored consistently after editor spawn/status failures.
+- Fixed resource percentage parsing for fullwidth percent signs and rounded percentage values.
 
 ## v1.1.0 - 2026-05-31
 

@@ -77,7 +77,9 @@ pub fn read_dir_entries(path: &Path, show_hidden: bool, filter: &str) -> Result<
     let mut entries = Vec::new();
     let filter = filter.to_lowercase();
     for entry in fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))? {
-        let entry = entry?;
+        let Ok(entry) = entry else {
+            continue;
+        };
         let name = display_os_str(&entry.file_name());
         if !show_hidden && name.starts_with('.') {
             continue;
@@ -85,7 +87,9 @@ pub fn read_dir_entries(path: &Path, show_hidden: bool, filter: &str) -> Result<
         if !filter.is_empty() && !name.to_lowercase().contains(&filter) {
             continue;
         }
-        entries.push(FileEntry::from_path(entry.path())?);
+        if let Ok(entry) = FileEntry::from_path(entry.path()) {
+            entries.push(entry);
+        }
     }
     entries.sort_by(|a, b| {
         let ak = match a.kind {
