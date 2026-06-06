@@ -346,7 +346,7 @@ fn cluster_app_ignores_duplicate_refresh_for_in_flight_host() {
 
 #[test]
 fn begin_refresh_caps_concurrent_hosts() {
-    let inventory = ClusterInventory::from_json(CAMPUS_JSON).unwrap();
+    let inventory = ClusterInventory::from_json(&many_hosts_json(40)).unwrap();
     let mut app = ClusterApp::new(inventory.hosts().to_vec());
     let aliases = (0..40)
         .map(|index| format!("host-{index:02}"))
@@ -359,7 +359,7 @@ fn begin_refresh_caps_concurrent_hosts() {
 
 #[test]
 fn begin_refresh_rotates_after_capped_batch_completes() {
-    let inventory = ClusterInventory::from_json(CAMPUS_JSON).unwrap();
+    let inventory = ClusterInventory::from_json(&many_hosts_json(40)).unwrap();
     let mut app = ClusterApp::new(inventory.hosts().to_vec());
     let aliases = (0..40)
         .map(|index| format!("host-{index:02}"))
@@ -373,6 +373,19 @@ fn begin_refresh_rotates_after_capped_batch_completes() {
 
     assert!(second.iter().any(|alias| alias == "host-16"));
     assert!(!second.iter().any(|alias| alias == "host-00"));
+}
+
+#[test]
+fn begin_refresh_ignores_unknown_aliases_without_polluting_counts() {
+    let inventory = ClusterInventory::from_json(CAMPUS_JSON).unwrap();
+    let mut app = ClusterApp::new(inventory.hosts().to_vec());
+
+    let started = app.begin_refresh(&["missing-host".to_string()]);
+
+    assert!(started.is_empty());
+    assert!(app.snapshot_for("missing-host").is_none());
+    assert_eq!(app.checking_count(), 0);
+    assert_eq!(app.offline_count(), 0);
 }
 
 #[test]
@@ -471,6 +484,48 @@ fn inventory_rejects_unresolved_proxy_jump() {
 }
 
 #[test]
+fn inventory_rejects_unknown_json_fields() {
+    let json = r#"
+{
+  "servers": [
+    { "alias": "server", "ssh_usr": "ops", "campus_ip": "203.0.113.10" }
+  ]
+}
+"#;
+
+    let err = ClusterInventory::from_json(json).unwrap_err();
+
+    assert!(err.to_string().contains("parse servers.json"));
+}
+
+#[test]
+fn inventory_trims_stored_connection_and_display_fields() {
+    let json = r#"
+{
+  "servers": [
+    {
+      "alias": " server ",
+      "ssh_user": " ops ",
+      "campus_ip": " 203.0.113.10 ",
+      "role": " Remote server ",
+      "workdir": " /srv/app "
+    }
+  ]
+}
+"#;
+
+    let inventory = ClusterInventory::from_json(json).unwrap();
+    let host = &inventory.hosts()[0];
+
+    assert_eq!(host.alias(), "server");
+    assert_eq!(host.address(), "203.0.113.10");
+    assert_eq!(host.user(), Some("ops"));
+    assert_eq!(host.role(), "Remote server");
+    assert_eq!(host.workdir(), Some("/srv/app"));
+    assert_eq!(host.ssh_target(), "ops@203.0.113.10");
+}
+
+#[test]
 fn cluster_render_shows_host_list_detail_metrics_and_footer_keys() {
     let inventory = ClusterInventory::from_json(CAMPUS_JSON).unwrap();
     let mut app = ClusterApp::new(inventory.hosts().to_vec());
@@ -529,6 +584,18 @@ fn cluster_render_shows_host_list_detail_metrics_and_footer_keys() {
     assert!(buffer.contains("s shell/ssh"));
     assert!(buffer.contains("t tersh"));
     assert!(buffer.contains("q quit"));
+}
+
+fn many_hosts_json(count: usize) -> String {
+    let servers = (0..count)
+        .map(|index| {
+            format!(
+                r#"{{ "alias": "host-{index:02}", "ssh_user": "ops", "campus_ip": "203.0.113.{index}" }}"#
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",\n");
+    format!(r#"{{ "servers": [ {servers} ] }}"#)
 }
 
 #[test]

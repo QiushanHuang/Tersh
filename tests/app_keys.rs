@@ -1,5 +1,8 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use std::sync::Mutex;
 use tersh::app::{App, Command, Mode};
+
+static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
 fn ctrl_g_closes_filter_before_quitting() {
@@ -190,6 +193,65 @@ fn edit_rejects_symlink_targets() {
     app.handle_command(Command::Edit);
 
     assert!(app.logs().iter().any(|log| log.contains("regular files")));
+}
+
+#[cfg(unix)]
+#[test]
+fn edit_revalidates_file_kind_before_launching_editor() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let old_visual = std::env::var_os("VISUAL");
+    let old_editor = std::env::var_os("EDITOR");
+    unsafe {
+        std::env::set_var("VISUAL", "false");
+        std::env::remove_var("EDITOR");
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("item.txt");
+    let target = dir.path().join("target.txt");
+    std::fs::write(&path, "item").unwrap();
+    std::fs::write(&target, "target").unwrap();
+    let mut app = App::new(dir.path().to_path_buf()).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    std::os::unix::fs::symlink(&target, &path).unwrap();
+
+    app.handle_command(Command::Edit);
+
+    restore_env("VISUAL", old_visual);
+    restore_env("EDITOR", old_editor);
+    assert!(app.logs().iter().any(|log| log.contains("regular files")));
+}
+
+#[test]
+fn cut_paste_retains_failed_cut_items_for_retry() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let dest_dir = tempfile::tempdir().unwrap();
+    let source_a = source_dir.path().join("a.txt");
+    let source_b = source_dir.path().join("b.txt");
+    std::fs::write(&source_a, "a").unwrap();
+    std::fs::write(&source_b, "b").unwrap();
+    std::fs::write(dest_dir.path().join("b.txt"), "existing").unwrap();
+    let mut app = App::new(source_dir.path().to_path_buf()).unwrap();
+
+    app.handle_command(Command::SelectAll);
+    app.handle_command(Command::Cut);
+    app.force_cwd_for_test(dest_dir.path().to_path_buf());
+    app.handle_command(Command::Paste);
+
+    assert!(!source_a.exists());
+    assert!(dest_dir.path().join("a.txt").exists());
+    assert!(source_b.exists());
+    assert_eq!(app.copy_buffer_len(), 1);
+}
+
+fn restore_env(name: &str, value: Option<std::ffi::OsString>) {
+    unsafe {
+        if let Some(value) = value {
+            std::env::set_var(name, value);
+        } else {
+            std::env::remove_var(name);
+        }
+    }
 }
 
 #[test]

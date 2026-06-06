@@ -26,6 +26,12 @@ pub struct FileEntry {
     pub symlink_target: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone)]
+pub struct DirectoryEntries {
+    pub entries: Vec<FileEntry>,
+    pub skipped: usize,
+}
+
 impl FileEntry {
     pub fn from_path(path: PathBuf) -> Result<Self> {
         let metadata = fs::symlink_metadata(&path)
@@ -74,21 +80,35 @@ impl FileEntry {
 }
 
 pub fn read_dir_entries(path: &Path, show_hidden: bool, filter: &str) -> Result<Vec<FileEntry>> {
+    Ok(read_dir_entries_with_diagnostics(path, show_hidden, filter)?.entries)
+}
+
+pub fn read_dir_entries_with_diagnostics(
+    path: &Path,
+    show_hidden: bool,
+    filter: &str,
+) -> Result<DirectoryEntries> {
     let mut entries = Vec::new();
+    let mut skipped = 0;
     let filter = filter.to_lowercase();
     for entry in fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))? {
-        let Ok(entry) = entry else {
-            continue;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
         };
         let name = display_os_str(&entry.file_name());
         if !show_hidden && name.starts_with('.') {
             continue;
-        }
+        };
         if !filter.is_empty() && !name.to_lowercase().contains(&filter) {
             continue;
         }
-        if let Ok(entry) = FileEntry::from_path(entry.path()) {
-            entries.push(entry);
+        match FileEntry::from_path(entry.path()) {
+            Ok(entry) => entries.push(entry),
+            Err(_) => skipped += 1,
         }
     }
     entries.sort_by(|a, b| {
@@ -107,7 +127,7 @@ pub fn read_dir_entries(path: &Path, show_hidden: bool, filter: &str) -> Result<
         ak.cmp(&bk)
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
-    Ok(entries)
+    Ok(DirectoryEntries { entries, skipped })
 }
 
 pub fn display_os_str(value: &OsStr) -> String {

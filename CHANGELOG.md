@@ -4,6 +4,16 @@
 
 ### Fixed
 
+- Fixed file operation races by creating copied files/directories with no-clobber semantics and moving/renaming paths with no-replace platform APIs.
+- Fixed edit and preview safety by revalidating regular files with no-follow opens before editor launch or preview cache hashing.
+- Fixed cut/paste retry behavior so failed cut items remain in the transfer buffer instead of being discarded.
+- Fixed cluster refresh generations so timed-out probe results cannot overwrite newer timeout/stale state, while real in-flight probes continue to count toward the concurrency cap.
+- Fixed cluster inventory parsing to reject unknown JSON fields and store trimmed aliases, SSH fields, roles, and work directories.
+- Fixed cluster probe output handling so non-UTF-8 stdout/stderr is preserved lossily instead of being reported as a read failure.
+- Fixed terminal suspension recovery paths to avoid half-restored alternate-screen/raw-mode states.
+- Fixed narrow file-list rendering by truncating long file names in-row.
+- Fixed OSC52 clipboard writes to reject oversized payloads before emitting terminal escape sequences.
+- Fixed install script failures for unwritable install directories with an explicit remediation message.
 - Fixed cluster snapshots so known host updates are applied even when injected outside an active refresh, restoring summary counts, stale metrics, and detail rendering.
 - Fixed cluster refresh scheduling so empty or fully saturated refresh attempts do not reset the automatic refresh timer.
 - Fixed cluster probe command execution to preserve stdout/stderr in timeout/error paths and report probe execution errors with context instead of silently dropping them.

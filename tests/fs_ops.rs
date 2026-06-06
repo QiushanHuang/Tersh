@@ -24,6 +24,33 @@ fn copies_symlink_as_symlink() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn copies_symlink_without_stating_protected_target() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let protected = dir.path().join("protected");
+    std::fs::create_dir(&protected).unwrap();
+    let target = protected.join("target.txt");
+    std::fs::write(&target, "secret").unwrap();
+    let link = dir.path().join("link.txt");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    std::fs::set_permissions(&protected, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let copied = dir.path().join("copied-link.txt");
+    let result = copy_path(&link, &copied, false);
+
+    std::fs::set_permissions(&protected, std::fs::Permissions::from_mode(0o700)).unwrap();
+    result.unwrap();
+    assert!(
+        std::fs::symlink_metadata(&copied)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
 #[test]
 fn trash_moves_file_into_tersh_trash() {
     let dir = tempfile::tempdir().unwrap();
@@ -113,6 +140,22 @@ fn permanent_delete_rejects_tersh_trash_directory() {
 
     assert!(err.to_string().contains(".tersh-trash"));
     assert!(trash.exists());
+}
+
+#[test]
+fn delete_and_trash_reject_tersh_trash_descendants() {
+    let dir = tempfile::tempdir().unwrap();
+    let trash = dir.path().join(".tersh-trash");
+    std::fs::create_dir(&trash).unwrap();
+    let trashed_file = trash.join("old.txt");
+    std::fs::write(&trashed_file, "old").unwrap();
+
+    let delete_err = permanent_delete(&trashed_file, dir.path()).unwrap_err();
+    let trash_err = trash_path(&trashed_file, dir.path()).unwrap_err();
+
+    assert!(delete_err.to_string().contains(".tersh-trash"));
+    assert!(trash_err.to_string().contains(".tersh-trash"));
+    assert!(trashed_file.exists());
 }
 
 #[cfg(unix)]

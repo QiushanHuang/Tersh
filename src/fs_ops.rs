@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use std::{
-    fs,
+    fs::{self, File, OpenOptions},
+    io,
     path::{Component, Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -26,23 +27,13 @@ pub fn copy_path(source: &Path, target: &Path, replace: bool) -> Result<()> {
     if metadata.file_type().is_symlink() {
         let link_target = fs::read_link(source)
             .with_context(|| format!("failed to read symlink {}", source.display()))?;
-        let is_dir = symlink_target_is_dir(source, &link_target)?;
+        create_parent_dir(target)?;
+        let is_dir = symlink_target_is_dir_for_creation(source, &link_target)?;
         create_symlink(&link_target, target, is_dir)
     } else if metadata.is_dir() {
-        copy_dir_recursive(source, target)
+        copy_dir_recursive(source, target, &metadata)
     } else if metadata.is_file() {
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::copy(source, target).with_context(|| {
-            format!(
-                "failed to copy {} to {}",
-                source.display(),
-                target.display()
-            )
-        })?;
-        fs::set_permissions(target, metadata.permissions()).ok();
-        Ok(())
+        copy_regular_file(source, target, &metadata)
     } else {
         bail!("unsupported file type: {}", source.display());
     }
@@ -52,7 +43,7 @@ pub fn rename_path(source: &Path, target: &Path) -> Result<()> {
     if path_exists_no_follow(target)? {
         bail!("target already exists: {}", target.display());
     }
-    fs::rename(source, target).with_context(|| {
+    rename_no_replace(source, target).with_context(|| {
         format!(
             "failed to rename {} to {}",
             source.display(),
@@ -67,20 +58,34 @@ pub fn trash_path(path: &Path, work_root: &Path) -> Result<DeleteDecision> {
     let file_name = path
         .file_name()
         .ok_or_else(|| anyhow!("cannot trash path without file name: {}", path.display()))?;
-    let mut target = trash_dir.join(file_name);
-    if path_exists_no_follow(&target)? {
-        target = trash_dir.join(format!(
-            "{}.{}",
-            file_name.to_string_lossy(),
-            unique_suffix()
-        ));
+    for attempt in 0..100 {
+        let target = if attempt == 0 {
+            trash_dir.join(file_name)
+        } else {
+            trash_dir.join(format!(
+                "{}.{}",
+                file_name.to_string_lossy(),
+                unique_suffix()
+            ))
+        };
+        match rename_no_replace(path, &target) {
+            Ok(()) => {
+                return Ok(DeleteDecision::MovedToTrash {
+                    from: path.to_path_buf(),
+                    to: target,
+                });
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("failed to move {} to trash", path.display()));
+            }
+        }
     }
-    fs::rename(path, &target)
-        .with_context(|| format!("failed to move {} to trash", path.display()))?;
-    Ok(DeleteDecision::MovedToTrash {
-        from: path.to_path_buf(),
-        to: target,
-    })
+    bail!(
+        "failed to allocate unique trash target for {}",
+        path.display()
+    );
 }
 
 fn prepare_trash_dir(work_root: &Path) -> Result<PathBuf> {
@@ -147,14 +152,44 @@ pub fn validate_file_name(name: &str) -> Result<()> {
     }
 }
 
-fn copy_dir_recursive(source: &Path, target: &Path) -> Result<()> {
-    fs::create_dir_all(target)
+fn copy_regular_file(source: &Path, target: &Path, metadata: &fs::Metadata) -> Result<()> {
+    create_parent_dir(target)?;
+    let mut input =
+        File::open(source).with_context(|| format!("failed to open {}", source.display()))?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(target)
+        .with_context(|| format!("failed to create {}", target.display()))?;
+    io::copy(&mut input, &mut output).with_context(|| {
+        format!(
+            "failed to copy {} to {}",
+            source.display(),
+            target.display()
+        )
+    })?;
+    fs::set_permissions(target, metadata.permissions()).ok();
+    Ok(())
+}
+
+fn copy_dir_recursive(source: &Path, target: &Path, metadata: &fs::Metadata) -> Result<()> {
+    create_parent_dir(target)?;
+    fs::create_dir(target)
         .with_context(|| format!("failed to create directory {}", target.display()))?;
+    fs::set_permissions(target, metadata.permissions()).ok();
     for entry in fs::read_dir(source)? {
         let entry = entry?;
         let child_source = entry.path();
         let child_target = target.join(entry.file_name());
         copy_path(&child_source, &child_target, false)?;
+    }
+    Ok(())
+}
+
+fn create_parent_dir(target: &Path) -> Result<()> {
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create parent {}", parent.display()))?;
     }
     Ok(())
 }
@@ -183,7 +218,13 @@ fn path_exists_no_follow(path: &Path) -> Result<bool> {
     }
 }
 
-fn symlink_target_is_dir(source: &Path, link_target: &Path) -> Result<bool> {
+#[cfg(unix)]
+fn symlink_target_is_dir_for_creation(_source: &Path, _link_target: &Path) -> Result<bool> {
+    Ok(false)
+}
+
+#[cfg(windows)]
+fn symlink_target_is_dir_for_creation(source: &Path, link_target: &Path) -> Result<bool> {
     let target_path = if link_target.is_absolute() {
         link_target.to_path_buf()
     } else {
@@ -227,10 +268,65 @@ fn guard_delete_target(path: &Path, work_root: &Path) -> Result<()> {
     if target == work_root {
         bail!("refusing to delete active work root");
     }
-    if target == work_root.join(".tersh-trash") {
+    let trash_root = work_root.join(".tersh-trash");
+    if target == trash_root || target.starts_with(&trash_root) {
         bail!("refusing to delete .tersh-trash");
     }
     Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn rename_no_replace(source: &Path, target: &Path) -> io::Result<()> {
+    let source = cstring_path(source)?;
+    let target = cstring_path(target)?;
+    let result = unsafe { libc::renamex_np(source.as_ptr(), target.as_ptr(), libc::RENAME_EXCL) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn rename_no_replace(source: &Path, target: &Path) -> io::Result<()> {
+    let source = cstring_path(source)?;
+    let target = cstring_path(target)?;
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            target.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "macos", target_os = "ios", target_os = "linux"))
+))]
+fn rename_no_replace(source: &Path, target: &Path) -> io::Result<()> {
+    fs::rename(source, target)
+}
+
+#[cfg(windows)]
+fn rename_no_replace(source: &Path, target: &Path) -> io::Result<()> {
+    fs::rename(source, target)
+}
+
+#[cfg(unix)]
+fn cstring_path(path: &Path) -> io::Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+
+    std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))
 }
 
 fn delete_identity(path: &Path) -> Result<PathBuf> {

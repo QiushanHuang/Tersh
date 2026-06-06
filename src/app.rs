@@ -1,5 +1,5 @@
 use crate::{
-    fs_core::{FileEntry, FileKind, read_dir_entries},
+    fs_core::{FileEntry, FileKind, read_dir_entries_with_diagnostics},
     fs_ops::{
         copy_path, destination_for_paste, permanent_delete, rename_path, trash_path,
         validate_file_name,
@@ -685,14 +685,17 @@ impl App {
     }
 
     fn reload(&mut self) {
-        match read_dir_entries(&self.cwd, self.show_hidden, &self.filter) {
-            Ok(entries) => {
-                self.entries = entries;
+        match read_dir_entries_with_diagnostics(&self.cwd, self.show_hidden, &self.filter) {
+            Ok(result) => {
+                self.entries = result.entries;
                 self.sort_entries();
                 self.retain_visible_selection();
                 self.cursor = self.cursor.min(self.entries.len().saturating_sub(1));
                 self.update_preview();
                 self.preview_offset = 0;
+                if result.skipped > 0 {
+                    self.log(format!("skipped {} unreadable item(s)", result.skipped));
+                }
             }
             Err(err) => {
                 self.log(format!("error: {err}"));
@@ -729,7 +732,9 @@ impl App {
                 crate::fs_core::escape_display(&err.to_string()),
             ),
         };
-        if let Some(signature) = signature {
+        if let Some(signature) = signature
+            && preview.kind != PreviewKind::Error
+        {
             self.preview_cache = Some(CachedPreview {
                 path: path.to_path_buf(),
                 signature,
@@ -849,6 +854,10 @@ impl App {
             return;
         }
         let path = entry.path.clone();
+        if let Err(err) = validate_editor_target(&path) {
+            self.log(format!("can only edit regular files: {err}"));
+            return;
+        }
         match self.launch_editor(&path) {
             Ok(()) => {
                 self.log(format!(
@@ -1002,6 +1011,7 @@ impl App {
             return;
         };
         let mut copied = 0;
+        let mut failed_cut_paths = Vec::new();
         for source in &buffer.paths {
             let result =
                 destination_for_paste(source, &self.cwd).and_then(|target| match buffer.kind {
@@ -1010,12 +1020,24 @@ impl App {
                 });
             match result {
                 Ok(()) => copied += 1,
-                Err(err) => self.log(format!("paste skipped: {err}")),
+                Err(err) => {
+                    if buffer.kind == TransferKind::Cut {
+                        failed_cut_paths.push(source.clone());
+                    }
+                    self.log(format!("paste skipped: {err}"));
+                }
             }
         }
         self.log(format!("pasted {copied} item(s)"));
         if buffer.kind == TransferKind::Cut {
-            self.transfer_buffer = None;
+            self.transfer_buffer = if failed_cut_paths.is_empty() {
+                None
+            } else {
+                Some(TransferBuffer {
+                    kind: TransferKind::Cut,
+                    paths: failed_cut_paths,
+                })
+            };
         }
         self.reload();
     }
@@ -1375,7 +1397,7 @@ fn preview_signature(path: &Path) -> Option<PreviewSignature> {
     };
 
     let sample_hash = if kind == FileKind::File {
-        preview_file_hash(path)
+        Some(preview_file_hash(path)?)
     } else {
         None
     };
@@ -1390,11 +1412,15 @@ fn preview_signature(path: &Path) -> Option<PreviewSignature> {
 }
 
 fn preview_file_hash(path: &Path) -> Option<u64> {
-    let mut file = fs::File::open(path).ok()?;
+    let mut file = open_hash_file_no_follow(path)?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.file_type().is_file() {
+        return None;
+    }
     let mut reader = std::io::Read::by_ref(&mut file).take(PREVIEW_SIGNATURE_HASH_LIMIT);
     let mut buffer = [0; 64 * 1024];
     let mut hasher = DefaultHasher::new();
-    metadata_size(path).hash(&mut hasher);
+    metadata.len().hash(&mut hasher);
     loop {
         let read = reader.read(&mut buffer).ok()?;
         if read == 0 {
@@ -1405,10 +1431,56 @@ fn preview_file_hash(path: &Path) -> Option<u64> {
     Some(hasher.finish())
 }
 
-fn metadata_size(path: &Path) -> u64 {
-    fs::metadata(path)
-        .map(|metadata| metadata.len())
-        .unwrap_or_default()
+#[cfg(unix)]
+fn open_hash_file_no_follow(path: &Path) -> Option<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .ok()
+}
+
+#[cfg(not(unix))]
+fn open_hash_file_no_follow(path: &Path) -> Option<fs::File> {
+    fs::File::open(path).ok()
+}
+
+fn validate_editor_target(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect {}", crate::fs_core::display_path(path)))?;
+    if !metadata.file_type().is_file() {
+        anyhow::bail!("not a regular file");
+    }
+    let file = open_editor_target_no_follow(path)?;
+    let metadata = file.metadata().with_context(|| {
+        format!(
+            "failed to inspect opened {}",
+            crate::fs_core::display_path(path)
+        )
+    })?;
+    if !metadata.file_type().is_file() {
+        anyhow::bail!("not a regular file");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_editor_target_no_follow(path: &Path) -> Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("failed to open {}", crate::fs_core::display_path(path)))
+}
+
+#[cfg(not(unix))]
+fn open_editor_target_no_follow(path: &Path) -> Result<fs::File> {
+    fs::File::open(path)
+        .with_context(|| format!("failed to open {}", crate::fs_core::display_path(path)))
 }
 
 fn kind_rank(kind: FileKind) -> u8 {
@@ -1491,33 +1563,49 @@ fn parse_command(input: String) -> Option<Vec<String>> {
     let mut state = State::Normal;
     let mut args = Vec::new();
     let mut current = String::new();
+    let mut arg_started = false;
     let mut chars = input.chars().peekable();
 
     while let Some(ch) = chars.next() {
         match state {
             State::Normal => match ch {
-                '\'' => state = State::Single,
-                '"' => state = State::Double,
+                '\'' => {
+                    arg_started = true;
+                    state = State::Single;
+                }
+                '"' => {
+                    arg_started = true;
+                    state = State::Double;
+                }
                 '\\' => {
                     if let Some(next) = chars.next() {
+                        arg_started = true;
                         current.push(next);
                     }
                 }
                 c if c.is_whitespace() => {
-                    if !current.is_empty() {
+                    if arg_started {
                         args.push(std::mem::take(&mut current));
+                        arg_started = false;
                     }
                 }
-                c => current.push(c),
+                c => {
+                    arg_started = true;
+                    current.push(c);
+                }
             },
             State::Single => match ch {
                 '\'' => state = State::Normal,
-                _ => current.push(ch),
+                _ => {
+                    arg_started = true;
+                    current.push(ch);
+                }
             },
             State::Double => match ch {
                 '"' => state = State::Normal,
                 '\\' => {
                     if let Some(next) = chars.next() {
+                        arg_started = true;
                         match next {
                             '\n' => current.push('\n'),
                             '"' | '\\' => current.push(next),
@@ -1528,12 +1616,15 @@ fn parse_command(input: String) -> Option<Vec<String>> {
                         }
                     }
                 }
-                _ => current.push(ch),
+                _ => {
+                    arg_started = true;
+                    current.push(ch);
+                }
             },
         }
     }
 
-    if !current.is_empty() {
+    if arg_started {
         args.push(current);
     }
 
@@ -1612,8 +1703,11 @@ impl TerminalSuspension {
     }
 
     fn restore(&mut self) -> Result<()> {
-        execute!(self.output.writer(), EnterAlternateScreen)?;
         enable_raw_mode()?;
+        if let Err(err) = execute!(self.output.writer(), EnterAlternateScreen) {
+            let _ = disable_raw_mode();
+            return Err(err.into());
+        }
         self.restored = true;
         Ok(())
     }
@@ -1621,9 +1715,8 @@ impl TerminalSuspension {
 
 impl Drop for TerminalSuspension {
     fn drop(&mut self) {
-        if !self.restored {
+        if !self.restored && enable_raw_mode().is_ok() {
             let _ = execute!(self.output.writer(), EnterAlternateScreen);
-            let _ = enable_raw_mode();
         }
     }
 }
@@ -1651,6 +1744,18 @@ mod tests {
     #[test]
     fn parse_command_rejects_unclosed_quotes() {
         assert_eq!(parse_command("\"vim".to_string()), None);
+    }
+
+    #[test]
+    fn parse_command_preserves_empty_quoted_arguments() {
+        assert_eq!(
+            parse_command("emacsclient -a \"\"".to_string()),
+            Some(vec![
+                "emacsclient".to_string(),
+                "-a".to_string(),
+                String::new()
+            ])
+        );
     }
 
     #[cfg(unix)]

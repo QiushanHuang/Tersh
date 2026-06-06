@@ -236,3 +236,15 @@ fn long_directory_list_keeps_focused_item_visible() {
     let buffer = render_app(&app, 60, 12);
     assert!(buffer.contains("item-29.txt"));
 }
+
+#[test]
+fn file_rows_truncate_long_names_in_narrow_layout() {
+    let dir = tempfile::tempdir().unwrap();
+    let long_name = format!("{}.txt", "a".repeat(140));
+    std::fs::write(dir.path().join(long_name), "x").unwrap();
+    let app = App::new(dir.path().to_path_buf()).unwrap();
+
+    let buffer = render_app(&app, 50, 10);
+
+    assert!(buffer.contains("..."));
+}

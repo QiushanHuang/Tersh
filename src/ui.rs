@@ -192,12 +192,19 @@ fn draw_files(frame: &mut Frame, area: Rect, app: &App) {
             _ => "",
         };
         let perm = if entry.readonly { "RO" } else { "RW" };
-        let row = format!(
-            "{cursor}{mark} {:<4} {:<4} {:>8} {}{}",
+        let prefix = format!(
+            "{cursor}{mark} {:<4} {:<4} {:>8} ",
             kind_icon(entry.kind),
             perm,
-            format_size(entry.size),
-            entry.name,
+            format_size(entry.size)
+        );
+        let inner_width = area.width.saturating_sub(2) as usize;
+        let name_width = inner_width
+            .saturating_sub(prefix.chars().count())
+            .saturating_sub(suffix.chars().count());
+        let row = format!(
+            "{prefix}{}{}",
+            truncate_chars(&entry.name, name_width),
             suffix
         );
         if index == app.cursor() {
@@ -279,6 +286,18 @@ fn draw_fullscreen_preview(frame: &mut Frame, area: Rect, app: &App) {
         .block(base_block().title("Preview").borders(Borders::ALL))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    if max_chars <= 3 {
+        return ".".repeat(max_chars);
+    }
+    let mut truncated = value.chars().take(max_chars - 3).collect::<String>();
+    truncated.push_str("...");
+    truncated
 }
 
 fn draw_preview(frame: &mut Frame, area: Rect, app: &App) {

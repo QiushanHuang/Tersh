@@ -34,6 +34,11 @@ cd "$project_dir"
 cargo build --release --bin tersh
 
 mkdir -p "$install_dir"
+if [ ! -w "$install_dir" ]; then
+    printf 'Install directory is not writable: %s\n' "$install_dir" >&2
+    printf 'Set TERSH_INSTALL_DIR to a writable directory or rerun with appropriate permissions.\n' >&2
+    exit 1
+fi
 cp "$project_dir/target/release/tersh" "$install_dir/tersh"
 chmod 755 "$install_dir/tersh"
 
