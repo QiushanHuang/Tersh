@@ -60,6 +60,8 @@ This matters when your working environment is:
 
 - Full-screen terminal file workbench
 - btop-inspired status header, sortable file list, and inspector panel
+- Context-aware shortcut footer that recommends actions for the focused item, active selection, and copy/cut buffer
+- File rows mark cursor, selection, and copy/cut buffer state in one compact status prefix
 - Directory navigation with keyboard-first controls
 - Optional shell wrapper for visual `cd` from the terminal
 - Inline file preview
@@ -71,7 +73,7 @@ This matters when your working environment is:
 - Copy file name, relative path, and absolute path
 - Compact info pane and operation log
 - Hidden file toggle
-- `tersh --c` multi-server status dashboard for local, jump, and remote hosts
+- `tersh --cluster` / `tersh --c` multi-server health dashboard for local, jump, and remote hosts
 
 ## v1.1.0 Release Highlights
 
@@ -125,7 +127,7 @@ tersh --help
 tersh
 ```
 
-Run this same block on a remote server after SSH if you want `tersh --c` -> `t` to open the Tersh workbench on that remote host.
+Run this same block on a remote server after SSH if you want the `t` action inside the `tersh --cluster` dashboard to open the Tersh workbench on that remote host.
 
 Tersh v1.1.0 requires Rust 1.85 or newer.
 
@@ -163,7 +165,19 @@ Open a specific path:
 tersh /var/www
 ```
 
-Open the multi-server status dashboard:
+Open a file directly, focusing its parent directory and entering preview:
+
+```bash
+tersh README.md
+```
+
+Open the read-only multi-server health dashboard:
+
+```bash
+tersh --cluster
+```
+
+The short compatibility alias also works:
 
 ```bash
 tersh --c
@@ -172,7 +186,7 @@ tersh --c
 Use a specific JSON inventory:
 
 ```bash
-tersh --c --cluster-config /path/to/servers.json
+tersh --cluster --cluster-config /path/to/servers.json
 ```
 
 The dashboard also checks `TERSH_SERVERS_JSON`, `./ssh/servers.json`, and `~/.config/tersh/servers.json`. The campus access layout from the companion runbook is supported: a local host, a Tailscale jump host, and campus servers reached through `ProxyJump`. Health probes require SSH host keys to already be trusted; run a normal `ssh user@host` first for new hosts.
@@ -385,6 +399,8 @@ MIT
 
 - 全屏终端文件工作台
 - 参考 btop 的状态栏、可排序文件列表和 Inspector 信息面板
+- 根据当前文件、目录、选区和复制/剪切缓冲区自动推荐快捷键的底部提示栏
+- 文件行用紧凑前缀同时标记当前行、选中状态和复制/剪切缓冲区状态
 - 键盘优先的目录浏览
 - 可选 shell 包装函数，让 `tersh` 作为可视化 `cd` 使用
 - 文件内联预览
@@ -396,7 +412,7 @@ MIT
 - 复制文件名、相对路径和绝对路径
 - 紧凑的信息面板和操作日志
 - 隐藏文件开关
-- `tersh --c` 多服务器状态面板，可查看本机、跳板机和远端服务器
+- `tersh --cluster` / `tersh --c` 多服务器健康状态面板，可查看本机、跳板机和远端服务器
 
 ## v1.1.0 更新重点
 
@@ -450,7 +466,7 @@ tersh --help
 tersh
 ```
 
-如果你已经 SSH 到服务器上，就在服务器终端里运行同一段命令；这样 `tersh --c` -> `t` 才能在那台远端主机上打开 Tersh 文件工作台。
+如果你已经 SSH 到服务器上，就在服务器终端里运行同一段命令；这样在 `tersh --cluster` 状态面板里按 `t` 时，才能在那台远端主机上打开 Tersh 文件工作台。
 
 Tersh v1.1.0 需要 Rust 1.85 或更新版本。
 
@@ -488,7 +504,19 @@ tersh
 tersh /var/www
 ```
 
-打开多服务器状态面板：
+直接打开文件，并聚焦其父目录、进入预览：
+
+```bash
+tersh README.md
+```
+
+打开只读的多服务器健康状态面板：
+
+```bash
+tersh --cluster
+```
+
+也可以继续使用短兼容别名：
 
 ```bash
 tersh --c
@@ -497,7 +525,7 @@ tersh --c
 指定 JSON 主机清单：
 
 ```bash
-tersh --c --cluster-config /path/to/servers.json
+tersh --cluster --cluster-config /path/to/servers.json
 ```
 
 状态面板也会检查 `TERSH_SERVERS_JSON`、`./ssh/servers.json` 和 `~/.config/tersh/servers.json`。之前运行指南里的校园网布局可以直接使用：本机、Tailscale 跳板机，以及通过 `ProxyJump` 访问的校园服务器。健康探测要求 SSH host key 已经受信任；新主机请先手动运行一次 `ssh user@host`。

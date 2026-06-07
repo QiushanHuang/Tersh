@@ -42,8 +42,25 @@ fn help_documents_cluster_status_manager_flag() {
     assert!(output.status.success());
 
     let stdout = String::from_utf8(output.stdout).expect("help output is utf-8");
+    assert!(stdout.contains("--cluster"));
     assert!(stdout.contains("--c"));
-    assert!(stdout.contains("multi-server status"));
+    assert!(stdout.contains("read-only cluster health"));
+    assert!(stdout.contains("route"));
+    assert!(stdout.contains("selected host"));
+}
+
+#[test]
+fn cluster_long_alias_keeps_existing_cluster_mode_contracts() {
+    let binary = std::env::var("CARGO_BIN_EXE_tersh").expect("tersh binary target exists");
+    let output = Command::new(binary)
+        .args(["--cluster", "--print-cwd"])
+        .output()
+        .expect("run tersh --cluster --print-cwd");
+
+    assert!(!output.status.success());
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr is utf-8");
+    assert!(stderr.contains("cannot be used with"));
 }
 
 #[test]

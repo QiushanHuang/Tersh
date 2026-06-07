@@ -1,6 +1,6 @@
 use crate::{
     app::{App, Mode},
-    fs_core::{display_path, escape_display, format_size},
+    fs_core::{FileKind, display_path, escape_display, format_size},
 };
 use ratatui::{
     Frame,
@@ -183,7 +183,7 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &App) {
 
 fn draw_files(frame: &mut Frame, area: Rect, app: &App) {
     let mut lines = vec![Line::from(Span::styled(
-        "S K PERM      SIZE NAME",
+        "CSB K    PERM      SIZE NAME",
         Style::default().fg(Color::Gray),
     ))];
     if !app.filter().is_empty() {
@@ -210,6 +210,7 @@ fn draw_files(frame: &mut Frame, area: Rect, app: &App) {
         } else {
             " "
         };
+        let buffer_mark = app.transfer_marker_for(&entry.path);
         let suffix = match entry.kind {
             crate::fs_core::FileKind::Directory => "/",
             crate::fs_core::FileKind::Symlink => "@",
@@ -217,7 +218,7 @@ fn draw_files(frame: &mut Frame, area: Rect, app: &App) {
         };
         let perm = if entry.readonly { "RO" } else { "RW" };
         let prefix = format!(
-            "{cursor}{mark} {:<4} {:<4} {:>8} ",
+            "{cursor}{mark}{buffer_mark} {:<4} {:<4} {:>8} ",
             kind_icon(entry.kind),
             perm,
             format_size(entry.size)
@@ -451,10 +452,11 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             "y_ | y copy | f name | r rel | a abs | ^G cancel | ^C force".to_string()
         }
         Mode::Normal if app.pending_g() => "g_ | g top | G bottom | ^G cancel | ^C force".to_string(),
-        Mode::Normal if compact => "q quit | ? help | / | ^G | ^C".to_string(),
-        Mode::Normal => {
-            "normal | q quit | Esc/^G clear | ^C force | ? help | j/k move | Enter open | h parent | / filter | Space mark | yy copy | p paste | s sort | S reverse".to_string()
+        Mode::Normal if compact && area.width < 50 => "q quit | ? help | / | ^G | ^C".to_string(),
+        Mode::Normal if compact => {
+            format!("next: {} | q quit | ? help | / | ^G | ^C", next_action(app))
         }
+        Mode::Normal => normal_footer(app),
         Mode::Preview if compact => "preview | q | Pg | ^G | ^C".to_string(),
         Mode::Preview => {
             "preview | q close | ^G close | ^C force | j/k page | Up/Down line | PgUp/PgDn | gg/G | / find | n/N | e edit".to_string()
@@ -544,6 +546,20 @@ fn draw_input_modal(frame: &mut Frame, area: Rect, app: &App) {
     };
     let mut lines = vec![Line::from(prompt)];
     if matches!(app.mode(), Mode::ConfirmTrash | Mode::ConfirmDelete) {
+        let required = match app.mode() {
+            Mode::ConfirmTrash => "trash",
+            Mode::ConfirmDelete => "delete",
+            _ => "",
+        };
+        lines.push(Line::from(format!("required: {required}")));
+        lines.push(Line::from(format!(
+            "typed: {}",
+            if app.input().is_empty() {
+                "-"
+            } else {
+                app.input()
+            }
+        )));
         lines.push(Line::from(format!(
             "targets: {} {}",
             app.operation_target_count(),
@@ -563,10 +579,53 @@ fn draw_input_modal(frame: &mut Frame, area: Rect, app: &App) {
         Mode::ConfirmTrash => "TRASH",
         _ => "Command",
     };
+    let block = match app.mode() {
+        Mode::ConfirmDelete => base_block()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Red))
+            .style(Style::default().fg(Color::Red)),
+        Mode::ConfirmTrash => base_block()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow)),
+        _ => base_block().title(title).borders(Borders::ALL),
+    };
     let paragraph = Paragraph::new(lines)
-        .block(base_block().title(title).borders(Borders::ALL))
+        .block(block)
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
+}
+
+fn normal_footer(app: &App) -> String {
+    let mut actions = vec![format!("next: {}", next_action(app))];
+    if app.selected_len() > 0 {
+        actions.push(format!("{} selected", app.selected_len()));
+        actions.push("d trash".to_string());
+        actions.push("yy copy".to_string());
+    } else {
+        actions.push("Space mark".to_string());
+        actions.push("yy copy".to_string());
+    }
+    if app.copy_buffer_len() > 0 {
+        actions.push("p paste".to_string());
+    }
+    actions.push("s sort".to_string());
+
+    format!(
+        "normal | {} | q quit | Esc/^G clear | ^C force | ? help | j/k move | / filter | h parent",
+        actions.join(" | ")
+    )
+}
+
+fn next_action(app: &App) -> &'static str {
+    match app.entries().get(app.cursor()).map(|entry| entry.kind) {
+        Some(FileKind::Directory) => "Enter open dir",
+        Some(FileKind::File) => "Enter preview file | e edit",
+        Some(FileKind::Symlink) => "Enter inspect link",
+        Some(FileKind::Other) => "Space mark item",
+        None => "r refresh",
+    }
 }
 
 fn kind_icon(kind: crate::fs_core::FileKind) -> &'static str {

@@ -369,8 +369,20 @@ fn detail_lines(app: &ClusterApp, include_logs: bool) -> Vec<Line<'static>> {
 
     if let Some(snapshot) = snapshot {
         push_snapshot_lines(&mut lines, snapshot);
+        if let Some(hint) = action_hint(snapshot) {
+            lines.push(Line::from(Span::styled(
+                format!("Hint: {hint}"),
+                Style::default()
+                    .fg(hint_style(snapshot.connection))
+                    .add_modifier(Modifier::BOLD),
+            )));
+        }
     } else {
         lines.push(Line::from("Status: unknown"));
+        lines.push(Line::from(Span::styled(
+            "Hint: press Enter to refresh this host",
+            Style::default().fg(Color::Gray),
+        )));
     }
     if include_logs {
         lines.push(Line::from(""));
@@ -581,15 +593,70 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &ClusterApp) {
         ClusterMode::Detail => {
             "detail | q/Esc back | ^G back | ^C force | r refresh | s shell/ssh | t tersh"
         }
-        ClusterMode::Normal if compact => "q quit | ? help | l detail | ^G | ^C",
+        ClusterMode::Normal if compact && area.width < 50 => "q quit | ? help | l detail | ^G | ^C",
+        ClusterMode::Normal if compact => {
+            return render_footer(
+                frame,
+                area,
+                format!(
+                    "next: {} | q quit | ? help | l detail | ^G | ^C",
+                    cluster_next_action(app)
+                ),
+            );
+        }
         ClusterMode::Normal => {
-            "q quit | ? help | ^G back | ^C force | r refresh | Enter refresh host | s shell/ssh | t tersh | l detail | j/k move | Home/End"
+            return render_footer(
+                frame,
+                area,
+                format!(
+                    "next: {} | q quit | ? help | ^G cancel | ^C force | r refresh | Enter refresh host | s shell/ssh | t tersh | l detail | j/k move | Home/End",
+                    cluster_next_action(app)
+                ),
+            );
         }
     };
+    render_footer(frame, area, text.to_string());
+}
+
+fn render_footer(frame: &mut Frame, area: Rect, text: String) {
     let paragraph = Paragraph::new(text)
         .style(Style::default().fg(Color::Gray))
         .block(base_block().borders(Borders::TOP));
     frame.render_widget(paragraph, area);
+}
+
+fn cluster_next_action(app: &ClusterApp) -> &'static str {
+    match app.selected_snapshot().map(|snapshot| snapshot.connection) {
+        Some(ConnectionState::Online) => "t tersh",
+        Some(ConnectionState::Checking) => "wait",
+        Some(ConnectionState::Stale) => "Enter refresh",
+        Some(ConnectionState::AuthFailed) => "l detail",
+        Some(ConnectionState::Timeout | ConnectionState::Offline) => "l detail",
+        Some(ConnectionState::Unknown) | None => "Enter refresh",
+    }
+}
+
+fn action_hint(snapshot: &HostSnapshot) -> Option<&'static str> {
+    match snapshot.connection {
+        ConnectionState::AuthFailed => Some("check SSH auth and trusted host key"),
+        ConnectionState::Timeout => Some("check VPN, jump host, and network route"),
+        ConnectionState::Offline => Some("inspect the probe error and host availability"),
+        ConnectionState::Stale => Some("refresh failed; showing last good metrics"),
+        ConnectionState::Unknown => Some("press Enter to refresh this host"),
+        ConnectionState::Checking => Some("probe is still running"),
+        ConnectionState::Online => None,
+    }
+}
+
+fn hint_style(state: ConnectionState) -> Color {
+    match state {
+        ConnectionState::AuthFailed | ConnectionState::Timeout | ConnectionState::Offline => {
+            Color::Red
+        }
+        ConnectionState::Stale | ConnectionState::Checking => Color::Yellow,
+        ConnectionState::Unknown => Color::Gray,
+        ConnectionState::Online => Color::Green,
+    }
 }
 
 fn draw_help(frame: &mut Frame, area: Rect) {

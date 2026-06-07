@@ -72,6 +72,56 @@ fn y_prefix_footer_shows_chord_options() {
 }
 
 #[test]
+fn normal_footer_recommends_actions_for_focused_directory() {
+    let app = App::for_test();
+
+    let buffer = render_app(&app, 100, 30);
+
+    assert!(buffer.contains("next: Enter open dir"));
+    assert!(buffer.contains("Space mark"));
+}
+
+#[test]
+fn normal_footer_recommends_file_actions_and_buffer_action() {
+    let mut app = App::for_test();
+    app.handle_command(Command::Down);
+    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+
+    let buffer = render_app(&app, 100, 30);
+
+    assert!(buffer.contains("next: Enter preview file"));
+    assert!(buffer.contains("e edit"));
+    assert!(buffer.contains("p paste"));
+}
+
+#[test]
+fn file_rows_mark_current_selection_and_transfer_buffer() {
+    let mut app = App::for_test();
+    app.handle_command(Command::ToggleSelect);
+    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+
+    let buffer = render_app(&app, 100, 30);
+
+    assert!(buffer.contains(">*C"));
+}
+
+#[test]
+fn destructive_confirmation_shows_required_and_typed_text() {
+    let mut app = App::for_test();
+    app.apply(Command::PermanentDelete);
+    for ch in "del".chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+    }
+
+    let buffer = render_app(&app, 100, 30);
+
+    assert!(buffer.contains("required: delete"));
+    assert!(buffer.contains("typed: del"));
+}
+
+#[test]
 fn workbench_operational_chrome_is_ascii() {
     let app = App::for_test();
 

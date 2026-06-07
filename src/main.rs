@@ -10,9 +10,10 @@ use std::path::PathBuf;
 )]
 struct Cli {
     #[arg(
-        long = "c",
+        long = "cluster",
+        visible_alias = "c",
         conflicts_with = "print_cwd",
-        help = "Open the multi-server status manager instead of the file workbench"
+        help = "Open the read-only cluster health dashboard with route and selected host launch actions"
     )]
     cluster_status: bool,
 

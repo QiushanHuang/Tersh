@@ -629,6 +629,19 @@ impl App {
             .unwrap_or(0)
     }
 
+    pub fn transfer_marker_for(&self, path: &Path) -> &'static str {
+        let Some(buffer) = &self.transfer_buffer else {
+            return " ";
+        };
+        if !buffer.paths.iter().any(|candidate| candidate == path) {
+            return " ";
+        }
+        match buffer.kind {
+            TransferKind::Copy => "C",
+            TransferKind::Cut => "X",
+        }
+    }
+
     pub fn copy_buffer_label(&self) -> String {
         self.transfer_buffer
             .as_ref()

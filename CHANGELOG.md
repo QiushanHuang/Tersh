@@ -4,12 +4,17 @@
 
 ### Added
 
+- Added `--cluster` as the clearer long-form entry for the read-only cluster health dashboard, while keeping `--c` as a compatibility alias.
+- Added context-aware workbench footer recommendations for focused directories, focused files, active selections, and copy/cut buffers.
+- Added cluster footer recommendations and detail hints so host status screens suggest the next action for online, stale, auth-failed, timeout, and unknown hosts.
 - Added direct file startup support so `tersh <file>` opens the file's parent directory, focuses the file, and enters preview for regular files.
 - Added remote workbench diagnostics for `tersh --c` so remote `t` sessions report missing `tersh` binaries and invalid `workdir` paths with actionable messages.
 - Added compact workbench help and confirmation layouts for very narrow terminal screens.
 
 ### Changed
 
+- Changed file rows to show cursor, selection, and copy/cut buffer state in a fixed row marker so the active operation target is easier to scan.
+- Changed trash/delete confirmation prompts to show required and typed confirmation text, with stronger visual severity styling.
 - Changed filter input to use the current in-memory directory listing while typing, avoiding a full directory scan on every character.
 - Changed compact workbench and cluster chrome to keep selection/buffer state and the cluster detail action visible on narrow terminals.
 - Changed the install script to build with `--locked`, and enabled release stripping plus thin LTO for smaller optimized local rebuilds.

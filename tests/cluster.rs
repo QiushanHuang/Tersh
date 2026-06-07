@@ -1002,6 +1002,61 @@ fn cluster_render_narrow_normal_mode_keeps_host_list_primary() {
 }
 
 #[test]
+fn cluster_narrow_footer_recommends_next_action_from_selected_state() {
+    let inventory = ClusterInventory::from_json(CAMPUS_JSON).unwrap();
+    let mut app = ClusterApp::new(inventory.hosts().to_vec());
+    app.apply(ClusterCommand::Down);
+    app.apply(ClusterCommand::Down);
+    app.apply_snapshot(HostSnapshot::online(
+        "school-star",
+        ProbeReport::parse(
+            "hostname=starbox\nload=0.12 0.20 0.30\nmemory=512/1024 MB (50%)\nstorage=8G/20G 40% used\ntasks=72 processes\ngpu=none\n",
+        ),
+        87,
+    ));
+
+    let backend = TestBackend::new(71, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| cluster_ui::draw(frame, &app))
+        .unwrap();
+
+    let buffer = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(buffer.contains("next: t tersh"));
+}
+
+#[test]
+fn cluster_detail_shows_actionable_hint_for_auth_failures() {
+    let inventory = ClusterInventory::from_json(DIRECT_JSON).unwrap();
+    let mut app = ClusterApp::new(inventory.hosts().to_vec());
+    app.apply_snapshot(HostSnapshot::failed(
+        "direct-box",
+        "Permission denied (publickey)",
+    ));
+
+    let backend = TestBackend::new(120, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| cluster_ui::draw(frame, &app))
+        .unwrap();
+
+    let buffer = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(buffer.contains("Hint: check SSH auth"));
+}
+
+#[test]
 fn cluster_render_narrow_detail_mode_shows_metrics() {
     let inventory = ClusterInventory::from_json(CAMPUS_JSON).unwrap();
     let mut app = ClusterApp::new(inventory.hosts().to_vec());
