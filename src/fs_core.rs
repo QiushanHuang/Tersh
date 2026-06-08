@@ -19,6 +19,7 @@ pub struct FileEntry {
     pub path: PathBuf,
     pub raw_name: OsString,
     pub name: String,
+    pub name_lower: String,
     pub kind: FileKind,
     pub size: u64,
     pub readonly: bool,
@@ -56,11 +57,13 @@ impl FileEntry {
             .map(OsStr::to_os_string)
             .unwrap_or_else(|| path.as_os_str().to_os_string());
         let name = display_os_str(&raw_name);
+        let name_lower = name.to_lowercase();
 
         Ok(Self {
             path,
             raw_name,
             name,
+            name_lower,
             kind,
             size: metadata.len(),
             readonly: metadata.permissions().readonly(),
@@ -124,8 +127,7 @@ pub fn read_dir_entries_with_diagnostics(
             FileKind::File => 2,
             FileKind::Other => 3,
         };
-        ak.cmp(&bk)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        ak.cmp(&bk).then_with(|| a.name_lower.cmp(&b.name_lower))
     });
     Ok(DirectoryEntries { entries, skipped })
 }

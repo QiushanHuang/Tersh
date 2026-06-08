@@ -14,8 +14,8 @@ use crossterm::{
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{
-    collections::BTreeSet,
     collections::hash_map::DefaultHasher,
+    collections::{BTreeSet, VecDeque},
     ffi::{CStr, CString, OsStr, OsString},
     fs,
     hash::{Hash, Hasher},
@@ -26,6 +26,9 @@ use std::{
 };
 
 const PREVIEW_SIGNATURE_HASH_LIMIT: u64 = (2 * 1024 * 1024) + 1;
+const PREVIEW_CACHE_LIMIT: usize = 32;
+const PREVIEW_CACHE_BYTES_LIMIT: usize = 4 * 1024 * 1024;
+const PREVIEW_CACHE_ENTRY_BYTES_LIMIT: usize = 512 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -40,6 +43,7 @@ pub enum Mode {
     MoveTo,
     ConfirmTrash,
     ConfirmDelete,
+    Conflict,
     Message,
 }
 
@@ -120,7 +124,8 @@ pub struct App {
     last_clipboard_text: Option<String>,
     sort_key: SortKey,
     sort_reverse: bool,
-    preview_cache: Option<CachedPreview>,
+    preview_cache: VecDeque<CachedPreview>,
+    pending_file_operation: Option<PendingFileOperation>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -140,6 +145,22 @@ struct TransferBuffer {
     paths: Vec<PathBuf>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileOperationSource {
+    TransferBuffer,
+    Direct,
+}
+
+#[derive(Debug, Clone)]
+struct PendingFileOperation {
+    kind: TransferKind,
+    paths: Vec<PathBuf>,
+    destination: PathBuf,
+    source: FileOperationSource,
+    label: &'static str,
+    allow_replace: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PreviewSignature {
     len: u64,
@@ -154,6 +175,7 @@ struct CachedPreview {
     path: PathBuf,
     signature: PreviewSignature,
     preview: Preview,
+    estimated_bytes: usize,
 }
 
 struct InitialLocation {
@@ -232,7 +254,8 @@ impl App {
             last_clipboard_text: None,
             sort_key: SortKey::Kind,
             sort_reverse: false,
-            preview_cache: None,
+            preview_cache: VecDeque::new(),
+            pending_file_operation: None,
         };
         app.reload();
         if let Some(name) = initial.focus_name {
@@ -261,11 +284,13 @@ impl App {
                 readonly: false,
                 modified: None,
                 symlink_target: None,
+                name_lower: "src".to_string(),
             },
             FileEntry {
                 path: PathBuf::from("/tmp/tersh-test/README.md"),
                 raw_name: "README.md".into(),
                 name: "README.md".to_string(),
+                name_lower: "readme.md".to_string(),
                 kind: FileKind::File,
                 size: 128,
                 readonly: false,
@@ -304,7 +329,8 @@ impl App {
             last_clipboard_text: None,
             sort_key: SortKey::Kind,
             sort_reverse: false,
-            preview_cache: None,
+            preview_cache: VecDeque::new(),
+            pending_file_operation: None,
         }
     }
 
@@ -483,6 +509,7 @@ impl App {
                 | Mode::MoveTo
                 | Mode::ConfirmTrash
                 | Mode::ConfirmDelete
+                | Mode::Conflict
         ) {
             let command = match key.code {
                 KeyCode::Enter => Some(Command::Submit),
@@ -745,6 +772,39 @@ impl App {
             .collect()
     }
 
+    pub fn conflict_count(&self) -> usize {
+        self.pending_file_operation
+            .as_ref()
+            .map(|operation| self.conflict_targets(operation).len())
+            .unwrap_or(0)
+    }
+
+    pub fn conflict_allows_replace(&self) -> bool {
+        self.pending_file_operation
+            .as_ref()
+            .map(|operation| operation.allow_replace)
+            .unwrap_or(false)
+    }
+
+    pub fn conflict_destination(&self) -> Option<&Path> {
+        self.pending_file_operation
+            .as_ref()
+            .map(|operation| operation.destination.as_path())
+    }
+
+    pub fn conflict_target_labels(&self, limit: usize) -> Vec<String> {
+        self.pending_file_operation
+            .as_ref()
+            .map(|operation| {
+                self.conflict_targets(operation)
+                    .into_iter()
+                    .take(limit)
+                    .map(|path| crate::fs_core::display_path(&path))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn take_clipboard_text(&mut self) -> Option<String> {
         self.clipboard_text.take()
     }
@@ -787,11 +847,16 @@ impl App {
 
     fn preview_for_path(&mut self, path: &Path) -> Preview {
         let signature = preview_signature(path);
-        if let (Some(signature), Some(cache)) = (&signature, &self.preview_cache)
-            && cache.path == path
-            && &cache.signature == signature
+        if let Some(signature) = &signature
+            && let Some(index) = self
+                .preview_cache
+                .iter()
+                .position(|cache| cache.path == path && &cache.signature == signature)
+            && let Some(cache) = self.preview_cache.remove(index)
         {
-            return cache.preview.clone();
+            let preview = cache.preview.clone();
+            self.preview_cache.push_back(cache);
+            return preview;
         }
         let preview = match preview_file(path) {
             Ok(preview) => preview,
@@ -804,13 +869,36 @@ impl App {
         if let Some(signature) = signature
             && preview.kind != PreviewKind::Error
         {
-            self.preview_cache = Some(CachedPreview {
-                path: path.to_path_buf(),
-                signature,
-                preview: preview.clone(),
-            });
+            let estimated_bytes = preview_cache_bytes(&preview);
+            self.preview_cache.retain(|cache| cache.path != path);
+            if estimated_bytes <= PREVIEW_CACHE_ENTRY_BYTES_LIMIT {
+                self.preview_cache.push_back(CachedPreview {
+                    path: path.to_path_buf(),
+                    signature,
+                    preview: preview.clone(),
+                    estimated_bytes,
+                });
+                self.trim_preview_cache();
+            }
         }
         preview
+    }
+
+    fn trim_preview_cache(&mut self) {
+        while self.preview_cache.len() > PREVIEW_CACHE_LIMIT
+            || self.preview_cache_bytes() > PREVIEW_CACHE_BYTES_LIMIT
+        {
+            if self.preview_cache.pop_front().is_none() {
+                break;
+            }
+        }
+    }
+
+    fn preview_cache_bytes(&self) -> usize {
+        self.preview_cache
+            .iter()
+            .map(|cache| cache.estimated_bytes)
+            .sum()
     }
 
     fn scroll_preview(&mut self, delta: isize) {
@@ -1003,15 +1091,15 @@ impl App {
             let ordering = match key {
                 SortKey::Kind => kind_rank(a.kind)
                     .cmp(&kind_rank(b.kind))
-                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+                    .then_with(|| a.name_lower.cmp(&b.name_lower)),
                 SortKey::Size => a
                     .size
                     .cmp(&b.size)
-                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+                    .then_with(|| a.name_lower.cmp(&b.name_lower)),
                 SortKey::Modified => a
                     .modified
                     .cmp(&b.modified)
-                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+                    .then_with(|| a.name_lower.cmp(&b.name_lower)),
             };
             if self.sort_reverse {
                 ordering.reverse()
@@ -1029,7 +1117,7 @@ impl App {
             self.entries = self
                 .all_entries
                 .iter()
-                .filter(|entry| entry.name.to_lowercase().contains(&filter))
+                .filter(|entry| entry.name_lower.contains(&filter))
                 .cloned()
                 .collect();
         }
@@ -1101,36 +1189,15 @@ impl App {
             self.log("transfer buffer empty");
             return;
         };
-        let mut copied = 0;
-        let mut failed_cut_paths = Vec::new();
-        for source in &buffer.paths {
-            let result =
-                destination_for_paste(source, &self.cwd).and_then(|target| match buffer.kind {
-                    TransferKind::Copy => copy_path(source, &target, false),
-                    TransferKind::Cut => rename_path(source, &target),
-                });
-            match result {
-                Ok(()) => copied += 1,
-                Err(err) => {
-                    if buffer.kind == TransferKind::Cut {
-                        failed_cut_paths.push(source.clone());
-                    }
-                    self.log(format!("paste skipped: {err}"));
-                }
-            }
-        }
-        self.log(format!("pasted {copied} item(s)"));
-        if buffer.kind == TransferKind::Cut {
-            self.transfer_buffer = if failed_cut_paths.is_empty() {
-                None
-            } else {
-                Some(TransferBuffer {
-                    kind: TransferKind::Cut,
-                    paths: failed_cut_paths,
-                })
-            };
-        }
-        self.reload();
+        let operation = PendingFileOperation {
+            kind: buffer.kind,
+            paths: buffer.paths,
+            destination: self.cwd.clone(),
+            source: FileOperationSource::TransferBuffer,
+            label: "pasted",
+            allow_replace: buffer.kind == TransferKind::Copy,
+        };
+        self.start_file_operation(operation);
     }
 
     fn copy_to_destination(&mut self, move_items: bool) {
@@ -1143,28 +1210,136 @@ impl App {
                 return;
             }
         };
-        let targets = self.operation_targets();
-        let mut completed = 0;
-        for source in targets {
-            let result = destination_for_paste(&source, &destination).and_then(|target| {
-                if move_items {
-                    rename_path(&source, &target)
-                } else {
-                    copy_path(&source, &target, false)
-                }
-            });
-            match result {
-                Ok(()) => completed += 1,
-                Err(err) => self.log(format!("copy/move skipped: {err}")),
+        let kind = if move_items {
+            TransferKind::Cut
+        } else {
+            TransferKind::Copy
+        };
+        let operation = PendingFileOperation {
+            kind,
+            paths: self.operation_targets(),
+            destination,
+            source: FileOperationSource::Direct,
+            label: if move_items { "moved" } else { "copied" },
+            allow_replace: !move_items,
+        };
+        self.start_file_operation(operation);
+    }
+
+    fn start_file_operation(&mut self, operation: PendingFileOperation) {
+        let conflicts = self.conflict_targets(&operation);
+        if !conflicts.is_empty() {
+            if !operation.allow_replace {
+                self.execute_file_operation(operation, false, true);
+                return;
+            }
+            self.log(format!("{} conflict(s)", conflicts.len()));
+            self.pending_file_operation = Some(operation);
+            self.mode = Mode::Conflict;
+            self.input.clear();
+            return;
+        }
+        self.execute_file_operation(operation, false, false);
+    }
+
+    fn submit_conflict(&mut self) {
+        let Some(operation) = self.pending_file_operation.take() else {
+            self.mode = Mode::Normal;
+            self.input.clear();
+            return;
+        };
+        let decision = self.input.trim().to_ascii_lowercase();
+        match decision.as_str() {
+            "replace" if operation.allow_replace => {
+                self.execute_file_operation(operation, true, false);
+            }
+            "replace" => {
+                self.pending_file_operation = Some(operation);
+                self.log("replace is only available for copy operations");
+            }
+            "skip" => {
+                self.execute_file_operation(operation, false, true);
+            }
+            _ => {
+                self.pending_file_operation = Some(operation);
+                self.log("type replace or skip to resolve conflict");
             }
         }
-        self.log(format!(
-            "{} {completed} item(s)",
-            if move_items { "moved" } else { "copied" }
-        ));
+        if self.mode == Mode::Conflict {
+            self.input.clear();
+        }
+    }
+
+    fn execute_file_operation(
+        &mut self,
+        operation: PendingFileOperation,
+        replace_existing: bool,
+        skip_conflicts: bool,
+    ) {
+        let mut completed = 0;
+        let mut skipped = 0;
+        let mut failed_cut_paths = Vec::new();
+        for source in &operation.paths {
+            let target = match destination_for_paste(source, &operation.destination) {
+                Ok(target) => target,
+                Err(err) => {
+                    self.log(format!("{} skipped: {err}", operation.label));
+                    continue;
+                }
+            };
+            if skip_conflicts && target_exists(&target) {
+                skipped += 1;
+                if operation.kind == TransferKind::Cut
+                    && operation.source == FileOperationSource::TransferBuffer
+                {
+                    failed_cut_paths.push(source.clone());
+                }
+                continue;
+            }
+            let result = match operation.kind {
+                TransferKind::Copy => copy_path(source, &target, replace_existing),
+                TransferKind::Cut => rename_path(source, &target),
+            };
+            match result {
+                Ok(()) => completed += 1,
+                Err(err) => {
+                    if operation.kind == TransferKind::Cut
+                        && operation.source == FileOperationSource::TransferBuffer
+                    {
+                        failed_cut_paths.push(source.clone());
+                    }
+                    self.log(format!("{} skipped: {err}", operation.label));
+                }
+            }
+        }
+        if skipped > 0 {
+            self.log(format!("skipped {skipped} existing item(s)"));
+        }
+        self.log(format!("{} {completed} item(s)", operation.label));
+        if operation.kind == TransferKind::Cut
+            && operation.source == FileOperationSource::TransferBuffer
+        {
+            self.transfer_buffer = if failed_cut_paths.is_empty() {
+                None
+            } else {
+                Some(TransferBuffer {
+                    kind: TransferKind::Cut,
+                    paths: failed_cut_paths,
+                })
+            };
+        }
         self.mode = Mode::Normal;
         self.input.clear();
         self.reload();
+    }
+
+    fn conflict_targets(&self, operation: &PendingFileOperation) -> Vec<PathBuf> {
+        operation
+            .paths
+            .iter()
+            .filter_map(|source| destination_for_paste(source, &operation.destination).ok())
+            .filter(|target| target_exists(target))
+            .collect()
     }
 
     fn submit(&mut self) {
@@ -1194,6 +1369,7 @@ impl App {
                     self.log("type delete then Enter for permanent delete");
                 }
             }
+            Mode::Conflict => self.submit_conflict(),
             Mode::Help | Mode::Message => self.mode = Mode::Normal,
             Mode::Normal => {}
         }
@@ -1280,7 +1456,8 @@ impl App {
             | Mode::CopyTo
             | Mode::MoveTo
             | Mode::ConfirmTrash
-            | Mode::ConfirmDelete => {
+            | Mode::ConfirmDelete
+            | Mode::Conflict => {
                 self.input.push(ch);
                 if self.mode == Mode::Filter {
                     self.filter = self.input.clone();
@@ -1422,15 +1599,27 @@ fn run_tui(path: PathBuf, output: TerminalOutput) -> Result<PathBuf> {
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
     let mut app = App::new_with_output(path, output)?;
+    let mut dirty = true;
 
     while !app.should_quit() {
-        terminal.draw(|frame| crate::ui::draw(frame, &app))?;
-        if event::poll(Duration::from_millis(100))?
-            && let Event::Key(key) = event::read()?
-        {
-            app.handle_key(key);
-            if let Some(text) = app.take_clipboard_text() {
-                crate::clipboard::write_clipboard(&mut output.writer(), &text)?;
+        if dirty {
+            terminal.draw(|frame| crate::ui::draw(frame, &app))?;
+            dirty = false;
+        }
+        if event::poll(Duration::from_millis(250))? {
+            match event::read()? {
+                Event::Key(key) => {
+                    app.handle_key(key);
+                    if let Some(text) = app.take_clipboard_text() {
+                        crate::clipboard::write_clipboard(&mut output.writer(), &text)?;
+                    }
+                    dirty = true;
+                }
+                Event::Resize(_, _) => {
+                    terminal.clear()?;
+                    dirty = true;
+                }
+                _ => {}
             }
         }
     }
@@ -1513,6 +1702,14 @@ fn preview_signature(path: &Path) -> Option<PreviewSignature> {
         symlink_target,
         sample_hash,
     })
+}
+
+fn target_exists(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok()
+}
+
+fn preview_cache_bytes(preview: &Preview) -> usize {
+    preview.path.as_os_str().len() + preview.lines.iter().map(|line| line.len()).sum::<usize>()
 }
 
 fn preview_file_hash(path: &Path) -> Option<u64> {
@@ -1843,6 +2040,69 @@ mod tests {
         file.write_all(b"b").unwrap();
 
         assert_ne!(first, preview_file_hash(&path).unwrap());
+    }
+
+    #[test]
+    fn preview_cache_retains_multiple_recent_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "a").unwrap();
+        fs::write(dir.path().join("b.txt"), "b").unwrap();
+        fs::write(dir.path().join("c.txt"), "c").unwrap();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+
+        app.handle_command(Command::Down);
+        app.handle_command(Command::Down);
+
+        assert!(app.preview_cache.len() >= 2);
+    }
+
+    #[test]
+    fn preview_cache_replaces_stale_entry_for_same_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        fs::write(&path, "a").unwrap();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        let cached_path = app.cwd().join("a.txt");
+
+        fs::write(&path, "b").unwrap();
+        app.handle_command(Command::Refresh);
+
+        assert_eq!(
+            app.preview_cache
+                .iter()
+                .filter(|cache| cache.path == cached_path)
+                .count(),
+            1
+        );
+        assert!(app.preview.lines.iter().any(|line| line.contains("b")));
+    }
+
+    #[test]
+    fn preview_cache_enforces_lru_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        for index in 0..(PREVIEW_CACHE_LIMIT + 5) {
+            fs::write(dir.path().join(format!("item-{index:02}.txt")), "x").unwrap();
+        }
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+
+        for _ in 0..(PREVIEW_CACHE_LIMIT + 4) {
+            app.handle_command(Command::Down);
+        }
+
+        assert_eq!(app.preview_cache.len(), PREVIEW_CACHE_LIMIT);
+        let newest_cached = format!("item-{:02}.txt", PREVIEW_CACHE_LIMIT + 4);
+        assert!(!app.preview_cache.iter().any(|cache| {
+            cache
+                .path
+                .file_name()
+                .is_some_and(|name| name == "item-00.txt")
+        }));
+        assert!(app.preview_cache.iter().any(|cache| {
+            cache
+                .path
+                .file_name()
+                .is_some_and(|name| name == newest_cached.as_str())
+        }));
     }
 
     #[test]

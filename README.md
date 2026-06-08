@@ -69,9 +69,12 @@ This matters when your working environment is:
 - Filter the current directory
 - Quick file edit with `$VISUAL`, `$EDITOR`, or `nano` fallback (`e`)
 - Copy, cut, paste, rename, and move workflows
+- Copy conflict handling with explicit `replace` / `skip` confirmation before overwriting existing targets
 - Safe trash flow before permanent deletion
 - Copy file name, relative path, and absolute path
 - Compact info pane and operation log
+- Dirty-driven rendering, bounded preview LRU cache, and cached filter/sort keys for lighter idle and browsing performance
+- Optional `TERSH_CLIPBOARD=off` mode for terminals where OSC52 clipboard writes are unwanted
 - Hidden file toggle
 - `tersh --cluster` / `tersh --c` multi-server health dashboard for local, jump, and remote hosts
 
@@ -227,6 +230,14 @@ alias tcd=tersh-cd
 ```
 
 Then run `tcd`, browse from directory A to directory B, and quit. Your shell will return in directory B. This works through a shell wrapper because a child process cannot directly change its parent shell directory.
+
+Disable terminal clipboard writes when OSC52 is unsupported or undesirable:
+
+```bash
+TERSH_CLIPBOARD=off tersh
+```
+
+Copy helpers still update Tersh's in-app copy state; they just skip writing OSC52 escape sequences to the terminal.
 
 ## Keybindings
 
@@ -408,9 +419,12 @@ MIT
 - 当前目录筛选
 - 可在预览中用 `e` 调用 `$VISUAL`、`$EDITOR` 或 `nano` 进行编辑
 - 复制、剪切、粘贴、重命名与移动
+- 复制遇到已有目标时，会先进入 `replace` / `skip` 冲突确认，再决定是否覆盖
 - 先入回收站再永久删除的安全流程
 - 复制文件名、相对路径和绝对路径
 - 紧凑的信息面板和操作日志
+- 按需重绘、带大小预算的预览 LRU 缓存，以及筛选/排序 lowercase 缓存，降低空闲和浏览时的开销
+- 可用 `TERSH_CLIPBOARD=off` 关闭 OSC52 终端剪贴板写入
 - 隐藏文件开关
 - `tersh --cluster` / `tersh --c` 多服务器健康状态面板，可查看本机、跳板机和远端服务器
 
@@ -566,6 +580,14 @@ alias tcd=tersh-cd
 ```
 
 之后运行 `tcd`，从 A 目录浏览到 B 目录并退出，回到终端后当前目录就是 B。这里必须通过 shell 函数实现，因为子进程不能直接修改父 shell 的当前目录。
+
+当终端不支持 OSC52，或者你不希望 Tersh 写入终端剪贴板时：
+
+```bash
+TERSH_CLIPBOARD=off tersh
+```
+
+复制辅助功能仍会更新 Tersh 内部复制状态，只是不向终端输出 OSC52 escape sequence。
 
 ## 快捷键
 

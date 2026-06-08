@@ -122,6 +122,28 @@ fn destructive_confirmation_shows_required_and_typed_text() {
 }
 
 #[test]
+fn copy_conflict_modal_shows_replace_and_skip_options() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let target_dir = tempfile::tempdir().unwrap();
+    std::fs::write(source_dir.path().join("copy.txt"), "new").unwrap();
+    std::fs::write(target_dir.path().join("copy.txt"), "old").unwrap();
+    let mut app = App::new(source_dir.path().to_path_buf()).unwrap();
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+    for ch in target_dir.path().to_string_lossy().chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+    }
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    let buffer = render_app(&app, 100, 30);
+
+    assert!(buffer.contains("CONFLICT"));
+    assert!(buffer.contains("conflicts: 1"));
+    assert!(buffer.contains("type replace"));
+    assert!(buffer.contains("type skip"));
+}
+
+#[test]
 fn workbench_operational_chrome_is_ascii() {
     let app = App::for_test();
 

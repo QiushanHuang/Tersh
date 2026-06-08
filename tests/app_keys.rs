@@ -445,6 +445,61 @@ fn yy_copies_file_and_p_pastes_into_current_directory() {
 }
 
 #[test]
+fn yy_paste_existing_target_replace_overwrites() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let target_dir = tempfile::tempdir().unwrap();
+    let source = source_dir.path().join("item.txt");
+    let target = target_dir.path().join("item.txt");
+    std::fs::write(&source, "new").unwrap();
+    std::fs::write(&target, "old").unwrap();
+    let mut app = App::new(source_dir.path().to_path_buf()).unwrap();
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    app.force_cwd_for_test(target_dir.path().to_path_buf());
+    app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+
+    assert_eq!(app.mode(), Mode::Conflict);
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "old");
+
+    for ch in "replace".chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+    }
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert_eq!(app.mode(), Mode::Normal);
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), "new");
+}
+
+#[test]
+fn yy_paste_existing_target_skip_preserves_existing() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let target_dir = tempfile::tempdir().unwrap();
+    let source = source_dir.path().join("item.txt");
+    let target = target_dir.path().join("item.txt");
+    std::fs::write(&source, "new").unwrap();
+    std::fs::write(&target, "old").unwrap();
+    let mut app = App::new(source_dir.path().to_path_buf()).unwrap();
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    app.force_cwd_for_test(target_dir.path().to_path_buf());
+    app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+
+    assert_eq!(app.mode(), Mode::Conflict);
+    for ch in "skip".chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+    }
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert_eq!(app.mode(), Mode::Normal);
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "old");
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), "new");
+    assert_eq!(app.copy_buffer_len(), 1);
+}
+
+#[test]
 fn x_cuts_file_and_p_moves_into_current_directory() {
     let source_dir = tempfile::tempdir().unwrap();
     let target_dir = tempfile::tempdir().unwrap();
@@ -487,4 +542,58 @@ fn copy_to_and_move_to_use_typed_destination_directory() {
     app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert!(!moving.exists());
     assert!(target_dir.path().join("move.txt").exists());
+}
+
+#[test]
+fn move_to_existing_target_skips_without_overwrite() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let target_dir = tempfile::tempdir().unwrap();
+    let source = source_dir.path().join("move.txt");
+    let target = target_dir.path().join("move.txt");
+    std::fs::write(&source, "new").unwrap();
+    std::fs::write(&target, "old").unwrap();
+    let mut app = App::new(source_dir.path().to_path_buf()).unwrap();
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+    for ch in target_dir.path().to_string_lossy().chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+    }
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert_eq!(app.mode(), Mode::Normal);
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "old");
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), "new");
+    assert_eq!(app.copy_buffer_len(), 0);
+}
+
+#[test]
+fn copy_to_existing_target_enters_conflict_mode_and_replace_overwrites() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let target_dir = tempfile::tempdir().unwrap();
+    std::fs::write(source_dir.path().join("copy.txt"), "new").unwrap();
+    std::fs::write(target_dir.path().join("copy.txt"), "old").unwrap();
+    let mut app = App::new(source_dir.path().to_path_buf()).unwrap();
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+    for ch in target_dir.path().to_string_lossy().chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+    }
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert_eq!(app.mode(), Mode::Conflict);
+    assert_eq!(
+        std::fs::read_to_string(target_dir.path().join("copy.txt")).unwrap(),
+        "old"
+    );
+
+    for ch in "replace".chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+    }
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert_eq!(app.mode(), Mode::Normal);
+    assert_eq!(
+        std::fs::read_to_string(target_dir.path().join("copy.txt")).unwrap(),
+        "new"
+    );
 }

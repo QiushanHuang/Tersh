@@ -62,7 +62,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
                 | Mode::CopyTo
                 | Mode::MoveTo
                 | Mode::ConfirmTrash
-                | Mode::ConfirmDelete => {
+                | Mode::ConfirmDelete
+                | Mode::Conflict => {
                     draw_input_modal(frame, command_overlay_rect(area, app.mode()), app)
                 }
                 Mode::Message | Mode::Normal | Mode::Preview | Mode::PreviewSearch => {}
@@ -479,6 +480,10 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         Mode::ConfirmDelete => {
             "delete | type delete | Enter confirm | Esc/^G cancel | ^C force".to_string()
         }
+        Mode::Conflict if compact => "conflict | replace/skip | ^G | ^C".to_string(),
+        Mode::Conflict => {
+            "conflict | type replace overwrite | type skip keep existing | Enter confirm | Esc/^G cancel | ^C force".to_string()
+        }
         Mode::Help => "help | q/?/Enter close | ^G close | ^C force".to_string(),
         Mode::Message => format!("{mode} | Esc/^G close | ^C force"),
     };
@@ -541,6 +546,7 @@ fn draw_input_modal(frame: &mut Frame, area: Rect, app: &App) {
         Mode::MoveTo => "Move selected/focused item(s) to directory",
         Mode::ConfirmTrash => "Move to .tersh-trash: type trash then Enter. Esc/Ctrl+G cancels.",
         Mode::ConfirmDelete => "Permanent delete: type delete then Enter. Esc/Ctrl+G cancels.",
+        Mode::Conflict => "Destination already exists",
         Mode::PreviewSearch => "Find in preview",
         _ => "",
     };
@@ -572,11 +578,30 @@ fn draw_input_modal(frame: &mut Frame, area: Rect, app: &App) {
             lines.push(Line::from(format!("{}. {}", index + 1, label)));
         }
     }
+    if app.mode() == Mode::Conflict {
+        lines.push(Line::from(format!("conflicts: {}", app.conflict_count())));
+        if let Some(destination) = app.conflict_destination() {
+            lines.push(Line::from(format!(
+                "destination: {}",
+                display_path(destination)
+            )));
+        }
+        lines.push(Line::from("type skip to keep existing targets"));
+        if app.conflict_allows_replace() {
+            lines.push(Line::from("type replace to overwrite existing targets"));
+        } else {
+            lines.push(Line::from("replace unavailable for move/cut operations"));
+        }
+        for (index, label) in app.conflict_target_labels(3).into_iter().enumerate() {
+            lines.push(Line::from(format!("{}. {}", index + 1, label)));
+        }
+    }
     lines.push(Line::from(""));
     lines.push(Line::from(escape_display(app.input())));
     let title = match app.mode() {
         Mode::ConfirmDelete => "DANGER",
         Mode::ConfirmTrash => "TRASH",
+        Mode::Conflict => "CONFLICT",
         _ => "Command",
     };
     let block = match app.mode() {
@@ -586,6 +611,10 @@ fn draw_input_modal(frame: &mut Frame, area: Rect, app: &App) {
             .border_style(Style::default().fg(Color::Red))
             .style(Style::default().fg(Color::Red)),
         Mode::ConfirmTrash => base_block()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow)),
+        Mode::Conflict => base_block()
             .title(title)
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Yellow)),
@@ -679,8 +708,10 @@ fn help_overlay_rect(area: Rect) -> Rect {
 }
 
 fn command_overlay_rect(area: Rect, mode: Mode) -> Rect {
-    if matches!(mode, Mode::ConfirmTrash | Mode::ConfirmDelete)
-        && (area.width < 60 || area.height < 14)
+    if matches!(
+        mode,
+        Mode::ConfirmTrash | Mode::ConfirmDelete | Mode::Conflict
+    ) && (area.width < 60 || area.height < 14)
     {
         area
     } else {

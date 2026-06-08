@@ -792,7 +792,7 @@ impl ClusterApp {
             .count()
     }
 
-    fn mark_timed_out_refreshes(&mut self) {
+    fn mark_timed_out_refreshes(&mut self) -> bool {
         let now = Instant::now();
         let timed_out_aliases = self
             .refresh_deadlines
@@ -800,6 +800,7 @@ impl ClusterApp {
             .filter(|(_, deadline)| now >= **deadline)
             .map(|(alias, _)| alias.clone())
             .collect::<Vec<_>>();
+        let changed = !timed_out_aliases.is_empty();
 
         for alias in timed_out_aliases {
             if let Some(active) = self.active_probes.get_mut(&alias) {
@@ -812,6 +813,7 @@ impl ClusterApp {
                 format!("probe timed out after {}s", PROBE_TIMEOUT.as_secs()),
             ));
         }
+        changed
     }
 
     fn has_host_alias(&self, alias: &str) -> bool {
@@ -907,37 +909,54 @@ pub fn run_with_inventory(inventory: ClusterInventory) -> Result<()> {
     let mut app = ClusterApp::from_inventory(inventory);
     let (tx, rx) = mpsc::channel();
     start_refresh_all(&mut app, tx.clone());
+    let mut dirty = true;
 
     while !app.should_quit() {
-        drain_snapshots(&mut app, &rx);
-        app.mark_timed_out_refreshes();
+        if drain_snapshots(&mut app, &rx) {
+            dirty = true;
+        }
+        if app.mark_timed_out_refreshes() {
+            dirty = true;
+        }
 
         if app.refresh_due(DEFAULT_REFRESH_INTERVAL) {
             start_refresh_all(&mut app, tx.clone());
+            dirty = true;
         }
 
-        terminal.draw(|frame| crate::cluster_ui::draw(frame, &app))?;
-        if event::poll(Duration::from_millis(100))?
-            && let Event::Key(key) = event::read()?
-        {
-            match app.handle_key(key) {
-                Some(ClusterCommand::RefreshAll) => start_refresh_all(&mut app, tx.clone()),
-                Some(ClusterCommand::RefreshSelected) => {
-                    start_refresh_selected(&mut app, tx.clone())
+        if dirty {
+            terminal.draw(|frame| crate::cluster_ui::draw(frame, &app))?;
+            dirty = false;
+        }
+        if event::poll(Duration::from_millis(100))? {
+            match event::read()? {
+                Event::Key(key) => {
+                    dirty = true;
+                    match app.handle_key(key) {
+                        Some(ClusterCommand::RefreshAll) => start_refresh_all(&mut app, tx.clone()),
+                        Some(ClusterCommand::RefreshSelected) => {
+                            start_refresh_selected(&mut app, tx.clone())
+                        }
+                        Some(ClusterCommand::OpenSession) => {
+                            terminal.show_cursor()?;
+                            open_selected_session(&mut app, &guard)?;
+                            terminal.clear()?;
+                            drain_snapshots(&mut app, &rx);
+                            start_refresh_selected(&mut app, tx.clone());
+                        }
+                        Some(ClusterCommand::OpenWorkbench) => {
+                            terminal.show_cursor()?;
+                            open_selected_workbench(&mut app, &guard)?;
+                            terminal.clear()?;
+                            drain_snapshots(&mut app, &rx);
+                            start_refresh_selected(&mut app, tx.clone());
+                        }
+                        _ => {}
+                    }
                 }
-                Some(ClusterCommand::OpenSession) => {
-                    terminal.show_cursor()?;
-                    open_selected_session(&mut app, &guard)?;
+                Event::Resize(_, _) => {
                     terminal.clear()?;
-                    drain_snapshots(&mut app, &rx);
-                    start_refresh_selected(&mut app, tx.clone());
-                }
-                Some(ClusterCommand::OpenWorkbench) => {
-                    terminal.show_cursor()?;
-                    open_selected_workbench(&mut app, &guard)?;
-                    terminal.clear()?;
-                    drain_snapshots(&mut app, &rx);
-                    start_refresh_selected(&mut app, tx.clone());
+                    dirty = true;
                 }
                 _ => {}
             }
@@ -946,10 +965,13 @@ pub fn run_with_inventory(inventory: ClusterInventory) -> Result<()> {
     Ok(())
 }
 
-fn drain_snapshots(app: &mut ClusterApp, rx: &mpsc::Receiver<ProbeSnapshot>) {
+fn drain_snapshots(app: &mut ClusterApp, rx: &mpsc::Receiver<ProbeSnapshot>) -> bool {
+    let mut changed = false;
     while let Ok(snapshot) = rx.try_recv() {
         app.apply_probe_snapshot(snapshot);
+        changed = true;
     }
+    changed
 }
 
 pub fn collect_host_snapshot(host: &HostConfig) -> HostSnapshot {
