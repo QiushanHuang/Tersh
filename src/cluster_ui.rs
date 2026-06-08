@@ -1,4 +1,7 @@
-use crate::cluster::{ClusterApp, ClusterMode, ConnectionState, HostKind, HostSnapshot};
+use crate::{
+    cluster::{ClusterApp, ClusterMode, ConnectionState, HostKind, HostSnapshot},
+    theme::{Theme, chip, footer_compact, footer_line},
+};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -22,6 +25,7 @@ const ASCII_BORDER: border::Set = border::Set {
 
 pub fn draw(frame: &mut Frame, app: &ClusterApp) {
     let area = frame.area();
+    let theme = Theme::current();
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -31,81 +35,78 @@ pub fn draw(frame: &mut Frame, app: &ClusterApp) {
         ])
         .split(area);
 
-    draw_header(frame, rows[0], app);
+    draw_header(frame, rows[0], app, theme);
     if app.mode() == ClusterMode::Detail {
-        draw_dashboard(frame, rows[1], app);
+        draw_dashboard(frame, rows[1], app, theme);
     } else {
-        draw_body(frame, rows[1], app);
+        draw_body(frame, rows[1], app, theme);
     }
-    draw_footer(frame, rows[2], app);
+    draw_footer(frame, rows[2], app, theme);
 
     if app.mode() == ClusterMode::Help {
-        draw_help(frame, centered_rect(70, 60, area));
+        draw_help(frame, centered_rect(70, 60, area), theme);
     }
 }
 
-fn draw_header(frame: &mut Frame, area: Rect, app: &ClusterApp) {
+fn draw_header(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
+    let palette = theme.palette();
     let lines = vec![Line::from(vec![
-        Span::styled(
-            "Cluster Status",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
+        Span::styled("Cluster Status", theme.fg_bold(palette.accent)),
         Span::raw("  "),
-        Span::styled(
-            format!("OK {}", app.online_count()),
-            Style::default().fg(Color::Green),
+        chip(
+            "OK",
+            app.online_count(),
+            theme.chip(palette.text, palette.ok),
         ),
-        Span::raw(" | "),
-        Span::styled(
-            format!("OLD {}", app.stale_count()),
-            Style::default().fg(Color::Yellow),
+        Span::raw(" "),
+        chip(
+            "OLD",
+            app.stale_count(),
+            theme.chip(palette.text, palette.warn),
         ),
-        Span::raw(" | "),
-        Span::styled(
-            format!("FAIL {}", app.offline_count()),
-            Style::default().fg(Color::Red),
+        Span::raw(" "),
+        chip(
+            "FAIL",
+            app.offline_count(),
+            theme.chip(palette.text, palette.danger),
         ),
-        Span::raw(" | "),
-        Span::styled(
-            format!("CHK {}/{}", app.checking_count(), app.hosts().len()),
-            Style::default().fg(Color::Cyan),
+        Span::raw(" "),
+        chip(
+            "CHK",
+            format!("{}/{}", app.checking_count(), app.hosts().len()),
+            theme.chip(palette.text, palette.accent),
         ),
         Span::raw(" | src "),
-        Span::styled(
-            ascii_safe(&app.inventory_label()),
-            Style::default().fg(Color::Gray),
-        ),
+        Span::styled(ascii_safe(&app.inventory_label()), theme.fg(palette.muted)),
     ])];
     let paragraph = Paragraph::new(lines).block(base_block().borders(Borders::ALL));
     frame.render_widget(paragraph, area);
 }
 
-fn draw_body(frame: &mut Frame, area: Rect, app: &ClusterApp) {
+fn draw_body(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
     if area.width >= 100 {
         let columns = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
             .split(area);
-        draw_hosts(frame, columns[0], app);
-        draw_dashboard(frame, columns[1], app);
+        draw_hosts(frame, columns[0], app, theme);
+        draw_dashboard(frame, columns[1], app, theme);
     } else if area.width >= 72 {
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
             .split(area);
-        draw_hosts(frame, rows[0], app);
-        draw_dashboard(frame, rows[1], app);
+        draw_hosts(frame, rows[0], app, theme);
+        draw_dashboard(frame, rows[1], app, theme);
     } else {
-        draw_hosts(frame, area, app);
+        draw_hosts(frame, area, app, theme);
     }
 }
 
-fn draw_hosts(frame: &mut Frame, area: Rect, app: &ClusterApp) {
+fn draw_hosts(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
     let mut lines = vec![Line::from(Span::styled(
         "state  alias           role     lat    mem   disk  address",
-        Style::default().fg(Color::Gray),
+        theme.fg(theme.palette().muted),
     ))];
     let capacity = area.height.saturating_sub(3) as usize;
     let start = visible_start(app.cursor(), app.hosts().len(), capacity);
@@ -142,12 +143,9 @@ fn draw_hosts(frame: &mut Frame, area: Rect, app: &ClusterApp) {
         );
         let row = truncate_to_width(&row, area.width.saturating_sub(2) as usize);
         let style = if index == app.cursor() {
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
+            theme.selected()
         } else {
-            state_style(state)
+            state_style(theme, state)
         };
         lines.push(Line::from(Span::styled(row, style)));
     }
@@ -161,9 +159,9 @@ fn draw_hosts(frame: &mut Frame, area: Rect, app: &ClusterApp) {
     frame.render_widget(paragraph, area);
 }
 
-fn draw_dashboard(frame: &mut Frame, area: Rect, app: &ClusterApp) {
+fn draw_dashboard(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
     if area.height < 14 {
-        draw_compact_dashboard(frame, area, app);
+        draw_compact_dashboard(frame, area, app, theme);
         return;
     }
 
@@ -172,38 +170,37 @@ fn draw_dashboard(frame: &mut Frame, area: Rect, app: &ClusterApp) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(route_height), Constraint::Min(5)])
         .split(area);
-    draw_route(frame, rows[0], app);
-    draw_detail_panel(frame, rows[1], app);
+    draw_route(frame, rows[0], app, theme);
+    draw_detail_panel(frame, rows[1], app, theme);
 }
 
-fn draw_compact_dashboard(frame: &mut Frame, area: Rect, app: &ClusterApp) {
+fn draw_compact_dashboard(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
     let mut lines = match app.selected_host() {
-        Some(host) => compact_route_lines(host),
+        Some(host) => compact_route_lines(host, theme),
         None => vec![Line::from("No cluster hosts available"), Line::from("")],
     };
-    lines.extend(compact_status_lines(app));
+    lines.extend(compact_status_lines(app, theme));
 
     let paragraph =
         Paragraph::new(lines).block(base_block().title("Route / Detail").borders(Borders::ALL));
     frame.render_widget(paragraph, area);
 }
 
-fn compact_route_lines(host: &crate::cluster::HostConfig) -> Vec<Line<'static>> {
+fn compact_route_lines(host: &crate::cluster::HostConfig, theme: Theme) -> Vec<Line<'static>> {
+    let palette = theme.palette();
     match host.kind() {
         HostKind::Local => vec![
             Line::from(Span::styled(
                 "Route: LOCAL ONLY",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
+                theme.fg_bold(palette.accent),
             )),
             Line::from(format!("Host: {}", ascii_safe(host.alias()))),
         ],
         HostKind::Jump => vec![
             Line::from(vec![
-                Span::styled("Route: LOCAL", Style::default().fg(Color::Cyan)),
+                Span::styled("Route: LOCAL", theme.fg(palette.accent)),
                 Span::raw(" => "),
-                Span::styled("JUMP", Style::default().fg(Color::Yellow)),
+                Span::styled("JUMP", theme.fg(palette.warn)),
             ]),
             Line::from(format!("Path: {}", ascii_safe(host.ssh_target()))),
         ],
@@ -211,11 +208,11 @@ fn compact_route_lines(host: &crate::cluster::HostConfig) -> Vec<Line<'static>> 
             if let Some(jump_target) = host.proxy_jump_target().or_else(|| host.proxy_jump()) {
                 vec![
                     Line::from(vec![
-                        Span::styled("Route: LOCAL", Style::default().fg(Color::Cyan)),
+                        Span::styled("Route: LOCAL", theme.fg(palette.accent)),
                         Span::raw(" => "),
-                        Span::styled("JUMP", Style::default().fg(Color::Yellow)),
+                        Span::styled("JUMP", theme.fg(palette.warn)),
                         Span::raw(" => "),
-                        Span::styled("SERVER", Style::default().fg(Color::Green)),
+                        Span::styled("SERVER", theme.fg(palette.ok)),
                     ]),
                     Line::from(format!(
                         "Path: {} => {}",
@@ -226,9 +223,9 @@ fn compact_route_lines(host: &crate::cluster::HostConfig) -> Vec<Line<'static>> 
             } else {
                 vec![
                     Line::from(vec![
-                        Span::styled("Route: LOCAL", Style::default().fg(Color::Cyan)),
+                        Span::styled("Route: LOCAL", theme.fg(palette.accent)),
                         Span::raw(" => "),
-                        Span::styled("SERVER", Style::default().fg(Color::Green)),
+                        Span::styled("SERVER", theme.fg(palette.ok)),
                     ]),
                     Line::from(format!("Path: {}", ascii_safe(host.ssh_target()))),
                 ]
@@ -237,7 +234,7 @@ fn compact_route_lines(host: &crate::cluster::HostConfig) -> Vec<Line<'static>> 
     }
 }
 
-fn compact_status_lines(app: &ClusterApp) -> Vec<Line<'static>> {
+fn compact_status_lines(app: &ClusterApp, theme: Theme) -> Vec<Line<'static>> {
     let Some(host) = app.selected_host() else {
         return vec![Line::from("Host: n/a")];
     };
@@ -272,16 +269,26 @@ fn compact_status_lines(app: &ClusterApp) -> Vec<Line<'static>> {
             "CPU load: {}",
             ascii_safe(report.cpu_load.as_deref().unwrap_or("unknown"))
         )),
-        resource_line("Memory", report.memory.as_deref(), MetricKind::Memory),
-        resource_line("Storage", report.storage.as_deref(), MetricKind::Storage),
-        resource_line("GPU", report.gpu.as_deref(), MetricKind::Gpu),
+        resource_line(
+            theme,
+            "Memory",
+            report.memory.as_deref(),
+            MetricKind::Memory,
+        ),
+        resource_line(
+            theme,
+            "Storage",
+            report.storage.as_deref(),
+            MetricKind::Storage,
+        ),
+        resource_line(theme, "GPU", report.gpu.as_deref(), MetricKind::Gpu),
         Line::from(format!("Log: {}", ascii_safe(latest_log))),
     ]
 }
 
-fn draw_route(frame: &mut Frame, area: Rect, app: &ClusterApp) {
+fn draw_route(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
     let paragraph = Paragraph::new(match app.selected_host() {
-        Some(host) => route_lines(host),
+        Some(host) => route_lines(host, theme),
         None => vec![Line::from("No route available")],
     })
     .block(base_block().title("Route").borders(Borders::ALL))
@@ -289,23 +296,19 @@ fn draw_route(frame: &mut Frame, area: Rect, app: &ClusterApp) {
     frame.render_widget(paragraph, area);
 }
 
-fn route_lines(host: &crate::cluster::HostConfig) -> Vec<Line<'static>> {
+fn route_lines(host: &crate::cluster::HostConfig, theme: Theme) -> Vec<Line<'static>> {
+    let palette = theme.palette();
     match host.kind() {
         HostKind::Local => vec![
-            Line::from(Span::styled(
-                "LOCAL ONLY",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )),
+            Line::from(Span::styled("LOCAL ONLY", theme.fg_bold(palette.accent))),
             Line::from(format!("local: {}", ascii_safe(host.alias()))),
             Line::from(format!("address: {}", ascii_safe(host.address()))),
         ],
         HostKind::Jump => vec![
             Line::from(vec![
-                Span::styled("LOCAL", Style::default().fg(Color::Cyan)),
+                Span::styled("LOCAL", theme.fg(palette.accent)),
                 Span::raw(" => "),
-                Span::styled("JUMP", Style::default().fg(Color::Yellow)),
+                Span::styled("JUMP", theme.fg(palette.warn)),
             ]),
             Line::from(format!("jump: {}", ascii_safe(host.ssh_target()))),
             Line::from(format!("command: ssh {}", ascii_safe(host.ssh_target()))),
@@ -314,11 +317,11 @@ fn route_lines(host: &crate::cluster::HostConfig) -> Vec<Line<'static>> {
             if let Some(jump_target) = host.proxy_jump_target().or_else(|| host.proxy_jump()) {
                 vec![
                     Line::from(vec![
-                        Span::styled("LOCAL", Style::default().fg(Color::Cyan)),
+                        Span::styled("LOCAL", theme.fg(palette.accent)),
                         Span::raw(" => "),
-                        Span::styled("JUMP", Style::default().fg(Color::Yellow)),
+                        Span::styled("JUMP", theme.fg(palette.warn)),
                         Span::raw(" => "),
-                        Span::styled("SERVER", Style::default().fg(Color::Green)),
+                        Span::styled("SERVER", theme.fg(palette.ok)),
                     ]),
                     Line::from(format!("jump: {}", ascii_safe(jump_target))),
                     Line::from(format!("server: {}", ascii_safe(host.ssh_target()))),
@@ -331,9 +334,9 @@ fn route_lines(host: &crate::cluster::HostConfig) -> Vec<Line<'static>> {
             } else {
                 vec![
                     Line::from(vec![
-                        Span::styled("LOCAL", Style::default().fg(Color::Cyan)),
+                        Span::styled("LOCAL", theme.fg(palette.accent)),
                         Span::raw(" => "),
-                        Span::styled("SERVER", Style::default().fg(Color::Green)),
+                        Span::styled("SERVER", theme.fg(palette.ok)),
                     ]),
                     Line::from(format!("server: {}", ascii_safe(host.ssh_target()))),
                     Line::from(format!("command: ssh {}", ascii_safe(host.ssh_target()))),
@@ -343,37 +346,33 @@ fn route_lines(host: &crate::cluster::HostConfig) -> Vec<Line<'static>> {
     }
 }
 
-fn draw_detail_panel(frame: &mut Frame, area: Rect, app: &ClusterApp) {
-    let lines = detail_lines(app, true);
+fn draw_detail_panel(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
+    let lines = detail_lines(app, true, theme);
     let paragraph = Paragraph::new(lines)
         .block(base_block().title("Detail").borders(Borders::ALL))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
 
-fn detail_lines(app: &ClusterApp, include_logs: bool) -> Vec<Line<'static>> {
+fn detail_lines(app: &ClusterApp, include_logs: bool, theme: Theme) -> Vec<Line<'static>> {
+    let palette = theme.palette();
     let Some(host) = app.selected_host() else {
         return vec![Line::from("No host selected")];
     };
     let snapshot = app.selected_snapshot();
     let mut lines = vec![Line::from(vec![
-        Span::styled(
-            ascii_safe(host.alias()),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(ascii_safe(host.alias()), theme.fg_bold(palette.path)),
         Span::raw(format!("  {}", host.kind().label())),
     ])];
     lines.push(Line::from(""));
 
     if let Some(snapshot) = snapshot {
-        push_snapshot_lines(&mut lines, snapshot);
+        push_snapshot_lines(&mut lines, snapshot, theme);
         if let Some(hint) = action_hint(snapshot) {
             lines.push(Line::from(Span::styled(
                 format!("Hint: {hint}"),
-                Style::default()
-                    .fg(hint_style(snapshot.connection))
+                theme
+                    .fg(hint_color(theme, snapshot.connection))
                     .add_modifier(Modifier::BOLD),
             )));
         }
@@ -381,17 +380,17 @@ fn detail_lines(app: &ClusterApp, include_logs: bool) -> Vec<Line<'static>> {
         lines.push(Line::from("Status: unknown"));
         lines.push(Line::from(Span::styled(
             "Hint: press Enter to refresh this host",
-            Style::default().fg(Color::Gray),
+            theme.fg(palette.muted),
         )));
     }
     if include_logs {
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "Log",
-            Style::default().fg(Color::Gray),
-        )));
+        lines.push(Line::from(Span::styled("Log", theme.fg(palette.muted))));
         for log in app.logs().iter().rev().take(4) {
-            lines.push(Line::from(ascii_safe(log)));
+            lines.push(Line::from(Span::styled(
+                ascii_safe(log),
+                cluster_log_style(theme, log),
+            )));
         }
     }
 
@@ -429,7 +428,8 @@ fn detail_lines(app: &ClusterApp, include_logs: bool) -> Vec<Line<'static>> {
     lines
 }
 
-fn push_snapshot_lines(lines: &mut Vec<Line<'static>>, snapshot: &HostSnapshot) {
+fn push_snapshot_lines(lines: &mut Vec<Line<'static>>, snapshot: &HostSnapshot, theme: Theme) {
+    let palette = theme.palette();
     let latency = snapshot
         .latency_ms
         .map(|value| format!("{value} ms"))
@@ -441,7 +441,7 @@ fn push_snapshot_lines(lines: &mut Vec<Line<'static>>, snapshot: &HostSnapshot) 
     if let Some(error) = &snapshot.error {
         lines.push(Line::from(Span::styled(
             format!("Error: {}", ascii_safe(error)),
-            Style::default().fg(Color::Red),
+            theme.fg(palette.danger),
         )));
         if snapshot.report.is_empty() {
             return;
@@ -449,20 +449,19 @@ fn push_snapshot_lines(lines: &mut Vec<Line<'static>>, snapshot: &HostSnapshot) 
     }
 
     let report = &snapshot.report;
-    lines.push(Line::from(Span::styled(
-        "Health",
-        Style::default().fg(Color::Gray),
-    )));
+    lines.push(Line::from(Span::styled("Health", theme.fg(palette.muted))));
     lines.push(Line::from(format!(
         "CPU load: {}",
         ascii_safe(report.cpu_load.as_deref().unwrap_or("unknown"))
     )));
     lines.push(resource_line(
+        theme,
         "Memory",
         report.memory.as_deref(),
         MetricKind::Memory,
     ));
     lines.push(resource_line(
+        theme,
         "Storage",
         report.storage.as_deref(),
         MetricKind::Storage,
@@ -471,11 +470,13 @@ fn push_snapshot_lines(lines: &mut Vec<Line<'static>>, snapshot: &HostSnapshot) 
         "Tasks: {}",
         ascii_safe(report.tasks.as_deref().unwrap_or("unknown"))
     )));
-    lines.push(resource_line("GPU", report.gpu.as_deref(), MetricKind::Gpu));
-    lines.push(Line::from(Span::styled(
-        "System",
-        Style::default().fg(Color::Gray),
-    )));
+    lines.push(resource_line(
+        theme,
+        "GPU",
+        report.gpu.as_deref(),
+        MetricKind::Gpu,
+    ));
+    lines.push(Line::from(Span::styled("System", theme.fg(palette.muted))));
     lines.push(Line::from(format!(
         "Hostname: {}",
         ascii_safe(report.hostname.as_deref().unwrap_or("unknown"))
@@ -497,7 +498,12 @@ enum MetricKind {
     Gpu,
 }
 
-fn resource_line(label: &'static str, value: Option<&str>, kind: MetricKind) -> Line<'static> {
+fn resource_line(
+    theme: Theme,
+    label: &'static str,
+    value: Option<&str>,
+    kind: MetricKind,
+) -> Line<'static> {
     let raw = value
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -520,8 +526,8 @@ fn resource_line(label: &'static str, value: Option<&str>, kind: MetricKind) -> 
         })
         .unwrap_or_else(|| " --".to_string());
     let style = bar_percent
-        .map(metric_style)
-        .unwrap_or_else(|| Style::default().fg(Color::Gray));
+        .map(|percent| metric_style(theme, percent))
+        .unwrap_or_else(|| theme.fg(theme.palette().muted));
 
     Line::from(vec![
         Span::raw(format!("{label}: ")),
@@ -576,16 +582,17 @@ fn clamp_percent(value: u16) -> u16 {
     value.min(100)
 }
 
-fn metric_style(percent: u16) -> Style {
+fn metric_style(theme: Theme, percent: u16) -> Style {
+    let palette = theme.palette();
     match clamp_percent(percent) {
-        0..=69 => Style::default().fg(Color::Green),
-        70..=89 => Style::default().fg(Color::Yellow),
-        _ => Style::default().fg(Color::Red),
+        0..=69 => theme.fg(palette.ok),
+        70..=89 => theme.fg(palette.warn),
+        _ => theme.fg(palette.danger),
     }
 }
 
-fn draw_footer(frame: &mut Frame, area: Rect, app: &ClusterApp) {
-    let compact = area.width < 64;
+fn draw_footer(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
+    let compact = footer_compact(area.width, 64);
     let text = match app.mode() {
         ClusterMode::Help if compact => "help | q/Esc | ^G | ^C",
         ClusterMode::Help => "help | q/?/Enter/Esc close | ^G close | ^C force",
@@ -598,6 +605,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &ClusterApp) {
             return render_footer(
                 frame,
                 area,
+                theme,
                 format!(
                     "next: {} | q quit | ? help | l detail | ^G | ^C",
                     cluster_next_action(app)
@@ -608,6 +616,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &ClusterApp) {
             return render_footer(
                 frame,
                 area,
+                theme,
                 format!(
                     "next: {} | q quit | ? help | ^G cancel | ^C force | r refresh | Enter refresh host | s shell/ssh | t tersh | l detail | j/k move | Home/End",
                     cluster_next_action(app)
@@ -615,13 +624,12 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &ClusterApp) {
             );
         }
     };
-    render_footer(frame, area, text.to_string());
+    render_footer(frame, area, theme, text.to_string());
 }
 
-fn render_footer(frame: &mut Frame, area: Rect, text: String) {
-    let paragraph = Paragraph::new(text)
-        .style(Style::default().fg(Color::Gray))
-        .block(base_block().borders(Borders::TOP));
+fn render_footer(frame: &mut Frame, area: Rect, theme: Theme, text: String) {
+    let paragraph =
+        Paragraph::new(footer_line(theme, &text)).block(base_block().borders(Borders::TOP));
     frame.render_widget(paragraph, area);
 }
 
@@ -648,18 +656,19 @@ fn action_hint(snapshot: &HostSnapshot) -> Option<&'static str> {
     }
 }
 
-fn hint_style(state: ConnectionState) -> Color {
+fn hint_color(theme: Theme, state: ConnectionState) -> Color {
+    let palette = theme.palette();
     match state {
         ConnectionState::AuthFailed | ConnectionState::Timeout | ConnectionState::Offline => {
-            Color::Red
+            palette.danger
         }
-        ConnectionState::Stale | ConnectionState::Checking => Color::Yellow,
-        ConnectionState::Unknown => Color::Gray,
-        ConnectionState::Online => Color::Green,
+        ConnectionState::Stale | ConnectionState::Checking => palette.warn,
+        ConnectionState::Unknown => palette.muted,
+        ConnectionState::Online => palette.ok,
     }
 }
 
-fn draw_help(frame: &mut Frame, area: Rect) {
+fn draw_help(frame: &mut Frame, area: Rect, theme: Theme) {
     frame.render_widget(Clear, area);
     let lines = vec![
         Line::from("Cluster Status"),
@@ -678,7 +687,12 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("  TERSH_SERVERS_JSON overrides the default servers.json path."),
     ];
     let paragraph = Paragraph::new(lines)
-        .block(base_block().title("Help").borders(Borders::ALL))
+        .block(
+            base_block()
+                .title("Help")
+                .borders(Borders::ALL)
+                .border_style(theme.fg(theme.palette().accent)),
+        )
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
@@ -695,19 +709,32 @@ fn state_short(state: ConnectionState) -> &'static str {
     }
 }
 
+fn cluster_log_style(theme: Theme, log: &str) -> Style {
+    let palette = theme.palette();
+    let lower = log.to_ascii_lowercase();
+    if lower.contains("auth") || lower.contains("error") || lower.contains("timeout") {
+        theme.fg(palette.danger)
+    } else if lower.contains("stale") || lower.contains("refresh") {
+        theme.fg(palette.warn)
+    } else {
+        theme.fg(palette.muted)
+    }
+}
+
 fn base_block() -> Block<'static> {
     Block::default().border_set(ASCII_BORDER)
 }
 
-fn state_style(state: ConnectionState) -> Style {
+fn state_style(theme: Theme, state: ConnectionState) -> Style {
+    let palette = theme.palette();
     match state {
-        ConnectionState::Online => Style::default().fg(Color::Green),
-        ConnectionState::Stale => Style::default().fg(Color::Yellow),
-        ConnectionState::Timeout => Style::default().fg(Color::Red),
-        ConnectionState::AuthFailed => Style::default().fg(Color::Red),
-        ConnectionState::Offline => Style::default().fg(Color::Red),
-        ConnectionState::Checking => Style::default().fg(Color::Yellow),
-        ConnectionState::Unknown => Style::default().fg(Color::Gray),
+        ConnectionState::Online => theme.fg(palette.ok),
+        ConnectionState::Stale => theme.fg(palette.warn),
+        ConnectionState::Timeout => theme.fg(palette.danger),
+        ConnectionState::AuthFailed => theme.fg(palette.danger),
+        ConnectionState::Offline => theme.fg(palette.danger),
+        ConnectionState::Checking => theme.fg(palette.warn),
+        ConnectionState::Unknown => theme.fg(palette.muted),
     }
 }
 

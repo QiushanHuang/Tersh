@@ -60,6 +60,7 @@ This matters when your working environment is:
 
 - Full-screen terminal file workbench
 - btop-inspired status header, sortable file list, and inspector panel
+- Shared btop-style theme system for workbench and cluster views, with optional contrast and no-color modes
 - Context-aware shortcut footer that recommends actions for the focused item, active selection, and copy/cut buffer
 - File rows mark cursor, selection, and copy/cut buffer state in one compact status prefix
 - Directory navigation with keyboard-first controls
@@ -75,6 +76,7 @@ This matters when your working environment is:
 - Compact info pane and operation log
 - Dirty-driven rendering, bounded preview LRU cache, and cached filter/sort keys for lighter idle and browsing performance
 - Optional `TERSH_CLIPBOARD=off` mode for terminals where OSC52 clipboard writes are unwanted
+- Optional `TERSH_THEME` and `TERSH_FOOTER` settings for high-contrast, no-color, or mobile-oriented terminals
 - Hidden file toggle
 - `tersh --cluster` / `tersh --c` multi-server health dashboard for local, jump, and remote hosts
 
@@ -238,6 +240,16 @@ TERSH_CLIPBOARD=off tersh
 ```
 
 Copy helpers still update Tersh's in-app copy state; they just skip writing OSC52 escape sequences to the terminal.
+
+Tune visual density and color for different devices:
+
+```bash
+TERSH_THEME=contrast tersh
+TERSH_THEME=mono TERSH_FOOTER=compact tersh
+TERSH_FOOTER=full tersh --cluster
+```
+
+`TERSH_THEME` accepts `btop`, `contrast`, or `mono`. `TERSH_COLOR=off` also selects no-color mode. `TERSH_FOOTER` accepts `auto`, `compact`, or `full`.
 
 ## Keybindings
 
@@ -410,6 +422,7 @@ MIT
 
 - 全屏终端文件工作台
 - 参考 btop 的状态栏、可排序文件列表和 Inspector 信息面板
+- workbench 与 cluster 共用 btop 风格主题系统，可切换高对比或无色模式
 - 根据当前文件、目录、选区和复制/剪切缓冲区自动推荐快捷键的底部提示栏
 - 文件行用紧凑前缀同时标记当前行、选中状态和复制/剪切缓冲区状态
 - 键盘优先的目录浏览
@@ -425,6 +438,7 @@ MIT
 - 紧凑的信息面板和操作日志
 - 按需重绘、带大小预算的预览 LRU 缓存，以及筛选/排序 lowercase 缓存，降低空闲和浏览时的开销
 - 可用 `TERSH_CLIPBOARD=off` 关闭 OSC52 终端剪贴板写入
+- 可用 `TERSH_THEME` 和 `TERSH_FOOTER` 适配高对比、无色或移动端紧凑终端
 - 隐藏文件开关
 - `tersh --cluster` / `tersh --c` 多服务器健康状态面板，可查看本机、跳板机和远端服务器
 
@@ -588,6 +602,16 @@ TERSH_CLIPBOARD=off tersh
 ```
 
 复制辅助功能仍会更新 Tersh 内部复制状态，只是不向终端输出 OSC52 escape sequence。
+
+针对不同终端设备调整视觉密度和配色：
+
+```bash
+TERSH_THEME=contrast tersh
+TERSH_THEME=mono TERSH_FOOTER=compact tersh
+TERSH_FOOTER=full tersh --cluster
+```
+
+`TERSH_THEME` 支持 `btop`、`contrast` 和 `mono`。`TERSH_COLOR=off` 也会启用无色模式。`TERSH_FOOTER` 支持 `auto`、`compact` 和 `full`。
 
 ## 快捷键
 

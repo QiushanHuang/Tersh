@@ -1,11 +1,12 @@
 use crate::{
     app::{App, Mode},
     fs_core::{FileKind, display_path, escape_display, format_size},
+    theme::{Theme, chip, footer_compact, footer_line},
 };
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     symbols::border,
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
@@ -25,6 +26,7 @@ const ASCII_BORDER: border::Set = border::Set {
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
+    let theme = Theme::current();
     match app.mode() {
         Mode::Preview | Mode::PreviewSearch => {
             let rows = Layout::default()
@@ -35,12 +37,12 @@ pub fn draw(frame: &mut Frame, app: &App) {
                     Constraint::Length(2),
                 ])
                 .split(area);
-            draw_header(frame, rows[0], app);
-            draw_fullscreen_preview(frame, rows[1], app);
+            draw_header(frame, rows[0], app, theme);
+            draw_fullscreen_preview(frame, rows[1], app, theme);
             if app.mode() == Mode::PreviewSearch {
-                draw_input_modal(frame, command_overlay_rect(area, app.mode()), app);
+                draw_input_modal(frame, command_overlay_rect(area, app.mode()), app, theme);
             }
-            draw_footer(frame, rows[2], app);
+            draw_footer(frame, rows[2], app, theme);
         }
         _ => {
             let rows = Layout::default()
@@ -51,11 +53,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
                     Constraint::Length(2),
                 ])
                 .split(area);
-            draw_header(frame, rows[0], app);
-            draw_body(frame, rows[1], app);
-            draw_footer(frame, rows[2], app);
+            draw_header(frame, rows[0], app, theme);
+            draw_body(frame, rows[1], app, theme);
+            draw_footer(frame, rows[2], app, theme);
             match app.mode() {
-                Mode::Help => draw_help(frame, help_overlay_rect(area)),
+                Mode::Help => draw_help(frame, help_overlay_rect(area), theme),
                 Mode::Filter
                 | Mode::Goto
                 | Mode::Rename
@@ -64,7 +66,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
                 | Mode::ConfirmTrash
                 | Mode::ConfirmDelete
                 | Mode::Conflict => {
-                    draw_input_modal(frame, command_overlay_rect(area, app.mode()), app)
+                    draw_input_modal(frame, command_overlay_rect(area, app.mode()), app, theme)
                 }
                 Mode::Message | Mode::Normal | Mode::Preview | Mode::PreviewSearch => {}
             }
@@ -72,11 +74,12 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
 }
 
-fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_header(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
     if area.width < 80 {
-        draw_compact_header(frame, area, app);
+        draw_compact_header(frame, area, app, theme);
         return;
     }
+    let palette = theme.palette();
     let hidden = if app.show_hidden() { "ON" } else { "OFF" };
     let filter = if app.filter().is_empty() {
         "-".to_string()
@@ -84,48 +87,47 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
         escape_display(app.filter())
     };
     let lines = vec![Line::from(vec![
-        Span::styled(
-            "Tersh",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+        Span::styled("Tersh", theme.fg_bold(palette.accent)),
+        Span::raw(" | "),
+        Span::styled(display_path(app.cwd()), theme.fg(palette.path)),
+        Span::raw(" | "),
+        chip(
+            "items",
+            app.entries().len(),
+            theme.chip(palette.text, palette.ok),
         ),
-        Span::raw(" | "),
-        Span::styled(display_path(app.cwd()), Style::default().fg(Color::Yellow)),
-        Span::raw(" | "),
-        Span::styled(
-            format!("items {}", app.entries().len()),
-            Style::default().fg(Color::Green),
-        ),
-        Span::raw(" | "),
-        Span::styled(
+        Span::raw(" "),
+        chip(
+            "sel",
             format!(
-                "sel {} {}",
+                "{} {}",
                 app.selected_len(),
                 format_size(app.selected_total_size())
             ),
-            Style::default().fg(Color::Magenta),
+            theme.chip(palette.text, palette.accent_alt),
         ),
-        Span::raw(" | "),
-        Span::styled(
-            format!("buf {}", app.copy_buffer_label()),
-            Style::default().fg(Color::Cyan),
+        Span::raw(" "),
+        chip(
+            "buf",
+            app.copy_buffer_label(),
+            theme.chip(palette.text, palette.accent),
         ),
-        Span::raw(" | "),
-        Span::raw(format!("hidden {hidden}")),
-        Span::raw(" | "),
-        Span::raw(format!("filter {filter}")),
-        Span::raw(" | "),
-        Span::styled(
-            format!("sort {}", app.sort_label()),
-            Style::default().fg(Color::Yellow),
+        Span::raw(" "),
+        chip("hidden", hidden, theme.chip(palette.text, palette.muted)),
+        Span::raw(" "),
+        chip("filter", filter, theme.chip(palette.text, palette.warn)),
+        Span::raw(" "),
+        chip(
+            "sort",
+            app.sort_label(),
+            theme.chip(palette.text, palette.path),
         ),
     ])];
     let paragraph = Paragraph::new(lines).block(base_block().borders(Borders::ALL));
     frame.render_widget(paragraph, area);
 }
 
-fn draw_compact_header(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_compact_header(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
     let filter = if app.filter().is_empty() { "-" } else { "*" };
     let text = format!(
         "Tersh | sel {} | buf {} | f {} | {}",
@@ -138,11 +140,12 @@ fn draw_compact_header(frame: &mut Frame, area: Rect, app: &App) {
         &text,
         area.width.saturating_sub(2) as usize,
     ))
+    .style(theme.fg(theme.palette().muted))
     .block(base_block().borders(Borders::ALL));
     frame.render_widget(paragraph, area);
 }
 
-fn draw_body(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_body(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
     if area.width >= 120 {
         let columns = Layout::default()
             .direction(Direction::Horizontal)
@@ -152,16 +155,16 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &App) {
                 Constraint::Percentage(18),
             ])
             .split(area);
-        draw_files(frame, columns[0], app);
-        draw_preview(frame, columns[1], app);
-        draw_info(frame, columns[2], app);
+        draw_files(frame, columns[0], app, theme);
+        draw_preview(frame, columns[1], app, theme);
+        draw_info(frame, columns[2], app, theme);
     } else if area.width >= 80 {
         let columns = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
             .split(area);
-        draw_files(frame, columns[0], app);
-        draw_preview(frame, columns[1], app);
+        draw_files(frame, columns[0], app, theme);
+        draw_preview(frame, columns[1], app, theme);
     } else {
         let rows = if area.height >= 7 && area.width >= 60 {
             Some(
@@ -174,18 +177,19 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &App) {
             None
         };
         if let Some(rows) = rows {
-            draw_files(frame, rows[0], app);
-            draw_compact_info(frame, rows[1], app);
+            draw_files(frame, rows[0], app, theme);
+            draw_compact_info(frame, rows[1], app, theme);
         } else {
-            draw_files(frame, area, app);
+            draw_files(frame, area, app, theme);
         }
     }
 }
 
-fn draw_files(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_files(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
+    let palette = theme.palette();
     let mut lines = vec![Line::from(Span::styled(
         "CSB K    PERM      SIZE NAME",
-        Style::default().fg(Color::Gray),
+        theme.fg(palette.muted),
     ))];
     if !app.filter().is_empty() {
         lines.push(Line::from(format!(
@@ -234,15 +238,12 @@ fn draw_files(frame: &mut Frame, area: Rect, app: &App) {
             suffix
         );
         if index == app.cursor() {
+            lines.push(Line::from(Span::styled(row, theme.selected())));
+        } else {
             lines.push(Line::from(Span::styled(
                 row,
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
+                file_row_style(theme, entry.kind, entry.readonly),
             )));
-        } else {
-            lines.push(Line::from(row));
         }
     }
     let title = if app.entries().is_empty() {
@@ -259,7 +260,8 @@ fn draw_files(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(paragraph, area);
 }
 
-fn draw_fullscreen_preview(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_fullscreen_preview(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
+    let palette = theme.palette();
     let lines = app.preview().lines.iter().collect::<Vec<_>>();
     let total_lines = lines.len();
     let view_lines = area.height.saturating_sub(4) as usize;
@@ -275,9 +277,7 @@ fn draw_fullscreen_preview(frame: &mut Frame, area: Rect, app: &App) {
     let mut rendered = Vec::new();
     rendered.push(Line::from(Span::styled(
         display_path(&app.preview().path),
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
+        theme.fg_bold(palette.path),
     )));
     let match_text = match active_match {
         Some(index) => format!("{}/{}", index + 1, matches.len()),
@@ -298,7 +298,7 @@ fn draw_fullscreen_preview(frame: &mut Frame, area: Rect, app: &App) {
     for (index, line) in lines.iter().enumerate().skip(offset).take(view_lines) {
         let mut style = Style::default();
         if !query.is_empty() && line.to_lowercase().contains(&query) {
-            style = style.fg(Color::Black).bg(Color::Yellow);
+            style = theme.chip(palette.selected_fg, palette.warn);
         }
         if index == active_line {
             style = style
@@ -355,10 +355,10 @@ fn compact_path(path: &std::path::Path, max_width: usize) -> String {
     truncate_display_width(&compact, max_width)
 }
 
-fn draw_preview(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_preview(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
     let mut lines = vec![Line::from(Span::styled(
         display_path(&app.preview().path),
-        Style::default().fg(Color::Yellow),
+        theme.fg(theme.palette().path),
     ))];
     lines.extend(app.preview().lines.iter().cloned().map(Line::from));
     let paragraph = Paragraph::new(lines)
@@ -367,12 +367,13 @@ fn draw_preview(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(paragraph, area);
 }
 
-fn draw_info(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_info(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
+    let palette = theme.palette();
     let focused = app.entries().get(app.cursor());
     let mut lines = Vec::new();
     lines.push(Line::from(Span::styled(
         "TARGET",
-        Style::default().fg(Color::Gray),
+        theme.fg_bold(palette.muted),
     )));
     if let Some(entry) = focused {
         lines.push(Line::from(format!("kind: {}", entry.kind_marker())));
@@ -394,14 +395,14 @@ fn draw_info(frame: &mut Frame, area: Rect, app: &App) {
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "BUFFER",
-        Style::default().fg(Color::Gray),
+        theme.fg_bold(palette.muted),
     )));
     lines.push(Line::from(app.copy_buffer_label()));
     lines.push(Line::from(format!("selected: {}", app.selected_len())));
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "SEARCH",
-        Style::default().fg(Color::Gray),
+        theme.fg_bold(palette.muted),
     )));
     lines.push(Line::from(format!(
         "filter: {}",
@@ -415,10 +416,13 @@ fn draw_info(frame: &mut Frame, area: Rect, app: &App) {
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "LOG",
-        Style::default().fg(Color::Gray),
+        theme.fg_bold(palette.muted),
     )));
     for log in app.logs().iter().rev().take(5) {
-        lines.push(Line::from(escape_display(log)));
+        lines.push(Line::from(Span::styled(
+            escape_display(log),
+            log_style(theme, log),
+        )));
     }
     let paragraph = Paragraph::new(lines)
         .block(base_block().title("Inspector").borders(Borders::ALL))
@@ -426,7 +430,7 @@ fn draw_info(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(paragraph, area);
 }
 
-fn draw_compact_info(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_compact_info(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
     let focused = app.entries().get(app.cursor());
     let target = focused
         .map(|entry| format!("{} {}", entry.kind_marker(), entry.name))
@@ -440,14 +444,14 @@ fn draw_compact_info(frame: &mut Frame, area: Rect, app: &App) {
         &text,
         area.width.saturating_sub(2) as usize,
     ))
-    .style(Style::default().fg(Color::Gray))
+    .style(theme.fg(theme.palette().muted))
     .block(base_block().title("Status").borders(Borders::ALL));
     frame.render_widget(paragraph, area);
 }
 
-fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_footer(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
     let mode = format!("{:?}", app.mode()).to_lowercase();
-    let compact = area.width < 60;
+    let compact = footer_compact(area.width, 60);
     let text = match app.mode() {
         Mode::Normal if app.pending_y() => {
             "y_ | y copy | f name | r rel | a abs | ^G cancel | ^C force".to_string()
@@ -487,13 +491,12 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         Mode::Help => "help | q/?/Enter close | ^G close | ^C force".to_string(),
         Mode::Message => format!("{mode} | Esc/^G close | ^C force"),
     };
-    let paragraph = Paragraph::new(text)
-        .style(Style::default().fg(Color::Gray))
-        .block(base_block().borders(Borders::TOP));
+    let paragraph =
+        Paragraph::new(footer_line(theme, &text)).block(base_block().borders(Borders::TOP));
     frame.render_widget(paragraph, area);
 }
 
-fn draw_help(frame: &mut Frame, area: Rect) {
+fn draw_help(frame: &mut Frame, area: Rect, theme: Theme) {
     frame.render_widget(Clear, area);
     let lines = if area.width < 60 || area.height < 14 {
         vec![
@@ -531,13 +534,19 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ]
     };
     let paragraph = Paragraph::new(lines)
-        .block(base_block().title("Help").borders(Borders::ALL))
+        .block(
+            base_block()
+                .title("Help")
+                .borders(Borders::ALL)
+                .border_style(theme.fg(theme.palette().accent)),
+        )
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
 
-fn draw_input_modal(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_input_modal(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
     frame.render_widget(Clear, area);
+    let palette = theme.palette();
     let prompt = match app.mode() {
         Mode::Filter => "Filter current directory",
         Mode::Goto => "Go to directory",
@@ -608,16 +617,16 @@ fn draw_input_modal(frame: &mut Frame, area: Rect, app: &App) {
         Mode::ConfirmDelete => base_block()
             .title(title)
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Red))
-            .style(Style::default().fg(Color::Red)),
+            .border_style(theme.border_danger())
+            .style(theme.danger()),
         Mode::ConfirmTrash => base_block()
             .title(title)
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Yellow)),
+            .border_style(theme.fg(palette.warn)),
         Mode::Conflict => base_block()
             .title(title)
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Yellow)),
+            .border_style(theme.fg(palette.warn)),
         _ => base_block().title(title).borders(Borders::ALL),
     };
     let paragraph = Paragraph::new(lines)
@@ -654,6 +663,31 @@ fn next_action(app: &App) -> &'static str {
         Some(FileKind::Symlink) => "Enter inspect link",
         Some(FileKind::Other) => "Space mark item",
         None => "r refresh",
+    }
+}
+
+fn file_row_style(theme: Theme, kind: crate::fs_core::FileKind, readonly: bool) -> Style {
+    let palette = theme.palette();
+    if readonly {
+        return theme.fg(palette.warn);
+    }
+    match kind {
+        crate::fs_core::FileKind::Directory => theme.fg(palette.accent),
+        crate::fs_core::FileKind::File => theme.fg(palette.text),
+        crate::fs_core::FileKind::Symlink => theme.fg(palette.accent_alt),
+        crate::fs_core::FileKind::Other => theme.fg(palette.muted),
+    }
+}
+
+fn log_style(theme: Theme, log: &str) -> Style {
+    let palette = theme.palette();
+    let lower = log.to_ascii_lowercase();
+    if lower.contains("error") || lower.contains("failed") || lower.contains("rejected") {
+        theme.fg(palette.danger)
+    } else if lower.contains("skipped") || lower.contains("conflict") {
+        theme.fg(palette.warn)
+    } else {
+        theme.fg(palette.muted)
     }
 }
 
