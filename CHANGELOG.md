@@ -6,7 +6,8 @@
 
 - Added copy-conflict handling for existing targets, with explicit `replace` or `skip` confirmation before overwriting.
 - Added `TERSH_CLIPBOARD=off` to disable OSC52 terminal clipboard writes while keeping in-app copy state and logs.
-- Added `TERSH_THEME=btop|contrast|mono` for color-rich, high-contrast, or no-color terminal rendering.
+- Added `TERSH_THEME=btop|aurora|contrast|mono` for color-rich, aurora, high-contrast, or no-color terminal rendering.
+- Added `TERSH_BORDER=ascii|rounded|thick` so Unicode-capable terminals can opt into rounded or heavier btop-style chrome while ASCII remains the remote-safe default.
 - Added `TERSH_FOOTER=auto|compact|full` so mobile or narrow-device users can force shortcut footer density.
 - Added `--cluster` as the clearer long-form entry for the read-only cluster health dashboard, while keeping `--c` as a compatibility alias.
 - Added context-aware workbench footer recommendations for focused directories, focused files, active selections, and copy/cut buffers.
@@ -19,6 +20,8 @@
 
 - Changed workbench and cluster event loops to dirty-driven rendering, reducing idle redraws while still repainting on input, resize, refresh, and probe updates.
 - Changed workbench and cluster chrome to share themed status chips, footer highlighting, selected-row styling, and warning/error emphasis.
+- Changed workbench and cluster rendering to use semantic panel-title, key/value, inactive, copy, cut, and search-match colors for stronger visual hierarchy without changing layout density.
+- Changed cluster resource bars to style filled and empty segments separately, making high-load metrics stand out while keeping ASCII bar characters for lightweight remote terminals.
 - Changed file preview caching from a single entry to a bounded LRU cache for faster adjacent-file navigation without retaining stale same-path previews.
 - Changed directory entries to cache lowercase names, reducing repeated allocation during filtering and sorting.
 - Changed file rows to show cursor, selection, and copy/cut buffer state in a fixed row marker so the active operation target is easier to scan.

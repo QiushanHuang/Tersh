@@ -1,28 +1,16 @@
 use crate::{
     app::{App, Mode},
     fs_core::{FileKind, display_path, escape_display, format_size},
-    theme::{Theme, chip, footer_compact, footer_line},
+    theme::{Theme, base_block, chip, footer_compact, footer_line, panel_title},
 };
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
-    symbols::border,
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{Borders, Clear, Paragraph, Wrap},
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-
-const ASCII_BORDER: border::Set = border::Set {
-    top_left: "+",
-    top_right: "+",
-    bottom_left: "+",
-    bottom_right: "+",
-    vertical_left: "|",
-    vertical_right: "|",
-    horizontal_top: "-",
-    horizontal_bottom: "-",
-};
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
@@ -87,7 +75,7 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
         escape_display(app.filter())
     };
     let lines = vec![Line::from(vec![
-        Span::styled("Tersh", theme.fg_bold(palette.accent)),
+        Span::styled("Tersh", theme.fg_bold(palette.panel_title)),
         Span::raw(" | "),
         Span::styled(display_path(app.cwd()), theme.fg(palette.path)),
         Span::raw(" | "),
@@ -189,13 +177,10 @@ fn draw_files(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
     let palette = theme.palette();
     let mut lines = vec![Line::from(Span::styled(
         "CSB K    PERM      SIZE NAME",
-        theme.fg(palette.muted),
+        theme.fg_bold(palette.key),
     ))];
     if !app.filter().is_empty() {
-        lines.push(Line::from(format!(
-            "filter: {}",
-            escape_display(app.filter())
-        )));
+        lines.push(kv_line(theme, "filter", escape_display(app.filter())));
     }
     let entry_capacity = area
         .height
@@ -242,7 +227,7 @@ fn draw_files(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
         } else {
             lines.push(Line::from(Span::styled(
                 row,
-                file_row_style(theme, entry.kind, entry.readonly),
+                file_row_style(theme, entry.kind, entry.readonly, buffer_mark),
             )));
         }
     }
@@ -256,7 +241,11 @@ fn draw_files(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
             app.sort_label()
         )
     };
-    let paragraph = Paragraph::new(lines).block(base_block().title(title).borders(Borders::ALL));
+    let paragraph = Paragraph::new(lines).block(
+        base_block()
+            .title(panel_title(theme, title))
+            .borders(Borders::ALL),
+    );
     frame.render_widget(paragraph, area);
 }
 
@@ -284,21 +273,31 @@ fn draw_fullscreen_preview(frame: &mut Frame, area: Rect, app: &App, theme: Them
         None if matches.is_empty() && app.preview_search_query().is_empty() => "-".to_string(),
         None => format!("0/{}", matches.len()),
     };
-    rendered.push(Line::from(format!(
-        "offset: {} / {} | match {match_text} | search: {}{}",
-        offset.saturating_add(1),
-        total_lines,
-        escape_display(app.preview_search_query()),
+    rendered.push(Line::from(vec![
+        Span::styled("offset: ", theme.fg(palette.key)),
+        Span::styled(
+            format!("{} / {}", offset.saturating_add(1), total_lines),
+            theme.fg(palette.value),
+        ),
+        Span::styled(" | ", theme.fg(palette.separator)),
+        Span::styled("match: ", theme.fg(palette.key)),
+        Span::styled(match_text, theme.fg(palette.value)),
+        Span::styled(" | ", theme.fg(palette.separator)),
+        Span::styled("search: ", theme.fg(palette.key)),
+        Span::styled(
+            escape_display(app.preview_search_query()),
+            theme.fg(palette.value),
+        ),
         if app.preview().truncated {
-            " | truncated"
+            Span::styled(" | truncated", theme.fg_bold(palette.warn))
         } else {
-            ""
+            Span::raw("")
         },
-    )));
+    ]));
     for (index, line) in lines.iter().enumerate().skip(offset).take(view_lines) {
         let mut style = Style::default();
         if !query.is_empty() && line.to_lowercase().contains(&query) {
-            style = theme.chip(palette.selected_fg, palette.warn);
+            style = theme.chip(palette.selected_fg, palette.search_match);
         }
         if index == active_line {
             style = style
@@ -309,7 +308,11 @@ fn draw_fullscreen_preview(frame: &mut Frame, area: Rect, app: &App, theme: Them
     }
 
     let paragraph = Paragraph::new(rendered)
-        .block(base_block().title("Preview").borders(Borders::ALL))
+        .block(
+            base_block()
+                .title(panel_title(theme, "Preview"))
+                .borders(Borders::ALL),
+        )
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
@@ -362,7 +365,11 @@ fn draw_preview(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
     ))];
     lines.extend(app.preview().lines.iter().cloned().map(Line::from));
     let paragraph = Paragraph::new(lines)
-        .block(base_block().title("Preview").borders(Borders::ALL))
+        .block(
+            base_block()
+                .title(panel_title(theme, "Preview"))
+                .borders(Borders::ALL),
+        )
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
@@ -371,53 +378,53 @@ fn draw_info(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
     let palette = theme.palette();
     let focused = app.entries().get(app.cursor());
     let mut lines = Vec::new();
-    lines.push(Line::from(Span::styled(
-        "TARGET",
-        theme.fg_bold(palette.muted),
-    )));
+    lines.push(section_line(theme, "TARGET"));
     if let Some(entry) = focused {
-        lines.push(Line::from(format!("kind: {}", entry.kind_marker())));
-        lines.push(Line::from(format!("size: {}", format_size(entry.size))));
-        lines.push(Line::from(format!(
-            "perm: {}",
+        lines.push(kv_line(theme, "kind", entry.kind_marker()));
+        lines.push(kv_line(theme, "size", format_size(entry.size)));
+        lines.push(kv_line(
+            theme,
+            "perm",
             if entry.readonly {
                 "readonly"
             } else {
                 "writable"
-            }
-        )));
+            },
+        ));
         if let Some(target) = &entry.symlink_target {
-            lines.push(Line::from(format!("-> {}", display_path(target))));
+            lines.push(Line::from(vec![
+                Span::styled("-> ", theme.fg(palette.key)),
+                Span::styled(display_path(target), theme.fg(palette.path)),
+            ]));
         }
     } else {
-        lines.push(Line::from("no item"));
+        lines.push(Line::from(Span::styled(
+            "no item",
+            theme.fg(palette.inactive),
+        )));
     }
     lines.push(Line::from(""));
+    lines.push(section_line(theme, "BUFFER"));
+    let buffer_label = app.copy_buffer_label();
     lines.push(Line::from(Span::styled(
-        "BUFFER",
-        theme.fg_bold(palette.muted),
+        buffer_label.clone(),
+        buffer_style(theme, &buffer_label),
     )));
-    lines.push(Line::from(app.copy_buffer_label()));
-    lines.push(Line::from(format!("selected: {}", app.selected_len())));
+    lines.push(kv_line(theme, "selected", app.selected_len().to_string()));
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "SEARCH",
-        theme.fg_bold(palette.muted),
-    )));
-    lines.push(Line::from(format!(
-        "filter: {}",
+    lines.push(section_line(theme, "SEARCH"));
+    lines.push(kv_line(
+        theme,
+        "filter",
         if app.filter().is_empty() {
             "-".to_string()
         } else {
             escape_display(app.filter())
-        }
-    )));
-    lines.push(Line::from(format!("sort: {}", app.sort_label())));
+        },
+    ));
+    lines.push(kv_line(theme, "sort", app.sort_label()));
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "LOG",
-        theme.fg_bold(palette.muted),
-    )));
+    lines.push(section_line(theme, "LOG"));
     for log in app.logs().iter().rev().take(5) {
         lines.push(Line::from(Span::styled(
             escape_display(log),
@@ -425,7 +432,11 @@ fn draw_info(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
         )));
     }
     let paragraph = Paragraph::new(lines)
-        .block(base_block().title("Inspector").borders(Borders::ALL))
+        .block(
+            base_block()
+                .title(panel_title(theme, "Inspector"))
+                .borders(Borders::ALL),
+        )
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
@@ -445,7 +456,11 @@ fn draw_compact_info(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
         area.width.saturating_sub(2) as usize,
     ))
     .style(theme.fg(theme.palette().muted))
-    .block(base_block().title("Status").borders(Borders::ALL));
+    .block(
+        base_block()
+            .title(panel_title(theme, "Status"))
+            .borders(Borders::ALL),
+    );
     frame.render_widget(paragraph, area);
 }
 
@@ -536,9 +551,9 @@ fn draw_help(frame: &mut Frame, area: Rect, theme: Theme) {
     let paragraph = Paragraph::new(lines)
         .block(
             base_block()
-                .title("Help")
+                .title(panel_title(theme, "Help"))
                 .borders(Borders::ALL)
-                .border_style(theme.fg(theme.palette().accent)),
+                .border_style(theme.fg(theme.palette().panel_title)),
         )
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
@@ -615,19 +630,21 @@ fn draw_input_modal(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
     };
     let block = match app.mode() {
         Mode::ConfirmDelete => base_block()
-            .title(title)
+            .title(panel_title(theme, title))
             .borders(Borders::ALL)
             .border_style(theme.border_danger())
             .style(theme.danger()),
         Mode::ConfirmTrash => base_block()
-            .title(title)
+            .title(panel_title(theme, title))
             .borders(Borders::ALL)
             .border_style(theme.fg(palette.warn)),
         Mode::Conflict => base_block()
-            .title(title)
+            .title(panel_title(theme, title))
             .borders(Borders::ALL)
             .border_style(theme.fg(palette.warn)),
-        _ => base_block().title(title).borders(Borders::ALL),
+        _ => base_block()
+            .title(panel_title(theme, title))
+            .borders(Borders::ALL),
     };
     let paragraph = Paragraph::new(lines)
         .block(block)
@@ -666,16 +683,53 @@ fn next_action(app: &App) -> &'static str {
     }
 }
 
-fn file_row_style(theme: Theme, kind: crate::fs_core::FileKind, readonly: bool) -> Style {
+fn section_line(theme: Theme, label: &'static str) -> Line<'static> {
+    Line::from(Span::styled(
+        label,
+        theme.fg_bold(theme.palette().panel_title),
+    ))
+}
+
+fn kv_line(theme: Theme, key: &'static str, value: impl Into<String>) -> Line<'static> {
     let palette = theme.palette();
+    Line::from(vec![
+        Span::styled(format!("{key}: "), theme.fg(palette.key)),
+        Span::styled(value.into(), theme.fg(palette.value)),
+    ])
+}
+
+fn buffer_style(theme: Theme, label: &str) -> Style {
+    let palette = theme.palette();
+    if label.starts_with("COPY") {
+        theme.fg_bold(palette.copy)
+    } else if label.starts_with("CUT") {
+        theme.fg_bold(palette.cut)
+    } else {
+        theme.fg(palette.inactive)
+    }
+}
+
+fn file_row_style(
+    theme: Theme,
+    kind: crate::fs_core::FileKind,
+    readonly: bool,
+    buffer_mark: &str,
+) -> Style {
+    let palette = theme.palette();
+    if buffer_mark == "C" {
+        return theme.fg_bold(palette.copy);
+    }
+    if buffer_mark == "X" {
+        return theme.fg_bold(palette.cut);
+    }
     if readonly {
         return theme.fg(palette.warn);
     }
     match kind {
         crate::fs_core::FileKind::Directory => theme.fg(palette.accent),
-        crate::fs_core::FileKind::File => theme.fg(palette.text),
+        crate::fs_core::FileKind::File => theme.fg(palette.value),
         crate::fs_core::FileKind::Symlink => theme.fg(palette.accent_alt),
-        crate::fs_core::FileKind::Other => theme.fg(palette.muted),
+        crate::fs_core::FileKind::Other => theme.fg(palette.inactive),
     }
 }
 
@@ -686,6 +740,13 @@ fn log_style(theme: Theme, log: &str) -> Style {
         theme.fg(palette.danger)
     } else if lower.contains("skipped") || lower.contains("conflict") {
         theme.fg(palette.warn)
+    } else if lower.contains("copied")
+        || lower.contains("moved")
+        || lower.contains("renamed")
+        || lower.contains("trashed")
+        || lower.contains("pasted")
+    {
+        theme.fg(palette.ok)
     } else {
         theme.fg(palette.muted)
     }
@@ -698,10 +759,6 @@ fn kind_icon(kind: crate::fs_core::FileKind) -> &'static str {
         crate::fs_core::FileKind::Symlink => "L",
         crate::fs_core::FileKind::Other => "O",
     }
-}
-
-fn base_block() -> Block<'static> {
-    Block::default().border_set(ASCII_BORDER)
 }
 
 fn visible_entry_start(cursor: usize, total_entries: usize, entry_capacity: usize) -> usize {
