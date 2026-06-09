@@ -10,15 +10,16 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs, io,
     path::{Path, PathBuf},
-    process::{Command as ProcessCommand, Stdio},
+    process::{Child, Command as ProcessCommand, Stdio},
     sync::mpsc,
     thread,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(6);
 const MAX_CONCURRENT_PROBES: usize = 16;
+const MAX_PROBE_OUTPUT_BYTES: u64 = 1024 * 1024;
 
 const PROBE_SCRIPT: &str = r#"
 printf 'hostname=%s\n' "$(hostname 2>/dev/null || echo unknown)"
@@ -129,53 +130,50 @@ impl ClusterInventory {
         let mut hosts = Vec::new();
 
         if let Some(main) = file.main_machine {
-            let alias = main.alias.unwrap_or_else(|| "local".to_string());
+            let alias = normalize_optional(main.alias).unwrap_or_else(|| "local".to_string());
             hosts.push(HostConfig {
-                address: main.tailscale_ip.unwrap_or_else(|| alias.clone()),
-                role: main.role.unwrap_or_else(|| "Codex host".to_string()),
+                address: normalize_optional(main.tailscale_ip).unwrap_or_else(|| alias.clone()),
+                role: normalize_optional(main.role).unwrap_or_else(|| "Codex host".to_string()),
                 ssh_target: alias.clone(),
                 alias,
                 kind: HostKind::Local,
                 user: None,
                 proxy_jump: None,
                 proxy_jump_target: None,
-                workdir: main.workdir,
+                workdir: normalize_optional(main.workdir),
             });
         }
 
         let mut proxy_targets = BTreeMap::new();
         if let Some(jump) = file.jump_host {
-            let alias = jump.alias.unwrap_or_else(|| "jump-host".to_string());
-            let user = jump.ssh_user;
-            let address = jump
-                .tailscale_ip
-                .or(jump.device_name)
+            let alias = normalize_optional(jump.alias).unwrap_or_else(|| "jump-host".to_string());
+            let user = normalize_optional(jump.ssh_user);
+            let address = normalize_optional(jump.tailscale_ip)
+                .or_else(|| normalize_optional(jump.device_name))
                 .unwrap_or_else(|| alias.clone());
             let ssh_target = connection_target(user.as_deref(), &address);
             proxy_targets.insert(alias.clone(), ssh_target.clone());
             hosts.push(HostConfig {
                 address,
-                role: jump.role.unwrap_or_else(|| "Network jump host".to_string()),
+                role: normalize_optional(jump.role)
+                    .unwrap_or_else(|| "Network jump host".to_string()),
                 ssh_target,
                 alias,
                 kind: HostKind::Jump,
                 user,
                 proxy_jump: None,
                 proxy_jump_target: None,
-                workdir: jump.workdir,
+                workdir: normalize_optional(jump.workdir),
             });
         }
 
         for server in file.servers.unwrap_or_default() {
-            let alias = server.alias.unwrap_or_else(|| {
-                server
-                    .campus_ip
-                    .clone()
-                    .unwrap_or_else(|| "server".to_string())
+            let alias = normalize_optional(server.alias).unwrap_or_else(|| {
+                normalize_optional(server.campus_ip.clone()).unwrap_or_else(|| "server".to_string())
             });
-            let user = server.ssh_user;
-            let address = server.campus_ip.unwrap_or_else(|| alias.clone());
-            let proxy_jump = server.proxy_jump;
+            let user = normalize_optional(server.ssh_user);
+            let address = normalize_optional(server.campus_ip).unwrap_or_else(|| alias.clone());
+            let proxy_jump = normalize_optional(server.proxy_jump);
             let proxy_jump_target = proxy_jump
                 .as_ref()
                 .and_then(|alias| proxy_targets.get(alias).cloned())
@@ -183,13 +181,14 @@ impl ClusterInventory {
             hosts.push(HostConfig {
                 ssh_target: connection_target(user.as_deref(), &address),
                 address,
-                role: server.role.unwrap_or_else(|| "Remote server".to_string()),
+                role: normalize_optional(server.role)
+                    .unwrap_or_else(|| "Remote server".to_string()),
                 alias,
                 kind: HostKind::Server,
                 user,
                 proxy_jump,
                 proxy_jump_target,
-                workdir: server.workdir,
+                workdir: normalize_optional(server.workdir),
             });
         }
 
@@ -238,6 +237,7 @@ impl ClusterInventory {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct InventoryFile {
     main_machine: Option<MainMachineRecord>,
     jump_host: Option<JumpHostRecord>,
@@ -245,6 +245,7 @@ struct InventoryFile {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MainMachineRecord {
     alias: Option<String>,
     tailscale_ip: Option<String>,
@@ -254,6 +255,7 @@ struct MainMachineRecord {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct JumpHostRecord {
     alias: Option<String>,
     device_name: Option<String>,
@@ -265,6 +267,7 @@ struct JumpHostRecord {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ServerRecord {
     alias: Option<String>,
     ssh_user: Option<String>,
@@ -358,6 +361,18 @@ pub struct HostSnapshot {
     pub latency_ms: Option<u128>,
     pub error: Option<String>,
     pub refreshed_at: Option<SystemTime>,
+}
+
+#[derive(Debug, Clone)]
+struct ProbeSnapshot {
+    token: u64,
+    snapshot: HostSnapshot,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ActiveProbe {
+    token: u64,
+    timed_out: bool,
 }
 
 impl HostSnapshot {
@@ -459,6 +474,8 @@ pub struct ClusterApp {
     hosts: Vec<HostConfig>,
     snapshots: BTreeMap<String, HostSnapshot>,
     last_good_reports: BTreeMap<String, ProbeReport>,
+    refresh_deadlines: BTreeMap<String, Instant>,
+    active_probes: BTreeMap<String, ActiveProbe>,
     cursor: usize,
     mode: ClusterMode,
     should_quit: bool,
@@ -467,6 +484,7 @@ pub struct ClusterApp {
     inventory_source: Option<PathBuf>,
     last_refresh_started: Option<Instant>,
     refresh_cursor: usize,
+    refresh_epoch: u64,
 }
 
 impl ClusterApp {
@@ -474,6 +492,8 @@ impl ClusterApp {
         if hosts.is_empty() {
             hosts.push(local_fallback_host());
         }
+        let mut seen = BTreeSet::new();
+        hosts.retain(|host| seen.insert(host.alias().to_string()));
         let snapshots = hosts
             .iter()
             .map(|host| {
@@ -487,6 +507,8 @@ impl ClusterApp {
             hosts,
             snapshots,
             last_good_reports: BTreeMap::new(),
+            refresh_deadlines: BTreeMap::new(),
+            active_probes: BTreeMap::new(),
             cursor: 0,
             mode: ClusterMode::Normal,
             should_quit: false,
@@ -495,6 +517,7 @@ impl ClusterApp {
             inventory_source: None,
             last_refresh_started: None,
             refresh_cursor: 0,
+            refresh_epoch: 0,
         }
     }
 
@@ -523,40 +546,69 @@ impl ClusterApp {
             ClusterCommand::ForceQuit => self.should_quit = true,
             ClusterCommand::RefreshAll => self.log("refresh requested"),
             ClusterCommand::RefreshSelected => {
-                let alias = self.selected_host().alias().to_string();
+                let alias = match self.selected_host() {
+                    Some(host) => host.alias().to_string(),
+                    None => return,
+                };
                 self.log(format!("refresh requested: {alias}"));
             }
             ClusterCommand::OpenSession => {
-                let alias = self.selected_host().alias().to_string();
+                let alias = match self.selected_host() {
+                    Some(host) => host.alias().to_string(),
+                    None => return,
+                };
                 self.log(format!("opening session: {alias}"));
             }
             ClusterCommand::OpenWorkbench => {
-                let alias = self.selected_host().alias().to_string();
+                let alias = match self.selected_host() {
+                    Some(host) => host.alias().to_string(),
+                    None => return,
+                };
                 self.log(format!("opening tersh: {alias}"));
             }
         }
     }
 
     pub fn begin_refresh(&mut self, aliases: &[String]) -> Vec<String> {
-        self.last_refresh_started = Some(Instant::now());
         let mut started = Vec::new();
-        if aliases.is_empty() || self.refreshing.len() >= MAX_CONCURRENT_PROBES {
+        let now = Instant::now();
+        if aliases.is_empty() {
+            self.log("no hosts to refresh");
+            return started;
+        }
+        if self.active_probes.len() >= MAX_CONCURRENT_PROBES {
+            self.last_refresh_started = Some(now);
             self.log("refresh already in progress");
             return started;
         }
-        let slots = MAX_CONCURRENT_PROBES.saturating_sub(self.refreshing.len());
+        let slots = MAX_CONCURRENT_PROBES.saturating_sub(self.active_probes.len());
         let start = self.refresh_cursor % aliases.len();
         let mut last_index = start;
+        let mut skipped_active = false;
         for offset in 0..aliases.len() {
             if started.len() >= slots {
                 break;
             }
             let index = (start + offset) % aliases.len();
             let alias = &aliases[index];
-            if self.refreshing.contains(alias) {
+            if !self.has_host_alias(alias) {
                 continue;
             }
+            if self.active_probes.contains_key(alias) {
+                skipped_active = true;
+                continue;
+            }
+            let token = self.next_refresh_token();
+            self.active_probes.insert(
+                alias.clone(),
+                ActiveProbe {
+                    token,
+                    timed_out: false,
+                },
+            );
             self.refreshing.insert(alias.clone());
+            self.refresh_deadlines
+                .insert(alias.clone(), now + PROBE_TIMEOUT);
             started.push(alias.clone());
             last_index = index;
             self.snapshots
@@ -566,15 +618,55 @@ impl ClusterApp {
             self.refresh_cursor = (last_index + 1) % aliases.len();
         }
         if started.is_empty() {
-            self.log("refresh already in progress");
+            if skipped_active {
+                self.last_refresh_started = Some(now);
+                self.log("refresh already in progress");
+            } else {
+                self.log("no eligible hosts to refresh");
+            }
         } else {
+            self.last_refresh_started = Some(now);
             self.log(format!("refreshing {} host(s)", started.len()));
         }
         started
     }
 
     pub fn apply_snapshot(&mut self, snapshot: HostSnapshot) {
+        if !self.has_host_alias(&snapshot.alias) {
+            return;
+        }
+        self.apply_snapshot_inner(snapshot);
+    }
+
+    #[doc(hidden)]
+    pub fn apply_completed_refresh_snapshot(&mut self, snapshot: HostSnapshot) {
+        if !self.has_host_alias(&snapshot.alias) {
+            return;
+        }
+        self.active_probes.remove(&snapshot.alias);
         self.refreshing.remove(&snapshot.alias);
+        self.refresh_deadlines.remove(&snapshot.alias);
+        self.apply_snapshot_inner(snapshot);
+    }
+
+    fn apply_probe_snapshot(&mut self, result: ProbeSnapshot) {
+        let alias = result.snapshot.alias.clone();
+        let Some(active) = self.active_probes.get(&alias).copied() else {
+            return;
+        };
+        if active.token != result.token {
+            return;
+        }
+        self.active_probes.remove(&alias);
+        self.refreshing.remove(&alias);
+        self.refresh_deadlines.remove(&alias);
+        if active.timed_out {
+            return;
+        }
+        self.apply_snapshot_inner(result.snapshot);
+    }
+
+    fn apply_snapshot_inner(&mut self, snapshot: HostSnapshot) {
         let alias = snapshot.alias.clone();
         let snapshot = self.merge_last_good_snapshot(snapshot);
         let state = snapshot.connection.label();
@@ -633,12 +725,13 @@ impl ClusterApp {
         self.cursor
     }
 
-    pub fn selected_host(&self) -> &HostConfig {
-        &self.hosts[self.cursor]
+    pub fn selected_host(&self) -> Option<&HostConfig> {
+        self.hosts.get(self.cursor)
     }
 
     pub fn selected_snapshot(&self) -> Option<&HostSnapshot> {
-        self.snapshots.get(self.selected_host().alias())
+        self.selected_host()
+            .and_then(|host| self.snapshots.get(host.alias()))
     }
 
     pub fn snapshot_for(&self, alias: &str) -> Option<&HostSnapshot> {
@@ -650,8 +743,7 @@ impl ClusterApp {
     }
 
     pub fn offline_count(&self) -> usize {
-        self.snapshots
-            .values()
+        self.host_snapshots()
             .filter(|snapshot| {
                 matches!(
                     snapshot.connection,
@@ -695,10 +787,57 @@ impl ClusterApp {
     }
 
     fn count_state(&self, state: ConnectionState) -> usize {
-        self.snapshots
-            .values()
+        self.host_snapshots()
             .filter(|snapshot| snapshot.connection == state)
             .count()
+    }
+
+    fn mark_timed_out_refreshes(&mut self) -> bool {
+        let now = Instant::now();
+        let timed_out_aliases = self
+            .refresh_deadlines
+            .iter()
+            .filter(|(_, deadline)| now >= **deadline)
+            .map(|(alias, _)| alias.clone())
+            .collect::<Vec<_>>();
+        let changed = !timed_out_aliases.is_empty();
+
+        for alias in timed_out_aliases {
+            if let Some(active) = self.active_probes.get_mut(&alias) {
+                active.timed_out = true;
+            }
+            self.refreshing.remove(&alias);
+            self.refresh_deadlines.remove(&alias);
+            self.apply_snapshot_inner(HostSnapshot::failed(
+                &alias,
+                format!("probe timed out after {}s", PROBE_TIMEOUT.as_secs()),
+            ));
+        }
+        changed
+    }
+
+    fn has_host_alias(&self, alias: &str) -> bool {
+        self.hosts.iter().any(|host| host.alias() == alias)
+    }
+
+    fn host_snapshots(&self) -> impl Iterator<Item = &HostSnapshot> {
+        self.hosts
+            .iter()
+            .filter_map(|host| self.snapshots.get(host.alias()))
+    }
+
+    fn next_refresh_token(&mut self) -> u64 {
+        self.refresh_epoch = self.refresh_epoch.wrapping_add(1).max(1);
+        self.refresh_epoch
+    }
+
+    fn refresh_token(&self, alias: &str) -> Option<u64> {
+        self.active_probes.get(alias).map(|probe| probe.token)
+    }
+
+    #[cfg(test)]
+    fn refresh_token_for_test(&self, alias: &str) -> Option<u64> {
+        self.refresh_token(alias)
     }
 
     fn merge_last_good_snapshot(&self, snapshot: HostSnapshot) -> HostSnapshot {
@@ -770,36 +909,54 @@ pub fn run_with_inventory(inventory: ClusterInventory) -> Result<()> {
     let mut app = ClusterApp::from_inventory(inventory);
     let (tx, rx) = mpsc::channel();
     start_refresh_all(&mut app, tx.clone());
+    let mut dirty = true;
 
     while !app.should_quit() {
-        drain_snapshots(&mut app, &rx);
+        if drain_snapshots(&mut app, &rx) {
+            dirty = true;
+        }
+        if app.mark_timed_out_refreshes() {
+            dirty = true;
+        }
 
         if app.refresh_due(DEFAULT_REFRESH_INTERVAL) {
             start_refresh_all(&mut app, tx.clone());
+            dirty = true;
         }
 
-        terminal.draw(|frame| crate::cluster_ui::draw(frame, &app))?;
-        if event::poll(Duration::from_millis(100))?
-            && let Event::Key(key) = event::read()?
-        {
-            match app.handle_key(key) {
-                Some(ClusterCommand::RefreshAll) => start_refresh_all(&mut app, tx.clone()),
-                Some(ClusterCommand::RefreshSelected) => {
-                    start_refresh_selected(&mut app, tx.clone())
+        if dirty {
+            terminal.draw(|frame| crate::cluster_ui::draw(frame, &app))?;
+            dirty = false;
+        }
+        if event::poll(Duration::from_millis(100))? {
+            match event::read()? {
+                Event::Key(key) => {
+                    dirty = true;
+                    match app.handle_key(key) {
+                        Some(ClusterCommand::RefreshAll) => start_refresh_all(&mut app, tx.clone()),
+                        Some(ClusterCommand::RefreshSelected) => {
+                            start_refresh_selected(&mut app, tx.clone())
+                        }
+                        Some(ClusterCommand::OpenSession) => {
+                            terminal.show_cursor()?;
+                            open_selected_session(&mut app, &guard)?;
+                            terminal.clear()?;
+                            drain_snapshots(&mut app, &rx);
+                            start_refresh_selected(&mut app, tx.clone());
+                        }
+                        Some(ClusterCommand::OpenWorkbench) => {
+                            terminal.show_cursor()?;
+                            open_selected_workbench(&mut app, &guard)?;
+                            terminal.clear()?;
+                            drain_snapshots(&mut app, &rx);
+                            start_refresh_selected(&mut app, tx.clone());
+                        }
+                        _ => {}
+                    }
                 }
-                Some(ClusterCommand::OpenSession) => {
-                    terminal.show_cursor()?;
-                    open_selected_session(&mut app, &guard)?;
+                Event::Resize(_, _) => {
                     terminal.clear()?;
-                    drain_snapshots(&mut app, &rx);
-                    start_refresh_selected(&mut app, tx.clone());
-                }
-                Some(ClusterCommand::OpenWorkbench) => {
-                    terminal.show_cursor()?;
-                    open_selected_workbench(&mut app, &guard)?;
-                    terminal.clear()?;
-                    drain_snapshots(&mut app, &rx);
-                    start_refresh_selected(&mut app, tx.clone());
+                    dirty = true;
                 }
                 _ => {}
             }
@@ -808,10 +965,13 @@ pub fn run_with_inventory(inventory: ClusterInventory) -> Result<()> {
     Ok(())
 }
 
-fn drain_snapshots(app: &mut ClusterApp, rx: &mpsc::Receiver<HostSnapshot>) {
+fn drain_snapshots(app: &mut ClusterApp, rx: &mpsc::Receiver<ProbeSnapshot>) -> bool {
+    let mut changed = false;
     while let Ok(snapshot) = rx.try_recv() {
-        app.apply_snapshot(snapshot);
+        app.apply_probe_snapshot(snapshot);
+        changed = true;
     }
+    changed
 }
 
 pub fn collect_host_snapshot(host: &HostConfig) -> HostSnapshot {
@@ -831,7 +991,7 @@ pub fn collect_host_snapshot(host: &HostConfig) -> HostSnapshot {
     }
 }
 
-fn start_refresh_all(app: &mut ClusterApp, tx: mpsc::Sender<HostSnapshot>) {
+fn start_refresh_all(app: &mut ClusterApp, tx: mpsc::Sender<ProbeSnapshot>) {
     let hosts = app.hosts().to_vec();
     let aliases = hosts
         .iter()
@@ -845,26 +1005,42 @@ fn start_refresh_all(app: &mut ClusterApp, tx: mpsc::Sender<HostSnapshot>) {
         if !started.contains(host.alias()) {
             continue;
         }
+        let Some(token) = app.refresh_token(host.alias()) else {
+            continue;
+        };
         let tx = tx.clone();
         thread::spawn(move || {
-            let _ = tx.send(collect_host_snapshot(&host));
+            let _ = tx.send(ProbeSnapshot {
+                token,
+                snapshot: collect_host_snapshot(&host),
+            });
         });
     }
 }
 
-fn start_refresh_selected(app: &mut ClusterApp, tx: mpsc::Sender<HostSnapshot>) {
-    let host = app.selected_host().clone();
+fn start_refresh_selected(app: &mut ClusterApp, tx: mpsc::Sender<ProbeSnapshot>) {
+    let Some(host) = app.selected_host().cloned() else {
+        return;
+    };
     if app.begin_refresh(&[host.alias().to_string()]).is_empty() {
         return;
     }
+    let Some(token) = app.refresh_token(host.alias()) else {
+        return;
+    };
     thread::spawn(move || {
-        let _ = tx.send(collect_host_snapshot(&host));
+        let _ = tx.send(ProbeSnapshot {
+            token,
+            snapshot: collect_host_snapshot(&host),
+        });
     });
 }
 
 fn run_local_probe() -> Result<String> {
-    let mut command = ProcessCommand::new("sh");
-    command.arg("-lc").arg(PROBE_SCRIPT);
+    let (program, mut args) = local_probe_shell();
+    let mut command = ProcessCommand::new(program);
+    command.args(args.drain(..));
+    command.arg(PROBE_SCRIPT);
     run_command_with_timeout(command, PROBE_TIMEOUT)
 }
 
@@ -884,7 +1060,7 @@ pub fn ssh_probe_args(host: &HostConfig) -> Vec<String> {
         "-o".to_string(),
         "ConnectionAttempts=1".to_string(),
         "-o".to_string(),
-        "StrictHostKeyChecking=accept-new".to_string(),
+        "StrictHostKeyChecking=yes".to_string(),
         "-o".to_string(),
         "ServerAliveInterval=2".to_string(),
         "-o".to_string(),
@@ -895,7 +1071,7 @@ pub fn ssh_probe_args(host: &HostConfig) -> Vec<String> {
         args.push(host.proxy_jump_target().unwrap_or(proxy_jump).to_string());
     }
     args.push(host.ssh_target().to_string());
-    args.push(format!("sh -lc {}", shell_quote(PROBE_SCRIPT)));
+    args.push(remote_probe_command(PROBE_SCRIPT));
     args
 }
 
@@ -985,7 +1161,9 @@ pub fn ssh_workbench_args(host: &HostConfig) -> Vec<String> {
 }
 
 fn open_selected_session(app: &mut ClusterApp, guard: &TerminalGuard) -> Result<()> {
-    let host = app.selected_host().clone();
+    let Some(host) = app.selected_host().cloned() else {
+        return Ok(());
+    };
     let local_shell = env::var("SHELL").ok();
     let command = host_session_command(&host, local_shell.as_deref());
 
@@ -999,7 +1177,9 @@ fn open_selected_session(app: &mut ClusterApp, guard: &TerminalGuard) -> Result<
 }
 
 fn open_selected_workbench(app: &mut ClusterApp, guard: &TerminalGuard) -> Result<()> {
-    let host = app.selected_host().clone();
+    let Some(host) = app.selected_host().cloned() else {
+        return Ok(());
+    };
     let current_tersh = current_tersh_program();
     let command = host_workbench_command(&host, &current_tersh);
 
@@ -1030,42 +1210,173 @@ fn current_tersh_program() -> String {
 }
 
 fn remote_workbench_command(workdir: Option<&str>) -> String {
-    let script = match workdir.map(str::trim).filter(|workdir| !workdir.is_empty()) {
-        Some(workdir) => format!("cd -- {} && exec tersh", shell_quote(workdir)),
-        None => "exec tersh".to_string(),
-    };
-    format!("sh -lc {}", shell_quote(&script))
+    let mut script = format!(
+        "if ! command -v tersh >/dev/null 2>&1; then printf '%s\\n' {} >&2; exit 127; fi",
+        shell_quote(
+            "tersh is not installed or not in PATH. Install: cargo install --git https://github.com/QiushanHuang/Tersh.git --tag v1.1.0 --bin tersh --force"
+        )
+    );
+    if let Some(workdir) = workdir.map(str::trim).filter(|workdir| !workdir.is_empty()) {
+        script.push_str(&format!(
+            "; cd -- {} || {{ printf '%s\\n' {} >&2; exit 1; }}",
+            shell_quote(workdir),
+            shell_quote(&format!("tersh workdir not found: {workdir}"))
+        ));
+    }
+    script.push_str("; exec tersh");
+    remote_probe_command(&script)
+}
+
+fn remote_probe_command(script: &str) -> String {
+    if cfg!(windows) {
+        format!("cmd /C \"{}\"", script.replace('"', "\\\""))
+    } else {
+        format!("sh -lc {}", shell_quote(script))
+    }
+}
+
+#[cfg(not(windows))]
+fn local_probe_shell() -> (&'static str, Vec<String>) {
+    ("sh", vec!["-lc".to_string()])
+}
+
+#[cfg(windows)]
+fn local_probe_shell() -> (&'static str, Vec<String>) {
+    ("cmd", vec!["/C".to_string()])
 }
 
 fn run_command_with_timeout(mut command: ProcessCommand, timeout: Duration) -> Result<String> {
+    let temp_files = TempProbeFiles::new();
+    let stdout = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .truncate(true)
+        .open(&temp_files.stdout)
+        .context("create temp stdout file")?;
+    let stderr = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .truncate(true)
+        .open(&temp_files.stderr)
+        .context("create temp stderr file")?;
+
+    configure_probe_command(&mut command);
+
     let mut child = command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
         .spawn()
         .context("start probe command")?;
     let started = Instant::now();
-
-    loop {
-        if child.try_wait()?.is_some() {
-            let output = child.wait_with_output()?;
-            if output.status.success() {
-                return Ok(String::from_utf8_lossy(&output.stdout).to_string());
-            }
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            if stderr.is_empty() {
-                anyhow::bail!("probe exited with {}", output.status);
-            }
-            anyhow::bail!("{stderr}");
+    let mut timed_out = false;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
         }
-
         if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait_with_output();
-            anyhow::bail!("probe timed out after {}s", timeout.as_secs());
+            timed_out = true;
+            terminate_probe_child(&mut child);
+            break child.wait().context("wait probe command after timeout")?;
         }
-
         thread::sleep(Duration::from_millis(50));
+    };
+
+    let stdout = read_lossy_limited(&temp_files.stdout, "stdout")?;
+    let stderr = read_lossy_limited(&temp_files.stderr, "stderr")?;
+
+    if timed_out {
+        let mut message = format!("probe timed out after {}s", timeout.as_secs());
+        let details = stderr.trim();
+        if !details.is_empty() {
+            message = format!("{message}: {details}");
+        }
+        anyhow::bail!(message);
     }
+
+    if status.success() {
+        return Ok(stdout);
+    }
+    let stderr = stderr.trim().to_string();
+    if stderr.is_empty() {
+        anyhow::bail!("probe exited with {}", status);
+    }
+    anyhow::bail!("{stderr}");
+}
+
+fn read_lossy_limited(path: &Path, stream: &str) -> Result<String> {
+    let metadata =
+        fs::metadata(path).with_context(|| format!("failed to inspect {}", path.display()))?;
+    if metadata.len() > MAX_PROBE_OUTPUT_BYTES {
+        anyhow::bail!(
+            "probe output too large: {stream} exceeded {} bytes",
+            MAX_PROBE_OUTPUT_BYTES
+        );
+    }
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+#[cfg(unix)]
+fn configure_probe_command(command: &mut ProcessCommand) {
+    use std::os::unix::process::CommandExt;
+
+    // Put each probe in its own process group so timeout cleanup reaches shell children too.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn configure_probe_command(_command: &mut ProcessCommand) {}
+
+#[cfg(unix)]
+fn terminate_probe_child(child: &mut Child) {
+    let pid = child.id() as libc::pid_t;
+    unsafe {
+        let _ = libc::killpg(pid, libc::SIGKILL);
+    }
+    let _ = child.kill();
+}
+
+#[cfg(not(unix))]
+fn terminate_probe_child(child: &mut Child) {
+    let _ = child.kill();
+}
+
+struct TempProbeFiles {
+    stdout: PathBuf,
+    stderr: PathBuf,
+}
+
+impl TempProbeFiles {
+    fn new() -> Self {
+        Self {
+            stdout: tempfile_path("tersh-probe-stdout"),
+            stderr: tempfile_path("tersh-probe-stderr"),
+        }
+    }
+}
+
+impl Drop for TempProbeFiles {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.stdout);
+        let _ = fs::remove_file(&self.stderr);
+    }
+}
+
+fn tempfile_path(prefix: &str) -> PathBuf {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|time| time.as_nanos())
+        .unwrap_or_default();
+    let pid = std::process::id();
+    std::env::temp_dir().join(format!("{prefix}-{pid}-{now}.log"))
 }
 
 fn key_to_command(key: KeyEvent) -> Option<ClusterCommand> {
@@ -1077,6 +1388,7 @@ fn key_to_command(key: KeyEvent) -> Option<ClusterCommand> {
         };
     }
     match key.code {
+        KeyCode::Esc => Some(ClusterCommand::Cancel),
         KeyCode::Char('j') | KeyCode::Down => Some(ClusterCommand::Down),
         KeyCode::Char('k') | KeyCode::Up => Some(ClusterCommand::Up),
         KeyCode::Home => Some(ClusterCommand::First),
@@ -1100,11 +1412,6 @@ fn default_inventory_candidates() -> Vec<PathBuf> {
     }
     if let Some(home) = home_dir() {
         paths.push(home.join(".config/tersh/servers.json"));
-        paths.push(
-            home.join(
-                "Desktop/Qiushan_Studio/7_Computer/codex-campus-server-access/ssh/servers.json",
-            ),
-        );
     }
     paths
 }
@@ -1128,10 +1435,17 @@ fn local_fallback_host() -> HostConfig {
 }
 
 fn connection_target(user: Option<&str>, address: &str) -> String {
+    let address = address.trim();
     match user {
         Some(user) if !user.trim().is_empty() => format!("{}@{}", user.trim(), address),
         _ => address.to_string(),
     }
+}
+
+fn normalize_optional(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn validate_hosts(hosts: &[HostConfig]) -> Result<()> {
@@ -1181,6 +1495,9 @@ fn validate_label(field: &'static str, value: &str) -> Result<()> {
 
 fn validate_ssh_field(field: &'static str, value: &str) -> Result<()> {
     validate_label(field, value)?;
+    if value.chars().any(char::is_whitespace) {
+        anyhow::bail!("{field} must not contain whitespace");
+    }
     if value.trim_start().starts_with('-') {
         anyhow::bail!("{field} must not start with '-'");
     }
@@ -1230,15 +1547,45 @@ impl TerminalGuard {
     fn suspend<T>(&self, action: impl FnOnce() -> T) -> Result<T> {
         execute!(io::stdout(), LeaveAlternateScreen).context("leave cluster status screen")?;
         if let Err(err) = disable_raw_mode() {
-            let _ = execute!(io::stdout(), EnterAlternateScreen);
+            if enable_raw_mode().is_ok() {
+                let _ = execute!(io::stdout(), EnterAlternateScreen);
+            }
             return Err(err.into());
         }
 
+        let mut resume = TerminalResume::new();
         let result = action();
 
-        execute!(io::stdout(), EnterAlternateScreen).context("restore cluster status screen")?;
-        enable_raw_mode().context("restore raw mode")?;
+        resume.restore()?;
         Ok(result)
+    }
+}
+
+struct TerminalResume {
+    restored: bool,
+}
+
+impl TerminalResume {
+    fn new() -> Self {
+        Self { restored: false }
+    }
+
+    fn restore(&mut self) -> Result<()> {
+        enable_raw_mode().context("restore raw mode")?;
+        if let Err(err) = execute!(io::stdout(), EnterAlternateScreen) {
+            let _ = disable_raw_mode();
+            return Err(err).context("restore cluster status screen");
+        }
+        self.restored = true;
+        Ok(())
+    }
+}
+
+impl Drop for TerminalResume {
+    fn drop(&mut self) {
+        if !self.restored && enable_raw_mode().is_ok() {
+            let _ = execute!(io::stdout(), EnterAlternateScreen);
+        }
     }
 }
 
@@ -1246,5 +1593,158 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
         let _ = execute!(io::stdout(), LeaveAlternateScreen);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{collections::BTreeSet, sync::Mutex};
+
+    static PROBE_TEMP_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn begin_refresh_empty_aliases_does_not_reset_refresh_timer() {
+        let mut app = ClusterApp::new(Vec::new());
+
+        assert!(app.refresh_due(Duration::from_secs(60)));
+        assert!(app.begin_refresh(&[]).is_empty());
+        assert!(app.refresh_due(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn timed_out_probe_result_does_not_overwrite_timeout_state() {
+        let mut app = ClusterApp::new(vec![test_host("school-star")]);
+        let aliases = vec!["school-star".to_string()];
+        assert_eq!(app.begin_refresh(&aliases), aliases);
+        let token = app.refresh_token_for_test("school-star").unwrap();
+        app.refresh_deadlines.insert(
+            "school-star".to_string(),
+            Instant::now() - Duration::from_secs(1),
+        );
+
+        app.mark_timed_out_refreshes();
+        app.apply_probe_snapshot(ProbeSnapshot {
+            token,
+            snapshot: HostSnapshot::online("school-star", ProbeReport::default(), 1),
+        });
+
+        assert_eq!(
+            app.snapshot_for("school-star").unwrap().connection,
+            ConnectionState::Timeout
+        );
+        assert_eq!(app.begin_refresh(&aliases), aliases);
+    }
+
+    #[test]
+    fn timed_out_active_probe_retry_is_throttled_when_no_host_is_eligible() {
+        let mut app = ClusterApp::new(vec![test_host("school-star")]);
+        let aliases = vec!["school-star".to_string()];
+        assert_eq!(app.begin_refresh(&aliases), aliases);
+        app.refresh_deadlines.insert(
+            "school-star".to_string(),
+            Instant::now() - Duration::from_secs(1),
+        );
+        app.last_refresh_started = Some(Instant::now() - Duration::from_secs(120));
+
+        app.mark_timed_out_refreshes();
+        assert!(app.refresh_due(Duration::from_secs(60)));
+        assert!(app.begin_refresh(&aliases).is_empty());
+
+        assert!(!app.refresh_due(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn external_snapshot_does_not_clear_active_refresh_accounting() {
+        let mut app = ClusterApp::new(vec![test_host("school-star")]);
+        let aliases = vec!["school-star".to_string()];
+        assert_eq!(app.begin_refresh(&aliases), aliases);
+
+        app.apply_snapshot(HostSnapshot::offline("school-star", "manual update"));
+
+        assert!(app.begin_refresh(&aliases).is_empty());
+    }
+
+    #[test]
+    fn cluster_app_deduplicates_constructor_hosts() {
+        let app = ClusterApp::new(vec![test_host("dup"), test_host("dup")]);
+
+        assert_eq!(app.hosts().len(), 1);
+        assert!(app.snapshot_for("dup").is_some());
+    }
+
+    #[test]
+    fn failed_probe_spawn_cleans_temp_files() {
+        let _guard = PROBE_TEMP_LOCK.lock().unwrap();
+        let before = probe_temp_files();
+        let command = ProcessCommand::new("__tersh_missing_probe_binary__");
+
+        let result = run_command_with_timeout(command, Duration::from_millis(1));
+
+        assert!(result.is_err());
+        let after = probe_temp_files();
+        assert_eq!(after.difference(&before).count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_failure_preserves_non_utf8_stderr_lossily() {
+        let _guard = PROBE_TEMP_LOCK.lock().unwrap();
+        let mut command = ProcessCommand::new("sh");
+        command.args(["-c", "printf '\\377' >&2; exit 2"]);
+
+        let err = run_command_with_timeout(command, Duration::from_secs(1)).unwrap_err();
+
+        assert!(err.to_string().contains('\u{fffd}'));
+        assert!(!err.to_string().contains("failed to read"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_output_over_limit_is_rejected() {
+        let _guard = PROBE_TEMP_LOCK.lock().unwrap();
+        let mut command = ProcessCommand::new("sh");
+        command.args([
+            "-c",
+            "dd if=/dev/zero bs=1024 count=1100 2>/dev/null | tr '\\0' x",
+        ]);
+
+        let err = run_command_with_timeout(command, Duration::from_secs(2)).unwrap_err();
+
+        assert!(err.to_string().contains("probe output too large"));
+    }
+
+    fn probe_temp_files() -> BTreeSet<PathBuf> {
+        let pid = std::process::id();
+        let prefixes = [
+            format!("tersh-probe-stdout-{pid}-"),
+            format!("tersh-probe-stderr-{pid}-"),
+        ];
+        fs::read_dir(std::env::temp_dir())
+            .into_iter()
+            .flatten()
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .map(|name| prefixes.iter().any(|prefix| name.starts_with(prefix)))
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
+    fn test_host(alias: &str) -> HostConfig {
+        HostConfig {
+            alias: alias.to_string(),
+            kind: HostKind::Server,
+            address: "203.0.113.10".to_string(),
+            user: Some("ops".to_string()),
+            role: "Remote server".to_string(),
+            proxy_jump: None,
+            proxy_jump_target: None,
+            ssh_target: "ops@203.0.113.10".to_string(),
+            workdir: None,
+        }
     }
 }

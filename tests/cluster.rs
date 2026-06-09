@@ -121,7 +121,7 @@ fn ssh_probe_args_are_non_interactive_and_use_configured_proxy_jump() {
     );
     assert!(
         args.windows(2)
-            .any(|pair| pair == ["-o", "StrictHostKeyChecking=accept-new"])
+            .any(|pair| pair == ["-o", "StrictHostKeyChecking=yes"])
     );
     assert!(args.iter().any(|arg| arg == "star@10.13.7.138"));
 }
@@ -197,6 +197,8 @@ fn host_workbench_command_opens_local_or_remote_tersh() {
             .any(|pair| pair == ["-J", "joshua@100.90.116.54"])
     );
     assert!(args.iter().any(|arg| arg == "star@10.13.7.138"));
+    assert!(args.last().unwrap().contains("command -v tersh"));
+    assert!(args.last().unwrap().contains("tersh is not installed"));
     assert!(args.last().unwrap().contains("exec tersh"));
     assert!(args.last().unwrap().contains("/srv/star"));
     assert!(!args.windows(2).any(|pair| pair == ["-o", "BatchMode=yes"]));
@@ -287,7 +289,7 @@ fn cluster_app_tracks_selection_updates_and_summary_counts() {
 
     app.apply(ClusterCommand::Down);
     app.apply(ClusterCommand::Down);
-    assert_eq!(app.selected_host().alias(), "school-star");
+    assert_eq!(app.selected_host().unwrap().alias(), "school-star");
 
     app.apply_snapshot(HostSnapshot::online(
         "school-star",
@@ -321,7 +323,7 @@ fn cluster_app_keeps_last_good_metrics_when_refresh_fails() {
 
     let aliases = vec!["school-star".to_string()];
     assert_eq!(app.begin_refresh(&aliases), aliases);
-    app.apply_snapshot(HostSnapshot::offline(
+    app.apply_completed_refresh_snapshot(HostSnapshot::offline(
         "school-star",
         "probe timed out after 6s",
     ));
@@ -346,7 +348,7 @@ fn cluster_app_ignores_duplicate_refresh_for_in_flight_host() {
 
 #[test]
 fn begin_refresh_caps_concurrent_hosts() {
-    let inventory = ClusterInventory::from_json(CAMPUS_JSON).unwrap();
+    let inventory = ClusterInventory::from_json(&many_hosts_json(40)).unwrap();
     let mut app = ClusterApp::new(inventory.hosts().to_vec());
     let aliases = (0..40)
         .map(|index| format!("host-{index:02}"))
@@ -359,7 +361,7 @@ fn begin_refresh_caps_concurrent_hosts() {
 
 #[test]
 fn begin_refresh_rotates_after_capped_batch_completes() {
-    let inventory = ClusterInventory::from_json(CAMPUS_JSON).unwrap();
+    let inventory = ClusterInventory::from_json(&many_hosts_json(40)).unwrap();
     let mut app = ClusterApp::new(inventory.hosts().to_vec());
     let aliases = (0..40)
         .map(|index| format!("host-{index:02}"))
@@ -367,12 +369,25 @@ fn begin_refresh_rotates_after_capped_batch_completes() {
 
     let first = app.begin_refresh(&aliases);
     for alias in first {
-        app.apply_snapshot(HostSnapshot::offline(alias, "offline"));
+        app.apply_completed_refresh_snapshot(HostSnapshot::offline(alias, "offline"));
     }
     let second = app.begin_refresh(&aliases);
 
     assert!(second.iter().any(|alias| alias == "host-16"));
     assert!(!second.iter().any(|alias| alias == "host-00"));
+}
+
+#[test]
+fn begin_refresh_ignores_unknown_aliases_without_polluting_counts() {
+    let inventory = ClusterInventory::from_json(CAMPUS_JSON).unwrap();
+    let mut app = ClusterApp::new(inventory.hosts().to_vec());
+
+    let started = app.begin_refresh(&["missing-host".to_string()]);
+
+    assert!(started.is_empty());
+    assert!(app.snapshot_for("missing-host").is_none());
+    assert_eq!(app.checking_count(), 0);
+    assert_eq!(app.offline_count(), 0);
 }
 
 #[test]
@@ -419,6 +434,21 @@ fn inventory_rejects_option_like_address_fields() {
     let err = ClusterInventory::from_json(json).unwrap_err();
 
     assert!(err.to_string().contains("address"));
+}
+
+#[test]
+fn inventory_rejects_whitespace_in_ssh_fields() {
+    let json = r#"
+{
+  "servers": [
+    { "alias": "bad", "ssh_user": "ops team", "campus_ip": "203.0.113.10" }
+  ]
+}
+"#;
+
+    let err = ClusterInventory::from_json(json).unwrap_err();
+
+    assert!(err.to_string().contains("ssh_user"));
 }
 
 #[test]
@@ -471,6 +501,48 @@ fn inventory_rejects_unresolved_proxy_jump() {
 }
 
 #[test]
+fn inventory_rejects_unknown_json_fields() {
+    let json = r#"
+{
+  "servers": [
+    { "alias": "server", "ssh_usr": "ops", "campus_ip": "203.0.113.10" }
+  ]
+}
+"#;
+
+    let err = ClusterInventory::from_json(json).unwrap_err();
+
+    assert!(err.to_string().contains("parse servers.json"));
+}
+
+#[test]
+fn inventory_trims_stored_connection_and_display_fields() {
+    let json = r#"
+{
+  "servers": [
+    {
+      "alias": " server ",
+      "ssh_user": " ops ",
+      "campus_ip": " 203.0.113.10 ",
+      "role": " Remote server ",
+      "workdir": " /srv/app "
+    }
+  ]
+}
+"#;
+
+    let inventory = ClusterInventory::from_json(json).unwrap();
+    let host = &inventory.hosts()[0];
+
+    assert_eq!(host.alias(), "server");
+    assert_eq!(host.address(), "203.0.113.10");
+    assert_eq!(host.user(), Some("ops"));
+    assert_eq!(host.role(), "Remote server");
+    assert_eq!(host.workdir(), Some("/srv/app"));
+    assert_eq!(host.ssh_target(), "ops@203.0.113.10");
+}
+
+#[test]
 fn cluster_render_shows_host_list_detail_metrics_and_footer_keys() {
     let inventory = ClusterInventory::from_json(CAMPUS_JSON).unwrap();
     let mut app = ClusterApp::new(inventory.hosts().to_vec());
@@ -498,6 +570,10 @@ fn cluster_render_shows_host_list_detail_metrics_and_footer_keys() {
         .map(|cell| cell.symbol())
         .collect::<String>();
     assert!(buffer.contains("Cluster Status"));
+    assert!(buffer.contains("OK 1"));
+    assert!(buffer.contains("OLD 0"));
+    assert!(buffer.contains("FAIL 0"));
+    assert!(buffer.contains("CHK 0/4"));
     assert!(buffer.contains("Route"));
     assert!(buffer.contains("LOCAL"));
     assert!(buffer.contains("JUMP"));
@@ -505,6 +581,8 @@ fn cluster_render_shows_host_list_detail_metrics_and_footer_keys() {
     assert!(buffer.contains("ssh -J"));
     assert!(buffer.contains("joshua@100.90.116.54"));
     assert!(buffer.contains("school-star"));
+    assert!(buffer.contains("87ms"));
+    assert!(buffer.contains("50%"));
     assert!(buffer.contains("CPU load"));
     assert!(buffer.contains("CPU load: 0.12 0.20 0.30"));
     assert!(!buffer.contains("CPU load: ["));
@@ -516,11 +594,40 @@ fn cluster_render_shows_host_list_detail_metrics_and_footer_keys() {
     assert!(buffer.contains("8G/20G 40% used"));
     assert!(buffer.contains("Tasks"));
     assert!(buffer.contains("GPU: ["));
+    assert!(buffer.contains("Health"));
+    assert!(buffer.contains("System"));
     assert!(buffer.contains("Log"));
     assert!(buffer.contains("r refresh"));
     assert!(buffer.contains("s shell/ssh"));
     assert!(buffer.contains("t tersh"));
     assert!(buffer.contains("q quit"));
+}
+
+fn many_hosts_json(count: usize) -> String {
+    let servers = (0..count)
+        .map(|index| {
+            format!(
+                r#"{{ "alias": "host-{index:02}", "ssh_user": "ops", "campus_ip": "203.0.113.{index}" }}"#
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",\n");
+    format!(r#"{{ "servers": [ {servers} ] }}"#)
+}
+
+#[test]
+fn cluster_escape_closes_detail_view() {
+    let inventory = ClusterInventory::from_json(CAMPUS_JSON).unwrap();
+    let mut app = ClusterApp::new(inventory.hosts().to_vec());
+    app.apply(ClusterCommand::OpenDetail);
+
+    let command = app.handle_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Esc,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+
+    assert_eq!(command, None);
+    assert_eq!(app.mode(), tersh::cluster::ClusterMode::Normal);
 }
 
 #[test]
@@ -543,8 +650,158 @@ fn cluster_render_tiny_keeps_exit_visible() {
         .collect::<String>();
     assert!(buffer.contains("q quit"));
     assert!(buffer.contains("? help"));
+    assert!(buffer.contains("l detail"));
     assert!(buffer.contains("^G"));
     assert!(buffer.contains("^C"));
+}
+
+#[test]
+fn cluster_render_long_host_rows_stay_single_line() {
+    let json = r#"
+{
+  "servers": [
+    {
+      "alias": "very-long-host-alias-for-rendering",
+      "ssh_user": "ops",
+      "campus_ip": "203.0.113.12345678901234567890",
+      "role": "Long address test"
+    },
+    {
+      "alias": "second-host",
+      "ssh_user": "ops",
+      "campus_ip": "203.0.113.20",
+      "role": "Visible after long row"
+    }
+  ]
+}
+"#;
+    let inventory = ClusterInventory::from_json(json).unwrap();
+    let app = ClusterApp::new(inventory.hosts().to_vec());
+
+    let backend = TestBackend::new(70, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| cluster_ui::draw(frame, &app))
+        .unwrap();
+
+    let buffer = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+
+    assert!(buffer.contains("second-host"));
+    assert!(buffer.contains("..."));
+}
+
+#[test]
+fn cluster_render_unicode_host_rows_stay_ascii_and_truncated() {
+    let json = r#"
+{
+  "servers": [
+    {
+      "alias": "服务器服务器服务器服务器服务器",
+      "ssh_user": "ops",
+      "campus_ip": "地址地址地址地址地址地址地址",
+      "role": "unicode"
+    },
+    {
+      "alias": "after-unicode",
+      "ssh_user": "ops",
+      "campus_ip": "203.0.113.30",
+      "role": "Visible after unicode row"
+    }
+  ]
+}
+"#;
+    let inventory = ClusterInventory::from_json(json).unwrap();
+    let app = ClusterApp::new(inventory.hosts().to_vec());
+
+    let backend = TestBackend::new(70, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| cluster_ui::draw(frame, &app))
+        .unwrap();
+
+    let buffer = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+
+    assert!(buffer.is_ascii());
+    assert!(buffer.contains("after-unicode"));
+}
+
+#[test]
+fn cluster_detail_escapes_dynamic_probe_and_inventory_text() {
+    let json = r#"
+{
+  "servers": [
+    {
+      "alias": "unicode-detail",
+      "ssh_user": "ops",
+      "campus_ip": "203.0.113.40",
+      "role": "Detail"
+    }
+  ]
+}
+"#;
+    let inventory = ClusterInventory::from_json(json).unwrap();
+    let mut app = ClusterApp::new(inventory.hosts().to_vec());
+    app.apply_snapshot(HostSnapshot::stale(
+        "unicode-detail",
+        ProbeReport::parse(
+            "hostname=主机\nsystem=Linux\u{1b}[31m\nuptime=up\nload=0.12\u{1b}[31m\nmemory=42% free\nstorage=8G/20G 40% used\ntasks=72\u{1b}[31m processes\ngpu=GPU😀 9%\n",
+        ),
+        "bad\n\u{1b}[31m error",
+    ));
+    app.apply(ClusterCommand::OpenDetail);
+
+    let backend = TestBackend::new(120, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| cluster_ui::draw(frame, &app))
+        .unwrap();
+
+    let buffer = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+
+    assert!(buffer.is_ascii());
+    assert!(buffer.contains("Error: bad"));
+    assert!(buffer.contains("?[31m"));
+    assert!(buffer.contains("Hostname: ??"));
+}
+
+#[test]
+fn cluster_operational_chrome_is_ascii() {
+    let inventory = ClusterInventory::from_json(CAMPUS_JSON).unwrap();
+    let app = ClusterApp::new(inventory.hosts().to_vec());
+
+    let backend = TestBackend::new(120, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| cluster_ui::draw(frame, &app))
+        .unwrap();
+
+    let buffer = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+
+    assert!(buffer.is_ascii());
 }
 
 #[test]
@@ -566,7 +823,7 @@ fn cluster_help_footer_is_mode_specific() {
         .iter()
         .map(|cell| cell.symbol())
         .collect::<String>();
-    assert!(buffer.contains("help | q close"));
+    assert!(buffer.contains("help | q/?/Enter/Esc close"));
     assert!(!buffer.contains("q quit | ? help | ^G back | ^C force | r refresh"));
 }
 
@@ -589,7 +846,7 @@ fn cluster_detail_footer_describes_back_action() {
         .iter()
         .map(|cell| cell.symbol())
         .collect::<String>();
-    assert!(buffer.contains("detail | q back"));
+    assert!(buffer.contains("detail | q/Esc back"));
     assert!(!buffer.contains("q quit | ? help | ^G back | ^C force | r refresh"));
 }
 
@@ -742,6 +999,61 @@ fn cluster_render_narrow_normal_mode_keeps_host_list_primary() {
     assert!(!buffer.contains("Route"));
     assert!(!buffer.contains("Memory: ["));
     assert!(buffer.contains("r refresh"));
+}
+
+#[test]
+fn cluster_narrow_footer_recommends_next_action_from_selected_state() {
+    let inventory = ClusterInventory::from_json(CAMPUS_JSON).unwrap();
+    let mut app = ClusterApp::new(inventory.hosts().to_vec());
+    app.apply(ClusterCommand::Down);
+    app.apply(ClusterCommand::Down);
+    app.apply_snapshot(HostSnapshot::online(
+        "school-star",
+        ProbeReport::parse(
+            "hostname=starbox\nload=0.12 0.20 0.30\nmemory=512/1024 MB (50%)\nstorage=8G/20G 40% used\ntasks=72 processes\ngpu=none\n",
+        ),
+        87,
+    ));
+
+    let backend = TestBackend::new(71, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| cluster_ui::draw(frame, &app))
+        .unwrap();
+
+    let buffer = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(buffer.contains("next: t tersh"));
+}
+
+#[test]
+fn cluster_detail_shows_actionable_hint_for_auth_failures() {
+    let inventory = ClusterInventory::from_json(DIRECT_JSON).unwrap();
+    let mut app = ClusterApp::new(inventory.hosts().to_vec());
+    app.apply_snapshot(HostSnapshot::failed(
+        "direct-box",
+        "Permission denied (publickey)",
+    ));
+
+    let backend = TestBackend::new(120, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| cluster_ui::draw(frame, &app))
+        .unwrap();
+
+    let buffer = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(buffer.contains("Hint: check SSH auth"));
 }
 
 #[test]

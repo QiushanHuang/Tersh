@@ -1,5 +1,44 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use std::sync::Mutex;
 use tersh::app::{App, Command, Mode};
+
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+#[test]
+fn starting_from_file_path_focuses_parent_and_opens_preview() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("note.txt");
+    std::fs::write(&path, "hello").unwrap();
+
+    let app = App::new(path).unwrap();
+
+    assert_eq!(app.cwd(), dir.path().canonicalize().unwrap());
+    assert_eq!(app.entries()[app.cursor()].name, "note.txt");
+    assert_eq!(app.mode(), Mode::Preview);
+    assert!(
+        app.preview()
+            .lines
+            .iter()
+            .any(|line| line.contains("hello"))
+    );
+}
+
+#[test]
+fn filter_input_uses_cached_entries_until_refresh() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("alpha.txt"), "a").unwrap();
+    std::fs::write(dir.path().join("beta.txt"), "b").unwrap();
+    let mut app = App::new(dir.path().to_path_buf()).unwrap();
+
+    app.apply(Command::OpenFilter);
+    std::fs::write(dir.path().join("zeta.txt"), "z").unwrap();
+    app.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+
+    assert!(app.entries().is_empty());
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    app.handle_command(Command::Refresh);
+    assert!(app.entries().iter().any(|entry| entry.name == "zeta.txt"));
+}
 
 #[test]
 fn ctrl_g_closes_filter_before_quitting() {
@@ -13,13 +52,13 @@ fn ctrl_g_closes_filter_before_quitting() {
 }
 
 #[test]
-fn escape_does_not_cancel_filter_mode() {
+fn escape_cancels_filter_mode() {
     let mut app = App::for_test();
 
     app.apply(Command::OpenFilter);
     app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
-    assert_eq!(app.mode(), Mode::Filter);
+    assert_eq!(app.mode(), Mode::Normal);
 }
 
 #[test]
@@ -127,6 +166,25 @@ fn gg_requires_two_g_keypresses_to_jump_to_first_item() {
 }
 
 #[test]
+fn cancel_clears_pending_y_and_g_prefixes() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "b").unwrap();
+    let mut app = App::new(dir.path().to_path_buf()).unwrap();
+    app.handle_command(Command::Last);
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
+    app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+    assert_eq!(app.last_clipboard_text(), None);
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+    assert_eq!(app.cursor(), 1);
+}
+
+#[test]
 fn page_keys_move_directory_cursor_by_page() {
     let dir = tempfile::tempdir().unwrap();
     for index in 0..25 {
@@ -139,6 +197,97 @@ fn page_keys_move_directory_cursor_by_page() {
 
     app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
     assert_eq!(app.cursor(), 0);
+}
+
+#[test]
+fn sort_keys_cycle_sort_and_reverse_file_order() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("small.txt"), "x").unwrap();
+    std::fs::write(dir.path().join("large.txt"), "xxxx").unwrap();
+    let mut app = App::new(dir.path().to_path_buf()).unwrap();
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+    assert_eq!(app.sort_label(), "size asc");
+    assert_eq!(app.entries()[0].name, "small.txt");
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT));
+    assert_eq!(app.sort_label(), "size desc");
+    assert_eq!(app.entries()[0].name, "large.txt");
+}
+
+#[cfg(unix)]
+#[test]
+fn edit_rejects_symlink_targets() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("target.txt");
+    let link = dir.path().join("link.txt");
+    std::fs::write(&target, "target").unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let mut app = App::new(dir.path().to_path_buf()).unwrap();
+
+    assert_eq!(app.entries()[app.cursor()].name, "link.txt");
+    app.handle_command(Command::Edit);
+
+    assert!(app.logs().iter().any(|log| log.contains("regular files")));
+}
+
+#[cfg(unix)]
+#[test]
+fn edit_revalidates_file_kind_before_launching_editor() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let old_visual = std::env::var_os("VISUAL");
+    let old_editor = std::env::var_os("EDITOR");
+    unsafe {
+        std::env::set_var("VISUAL", "false");
+        std::env::remove_var("EDITOR");
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("item.txt");
+    let target = dir.path().join("target.txt");
+    std::fs::write(&path, "item").unwrap();
+    std::fs::write(&target, "target").unwrap();
+    let mut app = App::new(dir.path().to_path_buf()).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    std::os::unix::fs::symlink(&target, &path).unwrap();
+
+    app.handle_command(Command::Edit);
+
+    restore_env("VISUAL", old_visual);
+    restore_env("EDITOR", old_editor);
+    assert!(app.logs().iter().any(|log| log.contains("regular files")));
+}
+
+#[test]
+fn cut_paste_retains_failed_cut_items_for_retry() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let dest_dir = tempfile::tempdir().unwrap();
+    let source_a = source_dir.path().join("a.txt");
+    let source_b = source_dir.path().join("b.txt");
+    std::fs::write(&source_a, "a").unwrap();
+    std::fs::write(&source_b, "b").unwrap();
+    std::fs::write(dest_dir.path().join("b.txt"), "existing").unwrap();
+    let mut app = App::new(source_dir.path().to_path_buf()).unwrap();
+
+    app.handle_command(Command::SelectAll);
+    app.handle_command(Command::Cut);
+    app.force_cwd_for_test(dest_dir.path().to_path_buf());
+    app.handle_command(Command::Paste);
+
+    assert!(!source_a.exists());
+    assert!(dest_dir.path().join("a.txt").exists());
+    assert!(source_b.exists());
+    assert_eq!(app.copy_buffer_len(), 1);
+}
+
+fn restore_env(name: &str, value: Option<std::ffi::OsString>) {
+    unsafe {
+        if let Some(value) = value {
+            std::env::set_var(name, value);
+        } else {
+            std::env::remove_var(name);
+        }
+    }
 }
 
 #[test]
@@ -296,6 +445,61 @@ fn yy_copies_file_and_p_pastes_into_current_directory() {
 }
 
 #[test]
+fn yy_paste_existing_target_replace_overwrites() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let target_dir = tempfile::tempdir().unwrap();
+    let source = source_dir.path().join("item.txt");
+    let target = target_dir.path().join("item.txt");
+    std::fs::write(&source, "new").unwrap();
+    std::fs::write(&target, "old").unwrap();
+    let mut app = App::new(source_dir.path().to_path_buf()).unwrap();
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    app.force_cwd_for_test(target_dir.path().to_path_buf());
+    app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+
+    assert_eq!(app.mode(), Mode::Conflict);
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "old");
+
+    for ch in "replace".chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+    }
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert_eq!(app.mode(), Mode::Normal);
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), "new");
+}
+
+#[test]
+fn yy_paste_existing_target_skip_preserves_existing() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let target_dir = tempfile::tempdir().unwrap();
+    let source = source_dir.path().join("item.txt");
+    let target = target_dir.path().join("item.txt");
+    std::fs::write(&source, "new").unwrap();
+    std::fs::write(&target, "old").unwrap();
+    let mut app = App::new(source_dir.path().to_path_buf()).unwrap();
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    app.force_cwd_for_test(target_dir.path().to_path_buf());
+    app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+
+    assert_eq!(app.mode(), Mode::Conflict);
+    for ch in "skip".chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+    }
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert_eq!(app.mode(), Mode::Normal);
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "old");
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), "new");
+    assert_eq!(app.copy_buffer_len(), 1);
+}
+
+#[test]
 fn x_cuts_file_and_p_moves_into_current_directory() {
     let source_dir = tempfile::tempdir().unwrap();
     let target_dir = tempfile::tempdir().unwrap();
@@ -338,4 +542,58 @@ fn copy_to_and_move_to_use_typed_destination_directory() {
     app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert!(!moving.exists());
     assert!(target_dir.path().join("move.txt").exists());
+}
+
+#[test]
+fn move_to_existing_target_skips_without_overwrite() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let target_dir = tempfile::tempdir().unwrap();
+    let source = source_dir.path().join("move.txt");
+    let target = target_dir.path().join("move.txt");
+    std::fs::write(&source, "new").unwrap();
+    std::fs::write(&target, "old").unwrap();
+    let mut app = App::new(source_dir.path().to_path_buf()).unwrap();
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+    for ch in target_dir.path().to_string_lossy().chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+    }
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert_eq!(app.mode(), Mode::Normal);
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "old");
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), "new");
+    assert_eq!(app.copy_buffer_len(), 0);
+}
+
+#[test]
+fn copy_to_existing_target_enters_conflict_mode_and_replace_overwrites() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let target_dir = tempfile::tempdir().unwrap();
+    std::fs::write(source_dir.path().join("copy.txt"), "new").unwrap();
+    std::fs::write(target_dir.path().join("copy.txt"), "old").unwrap();
+    let mut app = App::new(source_dir.path().to_path_buf()).unwrap();
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+    for ch in target_dir.path().to_string_lossy().chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+    }
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert_eq!(app.mode(), Mode::Conflict);
+    assert_eq!(
+        std::fs::read_to_string(target_dir.path().join("copy.txt")).unwrap(),
+        "old"
+    );
+
+    for ch in "replace".chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+    }
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert_eq!(app.mode(), Mode::Normal);
+    assert_eq!(
+        std::fs::read_to_string(target_dir.path().join("copy.txt")).unwrap(),
+        "new"
+    );
 }

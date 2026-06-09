@@ -5,4 +5,5 @@ pub mod cluster_ui;
 pub mod fs_core;
 pub mod fs_ops;
 pub mod preview;
+pub mod theme;
 pub mod ui;

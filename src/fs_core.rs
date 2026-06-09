@@ -19,11 +19,18 @@ pub struct FileEntry {
     pub path: PathBuf,
     pub raw_name: OsString,
     pub name: String,
+    pub name_lower: String,
     pub kind: FileKind,
     pub size: u64,
     pub readonly: bool,
     pub modified: Option<SystemTime>,
     pub symlink_target: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DirectoryEntries {
+    pub entries: Vec<FileEntry>,
+    pub skipped: usize,
 }
 
 impl FileEntry {
@@ -50,11 +57,13 @@ impl FileEntry {
             .map(OsStr::to_os_string)
             .unwrap_or_else(|| path.as_os_str().to_os_string());
         let name = display_os_str(&raw_name);
+        let name_lower = name.to_lowercase();
 
         Ok(Self {
             path,
             raw_name,
             name,
+            name_lower,
             kind,
             size: metadata.len(),
             readonly: metadata.permissions().readonly(),
@@ -74,18 +83,36 @@ impl FileEntry {
 }
 
 pub fn read_dir_entries(path: &Path, show_hidden: bool, filter: &str) -> Result<Vec<FileEntry>> {
+    Ok(read_dir_entries_with_diagnostics(path, show_hidden, filter)?.entries)
+}
+
+pub fn read_dir_entries_with_diagnostics(
+    path: &Path,
+    show_hidden: bool,
+    filter: &str,
+) -> Result<DirectoryEntries> {
     let mut entries = Vec::new();
+    let mut skipped = 0;
     let filter = filter.to_lowercase();
     for entry in fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))? {
-        let entry = entry?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
+        };
         let name = display_os_str(&entry.file_name());
         if !show_hidden && name.starts_with('.') {
             continue;
-        }
+        };
         if !filter.is_empty() && !name.to_lowercase().contains(&filter) {
             continue;
         }
-        entries.push(FileEntry::from_path(entry.path())?);
+        match FileEntry::from_path(entry.path()) {
+            Ok(entry) => entries.push(entry),
+            Err(_) => skipped += 1,
+        }
     }
     entries.sort_by(|a, b| {
         let ak = match a.kind {
@@ -100,10 +127,9 @@ pub fn read_dir_entries(path: &Path, show_hidden: bool, filter: &str) -> Result<
             FileKind::File => 2,
             FileKind::Other => 3,
         };
-        ak.cmp(&bk)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        ak.cmp(&bk).then_with(|| a.name_lower.cmp(&b.name_lower))
     });
-    Ok(entries)
+    Ok(DirectoryEntries { entries, skipped })
 }
 
 pub fn display_os_str(value: &OsStr) -> String {

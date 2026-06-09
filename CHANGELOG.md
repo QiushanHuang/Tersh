@@ -1,5 +1,101 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Added copy-conflict handling for existing targets, with explicit `replace` or `skip` confirmation before overwriting.
+- Added `TERSH_CLIPBOARD=off` to disable OSC52 terminal clipboard writes while keeping in-app copy state and logs.
+- Added `TERSH_THEME=btop|aurora|contrast|mono` for color-rich, aurora, high-contrast, or no-color terminal rendering.
+- Added `TERSH_BORDER=ascii|rounded|thick` so Unicode-capable terminals can opt into rounded or heavier btop-style chrome while ASCII remains the remote-safe default.
+- Added `TERSH_FOOTER=auto|compact|full` so mobile or narrow-device users can force shortcut footer density.
+- Added `--cluster` as the clearer long-form entry for the read-only cluster health dashboard, while keeping `--c` as a compatibility alias.
+- Added context-aware workbench footer recommendations for focused directories, focused files, active selections, and copy/cut buffers.
+- Added cluster footer recommendations and detail hints so host status screens suggest the next action for online, stale, auth-failed, timeout, and unknown hosts.
+- Added direct file startup support so `tersh <file>` opens the file's parent directory, focuses the file, and enters preview for regular files.
+- Added remote workbench diagnostics for `tersh --c` so remote `t` sessions report missing `tersh` binaries and invalid `workdir` paths with actionable messages.
+- Added compact workbench help and confirmation layouts for very narrow terminal screens.
+
+### Changed
+
+- Changed workbench and cluster event loops to dirty-driven rendering, reducing idle redraws while still repainting on input, resize, refresh, and probe updates.
+- Changed workbench and cluster chrome to share themed status chips, footer highlighting, selected-row styling, and warning/error emphasis.
+- Changed workbench and cluster rendering to use semantic panel-title, key/value, inactive, copy, cut, and search-match colors for stronger visual hierarchy without changing layout density.
+- Changed cluster resource bars to style filled and empty segments separately, making high-load metrics stand out while keeping ASCII bar characters for lightweight remote terminals.
+- Changed file preview caching from a single entry to a bounded LRU cache for faster adjacent-file navigation without retaining stale same-path previews.
+- Changed directory entries to cache lowercase names, reducing repeated allocation during filtering and sorting.
+- Changed file rows to show cursor, selection, and copy/cut buffer state in a fixed row marker so the active operation target is easier to scan.
+- Changed trash/delete confirmation prompts to show required and typed confirmation text, with stronger visual severity styling.
+- Changed filter input to use the current in-memory directory listing while typing, avoiding a full directory scan on every character.
+- Changed compact workbench and cluster chrome to keep selection/buffer state and the cluster detail action visible on narrow terminals.
+- Changed the install script to build with `--locked`, and enabled release stripping plus thin LTO for smaller optimized local rebuilds.
+
+### Fixed
+
+- Fixed parallel test instability in probe temporary-file cleanup checks by isolating the probe-output tests from each other.
+- Hardened file operation race windows with source identity rechecks, no-follow regular-file opens, safer trash/delete target checks, no-clobber copy targets, and no-replace rename APIs where supported.
+- Fixed copy failure cleanup so failed regular-file and recursive-directory copies do not leave partial targets behind.
+- Fixed replace-copy behavior so an invalid source no longer deletes an existing target before source validation succeeds.
+- Fixed edit and preview safety by revalidating regular files with no-follow opens before editor launch or preview cache hashing.
+- Fixed cut/paste retry behavior so failed cut items remain in the transfer buffer instead of being discarded.
+- Fixed cluster refresh generations so timed-out probe results cannot overwrite newer timeout/stale state, while real in-flight probes continue to count toward the concurrency cap.
+- Fixed cluster refresh retry throttling so timed-out active probes do not cause repeated no-eligible-host refresh attempts.
+- Fixed cluster inventory parsing to reject unknown JSON fields and store trimmed aliases, SSH fields, roles, and work directories.
+- Fixed cluster inventory validation to reject whitespace inside SSH target fields.
+- Changed cluster probes to require known SSH host keys instead of auto-accepting new keys during read-only health checks.
+- Fixed cluster probe cleanup by capping captured stdout/stderr and killing timed-out Unix probe process groups.
+- Fixed cluster probe output handling so non-UTF-8 stdout/stderr is preserved lossily instead of being reported as a read failure.
+- Fixed terminal suspension recovery paths to avoid half-restored alternate-screen/raw-mode states.
+- Fixed narrow file-list rendering by truncating long file names in-row.
+- Fixed file-list truncation to use terminal display width for wide Unicode characters.
+- Fixed OSC52 clipboard writes to reject oversized payloads before emitting terminal escape sequences.
+- Fixed install script failures for unwritable install directories with an explicit remediation message and atomic temporary-file installation.
+- Fixed cluster snapshots so known host updates are applied even when injected outside an active refresh, restoring summary counts, stale metrics, and detail rendering.
+- Fixed cluster refresh scheduling so empty or fully saturated refresh attempts do not reset the automatic refresh timer.
+- Fixed cluster probe command execution to preserve stdout/stderr in timeout/error paths and report probe execution errors with context instead of silently dropping them.
+- Fixed timeout handling for remote/local probes so output is cleaned up deterministically and timeout errors remain visible in refresh logs.
+- Fixed directory listings so transient failures for individual entries are skipped instead of clearing the entire view.
+- Fixed named home expansion for `~user` paths, including the no-trailing-slash form.
+- Fixed preview cache invalidation to hash the visible preview range instead of only the first 4 KiB.
+- Fixed preview handling for size-zero virtual regular files by attempting a bounded read before reporting an empty file.
+- Fixed editor launch recovery so alternate screen and raw mode are restored consistently after editor spawn/status failures.
+- Fixed resource percentage parsing for fullwidth percent signs and rounded percentage values.
+
+## v1.1.0 - 2026-05-31
+
+v1.1.0 is a small product-quality update that makes Tersh denser, more inspectable, and safer for remote terminal work.
+
+### Added
+
+- Added a btop-inspired file workbench header showing cwd, item count, selected size, copy/cut buffer state, hidden-file state, filter text, and sort mode.
+- Added sortable file browsing with `s` to cycle sort modes and `S` to reverse the current sort.
+- Added an Inspector panel that separates target metadata, buffer state, search/sort context, and logs.
+- Added cluster dashboard health tokens (`OK`, `OLD`, `FAIL`, `CHK`) plus per-host latency, memory, and disk columns.
+- Added `Esc` as a cancel key alongside `Ctrl+G`.
+- Added release documentation in `docs/releases/v1.1.0.md`.
+
+### Changed
+
+- Changed file rows into a denser operational table with selection, kind, permission, size, and name columns.
+- Changed edit behavior to respect `$VISUAL` and `$EDITOR` before falling back to `nano`.
+- Changed multi-target trash/delete confirmation dialogs to show operation source and the first affected paths.
+- Updated crate metadata to version `1.1.0` and declared `rust-version = "1.85"`.
+
+### Fixed
+
+- Fixed terminal display safety gaps by escaping rendered paths and prompt input.
+- Fixed edit safety so symlinks and special files are rejected instead of being handed to the editor.
+- Fixed directory reload behavior so transient metadata failures for one entry do not clear the whole view.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo clippy --locked --all-targets -- -D warnings`
+- `cargo test --locked --all-targets`
+- `cargo build --locked --release --bin tersh`
+- `./target/release/tersh --help`
+- `./target/release/tersh --version`
+
 ## V1 - 2026-05-31
 
 V1 turns Tersh into a safer and clearer product baseline for terminal file work and read-only multi-host checks.
@@ -55,6 +151,41 @@ V1 turns Tersh into a safer and clearer product baseline for terminal file work 
 - `t` exits back to the dashboard when the nested Tersh workbench exits with `q`.
 
 ## 中文更新说明
+
+### v1.1.0 - 2026-05-31
+
+v1.1.0 是一次小版本产品质量更新，让 Tersh 的终端界面更高密度、更容易扫读，也更适合远程文件工作。
+
+### 新增
+
+- 新增参考 btop 的文件工作台顶部状态栏，展示 cwd、条目数量、已选大小、复制/剪切缓冲区、隐藏文件状态、筛选文本和排序模式。
+- 新增 `s` 循环排序模式、`S` 反转当前排序。
+- 新增 Inspector 面板，分块展示目标元数据、缓冲区状态、搜索/排序上下文和日志。
+- 集群面板新增 `OK`、`OLD`、`FAIL`、`CHK` 健康指标，并在主机列表中显示延迟、内存和磁盘列。
+- 新增 `Esc` 作为取消键，与 `Ctrl+G` 一起使用。
+- 新增 `docs/releases/v1.1.0.md` 发行说明。
+
+### 调整
+
+- 文件行改为更紧凑的操作表格，展示选择、类型、权限、大小和名称。
+- 编辑器优先使用 `$VISUAL` 和 `$EDITOR`，最后回退到 `nano`。
+- 多目标删除/回收站确认会显示操作来源和前几个受影响路径。
+- crate 版本更新为 `1.1.0`，并声明 `rust-version = "1.85"`。
+
+### 修复
+
+- 修复路径和输入内容中的控制字符可能污染终端显示的问题。
+- 修复编辑功能会把符号链接和特殊文件交给编辑器的问题。
+- 修复目录刷新时单个条目 metadata 临时失败会清空整个视图的问题。
+
+### 验证
+
+- `cargo fmt --check`
+- `cargo clippy --locked --all-targets -- -D warnings`
+- `cargo test --locked --all-targets`
+- `cargo build --locked --release --bin tersh`
+- `./target/release/tersh --help`
+- `./target/release/tersh --version`
 
 ### V1 - 2026-05-31
 

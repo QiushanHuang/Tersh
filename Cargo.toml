@@ -1,9 +1,12 @@
 [package]
 name = "tersh"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
+rust-version = "1.85"
 description = "A lightweight terminal file workbench for local and SSH shell sessions."
 license = "MIT"
+repository = "https://github.com/QiushanHuang/Tersh"
+homepage = "https://github.com/QiushanHuang/Tersh"
 
 [dependencies]
 anyhow = "1"
@@ -14,6 +17,12 @@ libc = "0.2"
 ratatui = "0.29"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+unicode-width = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
