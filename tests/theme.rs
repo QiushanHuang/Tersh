@@ -4,7 +4,7 @@ use tersh::{
     app::App,
     cluster::{ClusterApp, ClusterInventory, HostSnapshot, ProbeReport},
     cluster_ui,
-    theme::{Theme, footer_line, panel_title},
+    theme::{ChipTone, Theme, Tone, footer_line, panel_title, resource_bar},
     ui::draw,
 };
 
@@ -109,6 +109,18 @@ fn render_cluster_bar_styles(app: &ClusterApp, width: u16, height: u16) -> (Colo
     (content[hash_index].fg, content[dash_index].fg)
 }
 
+fn render_app_title_style(app: &App, title: &str, width: u16, height: u16) -> Color {
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| draw(frame, app)).unwrap();
+    let content = terminal.backend().buffer().content();
+    let rendered = content.iter().map(|cell| cell.symbol()).collect::<String>();
+    let index = rendered
+        .find(title)
+        .unwrap_or_else(|| panic!("{title} should render"));
+    content[index].fg
+}
+
 fn with_env_var(name: &str, value: &str, run: impl FnOnce()) {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
     let _restore = EnvRestore {
@@ -177,6 +189,23 @@ fn rounded_border_can_be_enabled_for_workbench_and_cluster() {
 }
 
 #[test]
+fn thick_border_can_be_enabled_for_workbench_and_cluster() {
+    with_env_var("TERSH_BORDER", "thick", || {
+        let app = App::for_test();
+        let inventory = ClusterInventory::from_json(CAMPUS_JSON).unwrap();
+        let cluster = ClusterApp::new(inventory.hosts().to_vec());
+
+        let workbench = render_app(&app, 120, 30);
+        let cluster = render_cluster(&cluster, 120, 30);
+
+        assert!(workbench.contains("┏"));
+        assert!(workbench.contains("┛"));
+        assert!(cluster.contains("┏"));
+        assert!(cluster.contains("┛"));
+    });
+}
+
+#[test]
 fn default_border_stays_ascii_for_remote_compatibility() {
     with_env_var("TERSH_BORDER", "ascii", || {
         let app = App::for_test();
@@ -205,6 +234,75 @@ fn panel_title_uses_semantic_palette_color() {
     let title = panel_title(theme, "Preview");
 
     assert_eq!(title.spans[0].style.fg, Some(theme.palette().panel_title));
+}
+
+#[test]
+fn semantic_tones_and_chips_route_through_palette() {
+    let theme = Theme::Aurora;
+    let palette = theme.palette();
+
+    assert_eq!(theme.style(Tone::Title).fg, Some(palette.panel_title));
+    assert_eq!(theme.style(Tone::Copy).fg, Some(palette.copy));
+    assert_eq!(theme.bold(Tone::Danger).fg, Some(palette.danger));
+    assert!(
+        theme
+            .bold(Tone::Danger)
+            .add_modifier
+            .contains(ratatui::style::Modifier::BOLD)
+    );
+
+    let chip = theme.chip_tone(ChipTone::Copy);
+    assert_eq!(chip.bg, Some(palette.copy));
+    assert_eq!(chip.fg, Some(palette.text));
+
+    let mono_chip = Theme::Mono.chip_tone(ChipTone::Danger);
+    assert_eq!(mono_chip.fg, None);
+    assert_eq!(mono_chip.bg, None);
+    assert!(
+        mono_chip
+            .add_modifier
+            .contains(ratatui::style::Modifier::BOLD)
+    );
+}
+
+#[test]
+fn resource_bar_component_clamps_and_preserves_ascii_shape() {
+    let danger_bar = resource_bar(Theme::Btop, Some(95), 10);
+    let rendered = danger_bar
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+
+    assert_eq!(rendered, "[##########]");
+    assert_eq!(danger_bar[1].style.fg, Some(Theme::Btop.palette().danger));
+
+    let half_bar = resource_bar(Theme::Btop, Some(50), 10);
+    let rendered = half_bar
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+
+    assert_eq!(rendered, "[#####-----]");
+    assert_ne!(half_bar[1].style.fg, half_bar[2].style.fg);
+
+    let mono_bar = resource_bar(Theme::Mono, Some(50), 10);
+    assert!(
+        mono_bar
+            .iter()
+            .all(|span| span.style.fg.is_none() && span.style.bg.is_none())
+    );
+}
+
+#[test]
+fn workbench_files_panel_is_active_while_preview_is_inactive() {
+    with_env_var("TERSH_THEME", "btop", || {
+        let app = App::for_test();
+        let files_fg = render_app_title_style(&app, "Files", 120, 30);
+        let preview_fg = render_app_title_style(&app, "Preview", 120, 30);
+
+        assert_eq!(files_fg, Theme::Btop.palette().active);
+        assert_eq!(preview_fg, Theme::Btop.palette().inactive);
+    });
 }
 
 #[test]

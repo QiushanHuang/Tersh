@@ -22,6 +22,9 @@
 - Changed workbench and cluster chrome to share themed status chips, footer highlighting, selected-row styling, and warning/error emphasis.
 - Changed workbench and cluster rendering to use semantic panel-title, key/value, inactive, copy, cut, and search-match colors for stronger visual hierarchy without changing layout density.
 - Changed cluster resource bars to style filled and empty segments separately, making high-load metrics stand out while keeping ASCII bar characters for lightweight remote terminals.
+- Changed the TUI theme layer to use shared semantic `Tone` / `ChipTone` primitives for panel chrome, footer styling, key-value rows, and resource bars.
+- Changed workbench and cluster panels to distinguish active and inactive chrome, making the current work surface easier to scan without adding layout weight.
+- Changed compact workbench status to show the full copy/cut buffer label instead of a generic copy count.
 - Changed file preview caching from a single entry to a bounded LRU cache for faster adjacent-file navigation without retaining stale same-path previews.
 - Changed directory entries to cache lowercase names, reducing repeated allocation during filtering and sorting.
 - Changed file rows to show cursor, selection, and copy/cut buffer state in a fixed row marker so the active operation target is easier to scan.

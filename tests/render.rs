@@ -330,6 +330,17 @@ fn compact_layout_shows_focused_status_context() {
 }
 
 #[test]
+fn compact_status_distinguishes_cut_buffer_from_copy_count() {
+    let mut app = App::for_test();
+    app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+
+    let buffer = render_app(&app, 70, 12);
+
+    assert!(buffer.contains("CUT 1"));
+    assert!(!buffer.contains("copy 1"));
+}
+
+#[test]
 fn long_directory_list_keeps_focused_item_visible() {
     let dir = tempfile::Builder::new()
         .prefix("tersh-list-")
