@@ -121,6 +121,18 @@ fn render_app_title_style(app: &App, title: &str, width: u16, height: u16) -> Co
     content[index].fg
 }
 
+fn render_app_cell_colors(app: &App, text: &str, width: u16, height: u16) -> (Color, Color) {
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| draw(frame, app)).unwrap();
+    let content = terminal.backend().buffer().content();
+    let rendered = content.iter().map(|cell| cell.symbol()).collect::<String>();
+    let index = rendered
+        .find(text)
+        .unwrap_or_else(|| panic!("{text} should render"));
+    (content[index].fg, content[index].bg)
+}
+
 fn with_env_var(name: &str, value: &str, run: impl FnOnce()) {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
     let _restore = EnvRestore {
@@ -302,6 +314,23 @@ fn workbench_files_panel_is_active_while_preview_is_inactive() {
 
         assert_eq!(files_fg, Theme::Btop.palette().active);
         assert_eq!(preview_fg, Theme::Btop.palette().inactive);
+    });
+}
+
+#[test]
+fn workbench_header_hidden_state_uses_plain_key_value_style_without_background() {
+    with_env_var("TERSH_THEME", "btop", || {
+        let app = App::for_test();
+        let palette = Theme::Btop.palette();
+
+        let (label_fg, label_bg) = render_app_cell_colors(&app, "hidden", 120, 30);
+        let (value_fg, value_bg) = render_app_cell_colors(&app, "OFF", 120, 30);
+
+        assert_eq!(label_bg, Color::Reset);
+        assert_eq!(value_bg, Color::Reset);
+        assert_eq!(label_fg, palette.key);
+        assert_eq!(value_fg, palette.inactive);
+        assert_ne!(label_fg, value_fg);
     });
 }
 

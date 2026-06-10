@@ -357,6 +357,19 @@ pub fn kv_line(theme: Theme, key: &'static str, value: impl Into<String>) -> Lin
     ])
 }
 
+pub fn header_stat(
+    theme: Theme,
+    label: &'static str,
+    value: impl std::fmt::Display,
+    tone: Tone,
+) -> Vec<Span<'static>> {
+    vec![
+        Span::styled(label.to_string(), theme.bold(Tone::Key)),
+        Span::raw(" "),
+        Span::styled(value.to_string(), theme.style(tone)),
+    ]
+}
+
 pub fn footer_line(theme: Theme, text: &str) -> Line<'static> {
     let mut spans = Vec::new();
     for (index, raw_segment) in text.split('|').enumerate() {
