@@ -1210,6 +1210,13 @@ fn current_tersh_program() -> String {
 }
 
 fn remote_workbench_command(workdir: Option<&str>) -> String {
+    remote_workbench_command_with_env(workdir, &forwarded_workbench_env())
+}
+
+fn remote_workbench_command_with_env(
+    workdir: Option<&str>,
+    env_pairs: &[(&'static str, String)],
+) -> String {
     let mut script = format!(
         "if ! command -v tersh >/dev/null 2>&1; then printf '%s\\n' {} >&2; exit 127; fi",
         shell_quote(
@@ -1223,8 +1230,28 @@ fn remote_workbench_command(workdir: Option<&str>) -> String {
             shell_quote(&format!("tersh workdir not found: {workdir}"))
         ));
     }
-    script.push_str("; exec tersh");
+    if env_pairs.is_empty() {
+        script.push_str("; exec tersh");
+    } else {
+        script.push_str("; exec env");
+        for (name, value) in env_pairs {
+            script.push_str(&format!(" {name}={}", shell_quote(value)));
+        }
+        script.push_str(" tersh");
+    }
     remote_probe_command(&script)
+}
+
+fn forwarded_workbench_env() -> Vec<(&'static str, String)> {
+    ["TERSH_THEME", "TERSH_BORDER", "TERSH_FOOTER", "TERSH_COLOR"]
+        .into_iter()
+        .filter_map(|name| {
+            env::var(name)
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(|value| (name, value))
+        })
+        .collect()
 }
 
 fn remote_probe_command(script: &str) -> String {
@@ -1697,6 +1724,32 @@ mod tests {
 
         assert!(err.to_string().contains('\u{fffd}'));
         assert!(!err.to_string().contains("failed to read"));
+    }
+
+    #[test]
+    fn remote_workbench_command_forwards_only_ui_environment() {
+        let command = remote_workbench_command_with_env(
+            Some("/srv/app"),
+            &[
+                ("TERSH_THEME", "aurora".to_string()),
+                ("TERSH_BORDER", "rounded".to_string()),
+                ("TERSH_FOOTER", "compact".to_string()),
+                ("TERSH_COLOR", "0".to_string()),
+            ],
+        );
+
+        assert!(command.contains("command -v tersh"));
+        assert!(command.contains("/srv/app"));
+        assert!(command.contains("exec env"));
+        assert!(command.contains("TERSH_THEME="));
+        assert!(command.contains("aurora"));
+        assert!(command.contains("TERSH_BORDER="));
+        assert!(command.contains("rounded"));
+        assert!(command.contains("TERSH_FOOTER="));
+        assert!(command.contains("compact"));
+        assert!(command.contains("TERSH_COLOR="));
+        assert!(command.contains(" tersh"));
+        assert!(!command.contains("SECRET"));
     }
 
     #[cfg(unix)]

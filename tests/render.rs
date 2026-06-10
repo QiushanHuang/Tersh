@@ -276,8 +276,9 @@ fn compact_layout_keeps_survival_controls_visible() {
     let buffer = render_app(&app, 40, 10);
 
     assert!(buffer.contains("Files"));
+    assert!(buffer.contains("next: open"));
     assert!(buffer.contains("q quit"));
-    assert!(buffer.contains("? help"));
+    assert!(buffer.contains("?"));
     assert!(buffer.contains("^G"));
     assert!(buffer.contains("^C"));
 }

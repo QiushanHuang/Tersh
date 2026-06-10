@@ -133,6 +133,23 @@ fn render_app_cell_colors(app: &App, text: &str, width: u16, height: u16) -> (Co
     (content[index].fg, content[index].bg)
 }
 
+fn render_cluster_cell_colors(
+    app: &ClusterApp,
+    text: &str,
+    width: u16,
+    height: u16,
+) -> (Color, Color) {
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| cluster_ui::draw(frame, app)).unwrap();
+    let content = terminal.backend().buffer().content();
+    let rendered = content.iter().map(|cell| cell.symbol()).collect::<String>();
+    let index = rendered
+        .find(text)
+        .unwrap_or_else(|| panic!("{text} should render"));
+    (content[index].fg, content[index].bg)
+}
+
 fn with_env_var(name: &str, value: &str, run: impl FnOnce()) {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
     let _restore = EnvRestore {
@@ -178,7 +195,7 @@ fn compact_footer_can_be_forced_for_workbench() {
 
         let buffer = render_app(&app, 180, 30);
 
-        assert!(buffer.contains("next: Enter open dir"));
+        assert!(buffer.contains("next: Enter open"));
         assert!(!buffer.contains("j/k move"));
     });
 }
@@ -264,8 +281,11 @@ fn semantic_tones_and_chips_route_through_palette() {
     );
 
     let chip = theme.chip_tone(ChipTone::Copy);
-    assert_eq!(chip.bg, Some(palette.copy));
-    assert_eq!(chip.fg, Some(palette.text));
+    let pair = theme.chip_pair(ChipTone::Copy);
+    assert_eq!(chip.bg, Some(pair.bg));
+    assert_eq!(chip.fg, Some(pair.fg));
+    assert_eq!(pair.bg, palette.copy);
+    assert_ne!(pair.fg, pair.bg);
 
     let mono_chip = Theme::Mono.chip_tone(ChipTone::Danger);
     assert_eq!(mono_chip.fg, None);
@@ -275,6 +295,55 @@ fn semantic_tones_and_chips_route_through_palette() {
             .add_modifier
             .contains(ratatui::style::Modifier::BOLD)
     );
+}
+
+#[test]
+fn workbench_header_neutral_chips_keep_readable_filled_shape() {
+    with_env_var("TERSH_THEME", "btop", || {
+        let app = App::for_test();
+        let pair = Theme::Btop.chip_pair(ChipTone::Muted);
+        let warn = Theme::Btop.chip_pair(ChipTone::Warn);
+
+        let (hidden_fg, hidden_bg) = render_app_cell_colors(&app, "hidden", 120, 30);
+        let (off_fg, off_bg) = render_app_cell_colors(&app, "OFF", 120, 30);
+        let (filter_fg, filter_bg) = render_app_cell_colors(&app, "filter", 120, 30);
+
+        assert_eq!((hidden_fg, hidden_bg), (pair.fg, pair.bg));
+        assert_eq!((off_fg, off_bg), (pair.fg, pair.bg));
+        assert_eq!((filter_fg, filter_bg), (pair.fg, pair.bg));
+        assert_ne!(filter_bg, warn.bg);
+        assert_ne!(hidden_fg, hidden_bg);
+    });
+}
+
+#[test]
+fn compact_workbench_header_preserves_chip_styling() {
+    with_env_var("TERSH_THEME", "btop", || {
+        let app = App::for_test();
+        let pair = Theme::Btop.chip_pair(ChipTone::Muted);
+
+        let (sel_fg, sel_bg) = render_app_cell_colors(&app, "sel", 79, 16);
+        let (buf_fg, buf_bg) = render_app_cell_colors(&app, "buf", 79, 16);
+
+        assert_eq!((sel_fg, sel_bg), (pair.fg, pair.bg));
+        assert_eq!((buf_fg, buf_bg), (pair.fg, pair.bg));
+    });
+}
+
+#[test]
+fn compact_cluster_header_preserves_health_chip_styling() {
+    with_env_var("TERSH_THEME", "btop", || {
+        let inventory = ClusterInventory::from_json(CAMPUS_JSON).unwrap();
+        let app = ClusterApp::new(inventory.hosts().to_vec());
+        let ok = Theme::Btop.chip_pair(ChipTone::Ok);
+        let danger = Theme::Btop.chip_pair(ChipTone::Danger);
+
+        let (ok_fg, ok_bg) = render_cluster_cell_colors(&app, "OK", 50, 12);
+        let (fail_fg, fail_bg) = render_cluster_cell_colors(&app, "FAIL", 50, 12);
+
+        assert_eq!((ok_fg, ok_bg), (ok.fg, ok.bg));
+        assert_eq!((fail_fg, fail_bg), (danger.fg, danger.bg));
+    });
 }
 
 #[test]
@@ -314,23 +383,6 @@ fn workbench_files_panel_is_active_while_preview_is_inactive() {
 
         assert_eq!(files_fg, Theme::Btop.palette().active);
         assert_eq!(preview_fg, Theme::Btop.palette().inactive);
-    });
-}
-
-#[test]
-fn workbench_header_hidden_state_uses_plain_key_value_style_without_background() {
-    with_env_var("TERSH_THEME", "btop", || {
-        let app = App::for_test();
-        let palette = Theme::Btop.palette();
-
-        let (label_fg, label_bg) = render_app_cell_colors(&app, "hidden", 120, 30);
-        let (value_fg, value_bg) = render_app_cell_colors(&app, "OFF", 120, 30);
-
-        assert_eq!(label_bg, Color::Reset);
-        assert_eq!(value_bg, Color::Reset);
-        assert_eq!(label_fg, palette.key);
-        assert_eq!(value_fg, palette.inactive);
-        assert_ne!(label_fg, value_fg);
     });
 }
 

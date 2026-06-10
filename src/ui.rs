@@ -2,7 +2,7 @@ use crate::{
     app::{App, Mode},
     fs_core::{FileKind, display_path, escape_display, format_size},
     theme::{
-        Theme, Tone, base_block, footer_compact, footer_paragraph, header_stat, kv_line,
+        ChipTone, Theme, Tone, base_block, chip, footer_compact, footer_paragraph, kv_line,
         modal_block, panel_block, section_line,
     },
 };
@@ -70,7 +70,6 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
         draw_compact_header(frame, area, app, theme);
         return;
     }
-    let palette = theme.palette();
     let hidden = if app.show_hidden() { "ON" } else { "OFF" };
     let filter = if app.filter().is_empty() {
         "-".to_string()
@@ -78,73 +77,94 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
         escape_display(app.filter())
     };
     let buffer_label = app.copy_buffer_label();
-    let mut spans = vec![
-        Span::styled("Tersh", theme.fg_bold(palette.panel_title)),
-        header_separator(theme),
-        Span::styled(display_path(app.cwd()), theme.fg(palette.path)),
-    ];
-    append_header_stat(&mut spans, theme, "items", app.entries().len(), Tone::Ok);
-    append_header_stat(
-        &mut spans,
-        theme,
-        "sel",
-        format!(
-            "{} {}",
-            app.selected_len(),
-            format_size(app.selected_total_size())
+    let (buffer_tone, buffer_emphasis) = buffer_chip_tone(&buffer_label);
+    let (hidden_tone, hidden_emphasis) = if app.show_hidden() {
+        (ChipTone::Accent, true)
+    } else {
+        (ChipTone::Muted, false)
+    };
+    let (filter_tone, filter_emphasis) = if app.filter().is_empty() {
+        (ChipTone::Muted, false)
+    } else {
+        (ChipTone::Warn, true)
+    };
+    let (selection_tone, selection_emphasis) = if app.selected_len() > 0 {
+        (ChipTone::AccentAlt, true)
+    } else {
+        (ChipTone::Muted, false)
+    };
+    let lines = vec![Line::from(vec![
+        Span::styled("Tersh", theme.bold(Tone::Title)),
+        Span::raw(" | "),
+        Span::styled(display_path(app.cwd()), theme.style(Tone::Path)),
+        Span::raw(" | "),
+        workbench_chip(theme, "items", app.entries().len(), ChipTone::Muted, false),
+        Span::raw(" "),
+        workbench_chip(
+            theme,
+            "sel",
+            format!(
+                "{} {}",
+                app.selected_len(),
+                format_size(app.selected_total_size())
+            ),
+            selection_tone,
+            selection_emphasis,
         ),
-        Tone::AccentAlt,
-    );
-    append_header_stat(
-        &mut spans,
-        theme,
-        "buf",
-        buffer_label.clone(),
-        buffer_header_tone(&buffer_label),
-    );
-    append_header_stat(
-        &mut spans,
-        theme,
-        "hidden",
-        hidden,
-        if app.show_hidden() {
-            Tone::Active
-        } else {
-            Tone::Inactive
-        },
-    );
-    append_header_stat(
-        &mut spans,
-        theme,
-        "filter",
-        filter,
-        if app.filter().is_empty() {
-            Tone::Inactive
-        } else {
-            Tone::Warn
-        },
-    );
-    append_header_stat(&mut spans, theme, "sort", app.sort_label(), Tone::Path);
-    let lines = vec![Line::from(spans)];
+        Span::raw(" "),
+        workbench_chip(theme, "buf", buffer_label, buffer_tone, buffer_emphasis),
+        Span::raw(" "),
+        workbench_chip(theme, "hidden", hidden, hidden_tone, hidden_emphasis),
+        Span::raw(" "),
+        workbench_chip(theme, "filter", filter, filter_tone, filter_emphasis),
+        Span::raw(" "),
+        workbench_chip(theme, "sort", app.sort_label(), ChipTone::Path, false),
+    ])];
     let paragraph = Paragraph::new(lines).block(base_block().borders(Borders::ALL));
     frame.render_widget(paragraph, area);
 }
 
 fn draw_compact_header(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
     let filter = if app.filter().is_empty() { "-" } else { "*" };
-    let text = format!(
-        "Tersh | sel {} | buf {} | f {} | {}",
-        app.selected_len(),
-        app.copy_buffer_label(),
-        filter,
-        compact_path(app.cwd(), area.width.saturating_sub(34) as usize)
-    );
-    let paragraph = Paragraph::new(truncate_display_width(
-        &text,
-        area.width.saturating_sub(2) as usize,
-    ))
-    .style(theme.fg(theme.palette().muted))
-    .block(base_block().borders(Borders::ALL));
+    let buffer_label = app.copy_buffer_label();
+    let (buffer_tone, buffer_emphasis) = buffer_chip_tone(&buffer_label);
+    let (selection_tone, selection_emphasis) = if app.selected_len() > 0 {
+        (ChipTone::AccentAlt, true)
+    } else {
+        (ChipTone::Muted, false)
+    };
+    let path_budget = area.width.saturating_sub(42) as usize;
+    let line = Line::from(vec![
+        Span::styled("Tersh", theme.bold(Tone::Title)),
+        Span::raw(" "),
+        workbench_chip(
+            theme,
+            "sel",
+            app.selected_len(),
+            selection_tone,
+            selection_emphasis,
+        ),
+        Span::raw(" "),
+        workbench_chip(theme, "buf", buffer_label, buffer_tone, buffer_emphasis),
+        Span::raw(" "),
+        workbench_chip(
+            theme,
+            "f",
+            filter,
+            if app.filter().is_empty() {
+                ChipTone::Muted
+            } else {
+                ChipTone::Warn
+            },
+            !app.filter().is_empty(),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            compact_path(app.cwd(), path_budget),
+            theme.style(Tone::Path),
+        ),
+    ]);
+    let paragraph = Paragraph::new(line).block(base_block().borders(Borders::ALL));
     frame.render_widget(paragraph, area);
 }
 
@@ -308,7 +328,7 @@ fn draw_fullscreen_preview(frame: &mut Frame, area: Rect, app: &App, theme: Them
     for (index, line) in lines.iter().enumerate().skip(offset).take(view_lines) {
         let mut style = Style::default();
         if !query.is_empty() && line.to_lowercase().contains(&query) {
-            style = theme.chip(palette.selected_fg, palette.search_match);
+            style = theme.search_match();
         }
         if index == active_line {
             style = style
@@ -464,12 +484,19 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
     let compact = footer_compact(area.width, 60);
     let text = match app.mode() {
         Mode::Normal if app.pending_y() => {
-            "y_ | y copy | f name | r rel | a abs | ^G cancel | ^C force".to_string()
+            "y_ | yy copy | yf name | yr rel | ya abs | Esc/^G cancel | ^C force".to_string()
         }
-        Mode::Normal if app.pending_g() => "g_ | g top | G bottom | ^G cancel | ^C force".to_string(),
-        Mode::Normal if compact && area.width < 50 => "q quit | ? help | / | ^G | ^C".to_string(),
+        Mode::Normal if app.pending_g() => {
+            "g_ | gg top | G bottom | Esc/^G cancel | ^C force".to_string()
+        }
+        Mode::Normal if compact && area.width < 50 => {
+            format!("next: {} | q quit | ? | ^G | ^C", tiny_next_action(app))
+        }
         Mode::Normal if compact => {
-            format!("next: {} | q quit | ? help | / | ^G | ^C", next_action(app))
+            format!(
+                "next: {} | q quit | ? help | / filter | ^G | ^C",
+                compact_next_action(app)
+            )
         }
         Mode::Normal => normal_footer(app),
         Mode::Preview if compact => "preview | q | Pg | ^G | ^C".to_string(),
@@ -659,28 +686,48 @@ fn next_action(app: &App) -> &'static str {
     }
 }
 
-fn header_separator(theme: Theme) -> Span<'static> {
-    Span::styled(" | ", theme.style(Tone::Separator))
+fn compact_next_action(app: &App) -> &'static str {
+    match app.entries().get(app.cursor()).map(|entry| entry.kind) {
+        Some(FileKind::Directory) => "Enter open",
+        Some(FileKind::File) => "Enter preview",
+        Some(FileKind::Symlink) => "Enter inspect",
+        Some(FileKind::Other) => "Space mark",
+        None => "r refresh",
+    }
 }
 
-fn append_header_stat(
-    spans: &mut Vec<Span<'static>>,
+fn tiny_next_action(app: &App) -> &'static str {
+    match app.entries().get(app.cursor()).map(|entry| entry.kind) {
+        Some(FileKind::Directory) => "open",
+        Some(FileKind::File) => "preview",
+        Some(FileKind::Symlink) => "inspect",
+        Some(FileKind::Other) => "mark",
+        None => "refresh",
+    }
+}
+
+fn workbench_chip(
     theme: Theme,
-    label: &'static str,
+    label: &str,
     value: impl std::fmt::Display,
-    tone: Tone,
-) {
-    spans.push(header_separator(theme));
-    spans.extend(header_stat(theme, label, value, tone));
+    tone: ChipTone,
+    emphasized: bool,
+) -> Span<'static> {
+    let style = if emphasized {
+        theme.chip_tone(tone)
+    } else {
+        theme.subtle_chip_tone(tone)
+    };
+    chip(label, value, style)
 }
 
-fn buffer_header_tone(label: &str) -> Tone {
+fn buffer_chip_tone(label: &str) -> (ChipTone, bool) {
     if label.starts_with("COPY") {
-        Tone::Copy
+        (ChipTone::Copy, true)
     } else if label.starts_with("CUT") {
-        Tone::Cut
+        (ChipTone::Cut, true)
     } else {
-        Tone::Inactive
+        (ChipTone::Muted, false)
     }
 }
 

@@ -24,8 +24,11 @@
 - Changed cluster resource bars to style filled and empty segments separately, making high-load metrics stand out while keeping ASCII bar characters for lightweight remote terminals.
 - Changed the TUI theme layer to use shared semantic `Tone` / `ChipTone` primitives for panel chrome, footer styling, key-value rows, and resource bars.
 - Changed workbench and cluster panels to distinguish active and inactive chrome, making the current work surface easier to scan without adding layout weight.
-- Changed the workbench status header to use plain semantic key-value text instead of filled background chips, avoiding unreadable `hidden OFF` combinations on light terminal palettes.
 - Changed compact workbench status to show the full copy/cut buffer label instead of a generic copy count.
+- Changed workbench header chips to keep the filled status shape while using theme-level foreground/background pairs, improving `hidden OFF` and empty-filter readability across terminal palettes.
+- Changed compact workbench and cluster headers to retain the same chip visual language as the wide layouts.
+- Changed remote `tersh --c` workbench launches to forward only UI-related `TERSH_*` settings, keeping nested workbench themes consistent without forwarding unrelated environment.
+- Changed compact workbench footer hints to keep a page-aware `next:` recommendation visible on very narrow terminals.
 - Changed file preview caching from a single entry to a bounded LRU cache for faster adjacent-file navigation without retaining stale same-path previews.
 - Changed directory entries to cache lowercase names, reducing repeated allocation during filtering and sorting.
 - Changed file rows to show cursor, selection, and copy/cut buffer state in a fixed row marker so the active operation target is easier to scan.

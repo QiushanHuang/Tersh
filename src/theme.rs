@@ -37,6 +37,12 @@ pub struct Palette {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColorPair {
+    pub fg: Color,
+    pub bg: Color,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tone {
     Text,
     Muted,
@@ -255,9 +261,37 @@ impl Theme {
         }
     }
 
-    pub fn chip_tone(self, tone: ChipTone) -> Style {
+    pub fn filled(self, pair: ColorPair) -> Style {
+        match self {
+            Self::Mono => Style::default(),
+            _ => Style::default().fg(pair.fg).bg(pair.bg),
+        }
+    }
+
+    pub fn chip_pair(self, tone: ChipTone) -> ColorPair {
         let palette = self.palette();
-        self.chip(palette.text, self.color(tone.tone()))
+        ColorPair {
+            fg: palette.selected_fg,
+            bg: self.color(tone.tone()),
+        }
+    }
+
+    pub fn chip_tone(self, tone: ChipTone) -> Style {
+        self.filled(self.chip_pair(tone))
+            .add_modifier(Modifier::BOLD)
+    }
+
+    pub fn subtle_chip_tone(self, tone: ChipTone) -> Style {
+        self.filled(self.chip_pair(tone))
+    }
+
+    pub fn search_match(self) -> Style {
+        let palette = self.palette();
+        self.filled(ColorPair {
+            fg: palette.selected_fg,
+            bg: palette.search_match,
+        })
+        .add_modifier(Modifier::BOLD)
     }
 
     pub fn selected(self) -> Style {
@@ -355,19 +389,6 @@ pub fn kv_line(theme: Theme, key: &'static str, value: impl Into<String>) -> Lin
         Span::styled(format!("{key}: "), theme.style(Tone::Key)),
         Span::styled(value.into(), theme.style(Tone::Value)),
     ])
-}
-
-pub fn header_stat(
-    theme: Theme,
-    label: &'static str,
-    value: impl std::fmt::Display,
-    tone: Tone,
-) -> Vec<Span<'static>> {
-    vec![
-        Span::styled(label.to_string(), theme.bold(Tone::Key)),
-        Span::raw(" "),
-        Span::styled(value.to_string(), theme.style(tone)),
-    ]
 }
 
 pub fn footer_line(theme: Theme, text: &str) -> Line<'static> {
