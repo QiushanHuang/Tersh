@@ -1,8 +1,8 @@
 use crate::{
     cluster::{ClusterApp, ClusterMode, ConnectionState, HostKind, HostSnapshot},
     theme::{
-        ChipTone, Theme, Tone, base_block, chip, footer_compact, footer_paragraph, kv_line,
-        panel_block, resource_bar, section_line,
+        Theme, Tone, base_block, chip, footer_compact, footer_paragraph, kv_line, panel_block,
+        resource_bar, section_line,
     },
 };
 use ratatui::{
@@ -40,59 +40,38 @@ pub fn draw(frame: &mut Frame, app: &ClusterApp) {
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
-    if area.width < 64 {
-        draw_compact_header(frame, area, app, theme);
-        return;
-    }
+    let palette = theme.palette();
     let lines = vec![Line::from(vec![
-        Span::styled("Cluster Status", theme.bold(Tone::Title)),
+        Span::styled("Cluster Status", theme.fg_bold(palette.panel_title)),
         Span::raw("  "),
-        chip("OK", app.online_count(), theme.chip_tone(ChipTone::Ok)),
+        chip(
+            "OK",
+            app.online_count(),
+            theme.chip(palette.text, palette.ok),
+        ),
         Span::raw(" "),
-        chip("OLD", app.stale_count(), theme.chip_tone(ChipTone::Warn)),
+        chip(
+            "OLD",
+            app.stale_count(),
+            theme.chip(palette.text, palette.warn),
+        ),
         Span::raw(" "),
         chip(
             "FAIL",
             app.offline_count(),
-            theme.chip_tone(ChipTone::Danger),
+            theme.chip(palette.text, palette.danger),
         ),
         Span::raw(" "),
         chip(
             "CHK",
             format!("{}/{}", app.checking_count(), app.hosts().len()),
-            theme.chip_tone(ChipTone::Accent),
+            theme.chip(palette.text, palette.accent),
         ),
-        Span::styled(" | ", theme.style(Tone::Separator)),
-        Span::styled("src ", theme.style(Tone::Key)),
-        Span::styled(ascii_safe(&app.inventory_label()), theme.style(Tone::Muted)),
+        Span::styled(" | ", theme.fg(palette.separator)),
+        Span::styled("src ", theme.fg(palette.key)),
+        Span::styled(ascii_safe(&app.inventory_label()), theme.fg(palette.muted)),
     ])];
     let paragraph = Paragraph::new(lines).block(base_block().borders(Borders::ALL));
-    frame.render_widget(paragraph, area);
-}
-
-fn draw_compact_header(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
-    let mut spans = vec![
-        Span::styled("Cluster", theme.bold(Tone::Title)),
-        Span::raw(" "),
-        chip("OK", app.online_count(), theme.chip_tone(ChipTone::Ok)),
-        Span::raw(" "),
-        chip(
-            "FAIL",
-            app.offline_count(),
-            theme.chip_tone(ChipTone::Danger),
-        ),
-    ];
-    if area.width >= 50 {
-        spans.extend([
-            Span::raw(" "),
-            chip(
-                "CHK",
-                format!("{}/{}", app.checking_count(), app.hosts().len()),
-                theme.chip_tone(ChipTone::Accent),
-            ),
-        ]);
-    }
-    let paragraph = Paragraph::new(Line::from(spans)).block(base_block().borders(Borders::ALL));
     frame.render_widget(paragraph, area);
 }
 
