@@ -558,14 +558,12 @@ fn draw_input_modal(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
             _ => "",
         };
         lines.push(Line::from(format!("required: {required}")));
-        lines.push(Line::from(format!(
-            "typed: {}",
-            if app.input().is_empty() {
-                "-"
-            } else {
-                app.input()
-            }
-        )));
+        let typed = if app.input().is_empty() {
+            "-".to_string()
+        } else {
+            escape_display(app.input())
+        };
+        lines.push(Line::from(format!("typed: {typed}")));
         lines.push(Line::from(format!(
             "targets: {} {}",
             app.operation_target_count(),

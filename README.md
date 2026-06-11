@@ -8,7 +8,7 @@
 [![Shell Workflow](https://img.shields.io/badge/Workflow-Local%20%7C%20SSH%20Shell-0f766e)](#local-and-ssh-shell-sessions)
 [![Mobile Friendly](https://img.shields.io/badge/Focus-Mobile--Friendly-2563eb)](#mobile-friendly-terminal-workflow)
 [![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Linux-475569)](#installation)
-[![Status](https://img.shields.io/badge/Status-v1.1.0-16a34a)](#project-status)
+[![Status](https://img.shields.io/badge/Status-v1.1.1-16a34a)](#project-status)
 [![License](https://img.shields.io/badge/License-MIT-16a34a)](#license)
 
 <a id="english"></a>
@@ -126,7 +126,7 @@ export PATH="$HOME/.cargo/bin:$PATH"
 if command -v rustup >/dev/null 2>&1; then
   rustup update stable
 fi
-cargo install --git https://github.com/QiushanHuang/Tersh.git --tag v1.1.0 --bin tersh --force
+cargo install --locked --git https://github.com/QiushanHuang/Tersh.git --bin tersh --force
 
 tersh --help
 tersh
@@ -134,7 +134,7 @@ tersh
 
 Run this same block on a remote server after SSH if you want the `t` action inside the `tersh --cluster` dashboard to open the Tersh workbench on that remote host.
 
-Tersh v1.1.0 requires Rust 1.85 or newer.
+Tersh requires Rust 1.88 or newer.
 
 ### Clone And Install From Source
 
@@ -322,7 +322,7 @@ It aims to keep the speed and portability of terminal work while removing repeti
 
 ## Project Status
 
-This repository is at v1.1.0.
+This repository is at v1.1.1.
 
 The current implementation focuses on a stable terminal workflow:
 
@@ -490,7 +490,7 @@ export PATH="$HOME/.cargo/bin:$PATH"
 if command -v rustup >/dev/null 2>&1; then
   rustup update stable
 fi
-cargo install --git https://github.com/QiushanHuang/Tersh.git --tag v1.1.0 --bin tersh --force
+cargo install --locked --git https://github.com/QiushanHuang/Tersh.git --bin tersh --force
 
 tersh --help
 tersh
@@ -498,7 +498,7 @@ tersh
 
 如果你已经 SSH 到服务器上，就在服务器终端里运行同一段命令；这样在 `tersh --cluster` 状态面板里按 `t` 时，才能在那台远端主机上打开 Tersh 文件工作台。
 
-Tersh v1.1.0 需要 Rust 1.85 或更新版本。
+Tersh 需要 Rust 1.88 或更新版本。
 
 ### 克隆源码并安装
 
@@ -686,7 +686,7 @@ Tersh 处在原始 shell 命令和完整远程文件管理器之间。
 
 ## 项目状态
 
-项目目前已进入 v1.1.0。
+项目目前已进入 v1.1.1。
 
 当前实现聚焦在一条稳定的终端工作流上：
 

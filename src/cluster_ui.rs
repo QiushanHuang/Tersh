@@ -516,7 +516,7 @@ fn resource_line(
         MetricKind::Memory => memory_metric(raw),
         MetricKind::Storage => percent_from_token(raw).map(|percent| (percent, "used")),
         MetricKind::Gpu if raw.eq_ignore_ascii_case("none") => None,
-        MetricKind::Gpu => percent_from_token(raw).map(|percent| (percent, "")),
+        MetricKind::Gpu => gpu_metric(raw),
     };
     let bar_percent = metric.map(|(percent, _)| percent);
     let percent_text = metric
@@ -549,6 +549,20 @@ fn memory_metric(raw: &str) -> Option<(u16, &'static str)> {
     }
 }
 
+fn gpu_metric(raw: &str) -> Option<(u16, &'static str)> {
+    if let Some(percent) = percent_from_token(raw) {
+        return Some((percent, ""));
+    }
+    raw.split(';').find_map(|gpu| {
+        let mut fields = gpu.split(',').map(str::trim);
+        fields.next()?;
+        fields
+            .next()
+            .and_then(parse_percent_number)
+            .map(|percent| (percent, ""))
+    })
+}
+
 fn percent_from_token(input: &str) -> Option<u16> {
     for (index, ch) in input.char_indices() {
         if ch != '%' && ch != '％' {
@@ -566,11 +580,16 @@ fn percent_from_token(input: &str) -> Option<u16> {
         if number.is_empty() {
             continue;
         }
-        if let Ok(value) = number.parse::<f64>() {
-            return Some(clamp_percent(value.round().max(0.0) as u16));
+        if let Some(value) = parse_percent_number(&number) {
+            return Some(value);
         }
     }
     None
+}
+
+fn parse_percent_number(value: &str) -> Option<u16> {
+    let value = value.trim().parse::<f64>().ok()?;
+    Some(clamp_percent(value.round().max(0.0) as u16))
 }
 
 fn clamp_percent(value: u16) -> u16 {

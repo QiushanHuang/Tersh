@@ -8,12 +8,13 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use serde::Deserialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env, fs, io,
+    env, fs,
+    io::{self, Read},
     path::{Path, PathBuf},
     process::{Child, Command as ProcessCommand, Stdio},
     sync::mpsc,
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime},
 };
 
 const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
@@ -22,6 +23,8 @@ const MAX_CONCURRENT_PROBES: usize = 16;
 const MAX_PROBE_OUTPUT_BYTES: u64 = 1024 * 1024;
 
 const PROBE_SCRIPT: &str = r#"
+PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/local/cuda/bin:$PATH"
+export PATH
 printf 'hostname=%s\n' "$(hostname 2>/dev/null || echo unknown)"
 printf 'system=%s\n' "$(uname -srm 2>/dev/null || uname -a 2>/dev/null || echo unknown)"
 printf 'uptime=%s\n' "$(uptime 2>/dev/null | sed 's/^ *//')"
@@ -49,6 +52,8 @@ else
   printf 'gpu=none\n'
 fi
 "#;
+
+const PATH_BOOTSTRAP_SCRIPT: &str = r#"PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/local/cuda/bin:$PATH"; export PATH"#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostKind {
@@ -1056,6 +1061,10 @@ pub fn ssh_probe_args(host: &HostConfig) -> Vec<String> {
         "-o".to_string(),
         "BatchMode=yes".to_string(),
         "-o".to_string(),
+        "ClearAllForwardings=yes".to_string(),
+        "-o".to_string(),
+        "PermitLocalCommand=no".to_string(),
+        "-o".to_string(),
         "ConnectTimeout=3".to_string(),
         "-o".to_string(),
         "ConnectionAttempts=1".to_string(),
@@ -1135,6 +1144,7 @@ pub fn host_workbench_command(host: &HostConfig, local_tersh_program: &str) -> S
         };
         let mut args = Vec::new();
         if let Some(workdir) = host.workdir().filter(|workdir| !workdir.trim().is_empty()) {
+            args.push("--".to_string());
             args.push(workdir.to_string());
         }
         return SessionCommand {
@@ -1211,9 +1221,10 @@ fn current_tersh_program() -> String {
 
 fn remote_workbench_command(workdir: Option<&str>) -> String {
     let mut script = format!(
-        "if ! command -v tersh >/dev/null 2>&1; then printf '%s\\n' {} >&2; exit 127; fi",
+        "{}; if ! command -v tersh >/dev/null 2>&1; then printf '%s\\n' {} >&2; exit 127; fi",
+        PATH_BOOTSTRAP_SCRIPT,
         shell_quote(
-            "tersh is not installed or not in PATH. Install: cargo install --git https://github.com/QiushanHuang/Tersh.git --tag v1.1.0 --bin tersh --force"
+            "tersh is not installed or not in PATH. Install: cargo install --locked --git https://github.com/QiushanHuang/Tersh.git --bin tersh --force"
         )
     );
     if let Some(workdir) = workdir.map(str::trim).filter(|workdir| !workdir.is_empty()) {
@@ -1231,13 +1242,13 @@ fn remote_probe_command(script: &str) -> String {
     if cfg!(windows) {
         format!("cmd /C \"{}\"", script.replace('"', "\\\""))
     } else {
-        format!("sh -lc {}", shell_quote(script))
+        format!("sh -c {}", shell_quote(script))
     }
 }
 
 #[cfg(not(windows))]
 fn local_probe_shell() -> (&'static str, Vec<String>) {
-    ("sh", vec!["-lc".to_string()])
+    ("sh", vec!["-c".to_string()])
 }
 
 #[cfg(windows)]
@@ -1246,27 +1257,23 @@ fn local_probe_shell() -> (&'static str, Vec<String>) {
 }
 
 fn run_command_with_timeout(mut command: ProcessCommand, timeout: Duration) -> Result<String> {
-    let temp_files = TempProbeFiles::new();
-    let stdout = fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .truncate(true)
-        .open(&temp_files.stdout)
-        .context("create temp stdout file")?;
-    let stderr = fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .truncate(true)
-        .open(&temp_files.stderr)
-        .context("create temp stderr file")?;
-
     configure_probe_command(&mut command);
 
     let mut child = command
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .context("start probe command")?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("capture probe stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("capture probe stderr"))?;
+    let stdout_handle = thread::spawn(move || read_lossy_limited(stdout, "stdout"));
+    let stderr_handle = thread::spawn(move || read_lossy_limited(stderr, "stderr"));
     let started = Instant::now();
     let mut timed_out = false;
     let status = loop {
@@ -1281,8 +1288,8 @@ fn run_command_with_timeout(mut command: ProcessCommand, timeout: Duration) -> R
         thread::sleep(Duration::from_millis(50));
     };
 
-    let stdout = read_lossy_limited(&temp_files.stdout, "stdout")?;
-    let stderr = read_lossy_limited(&temp_files.stderr, "stderr")?;
+    let stdout = join_probe_reader(stdout_handle, "stdout")?;
+    let stderr = join_probe_reader(stderr_handle, "stderr")?;
 
     if timed_out {
         let mut message = format!("probe timed out after {}s", timeout.as_secs());
@@ -1303,17 +1310,34 @@ fn run_command_with_timeout(mut command: ProcessCommand, timeout: Duration) -> R
     anyhow::bail!("{stderr}");
 }
 
-fn read_lossy_limited(path: &Path, stream: &str) -> Result<String> {
-    let metadata =
-        fs::metadata(path).with_context(|| format!("failed to inspect {}", path.display()))?;
-    if metadata.len() > MAX_PROBE_OUTPUT_BYTES {
-        anyhow::bail!(
-            "probe output too large: {stream} exceeded {} bytes",
-            MAX_PROBE_OUTPUT_BYTES
-        );
+fn read_lossy_limited<R: Read>(mut reader: R, stream: &str) -> Result<String> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0; 8192];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .with_context(|| format!("failed to read probe {stream}"))?;
+        if read == 0 {
+            break;
+        }
+        if bytes.len().saturating_add(read) > MAX_PROBE_OUTPUT_BYTES as usize {
+            anyhow::bail!(
+                "probe output too large: {stream} exceeded {} bytes",
+                MAX_PROBE_OUTPUT_BYTES
+            );
+        }
+        bytes.extend_from_slice(&buffer[..read]);
     }
-    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn join_probe_reader(
+    handle: thread::JoinHandle<Result<String>>,
+    stream: &'static str,
+) -> Result<String> {
+    handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("probe {stream} reader panicked"))?
 }
 
 #[cfg(unix)]
@@ -1347,36 +1371,6 @@ fn terminate_probe_child(child: &mut Child) {
 #[cfg(not(unix))]
 fn terminate_probe_child(child: &mut Child) {
     let _ = child.kill();
-}
-
-struct TempProbeFiles {
-    stdout: PathBuf,
-    stderr: PathBuf,
-}
-
-impl TempProbeFiles {
-    fn new() -> Self {
-        Self {
-            stdout: tempfile_path("tersh-probe-stdout"),
-            stderr: tempfile_path("tersh-probe-stderr"),
-        }
-    }
-}
-
-impl Drop for TempProbeFiles {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.stdout);
-        let _ = fs::remove_file(&self.stderr);
-    }
-}
-
-fn tempfile_path(prefix: &str) -> PathBuf {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|time| time.as_nanos())
-        .unwrap_or_default();
-    let pid = std::process::id();
-    std::env::temp_dir().join(format!("{prefix}-{pid}-{now}.log"))
 }
 
 fn key_to_command(key: KeyEvent) -> Option<ClusterCommand> {
@@ -1671,6 +1665,13 @@ mod tests {
 
         assert_eq!(app.hosts().len(), 1);
         assert!(app.snapshot_for("dup").is_some());
+    }
+
+    #[test]
+    fn probe_script_bootstraps_common_non_login_shell_paths() {
+        assert!(PROBE_SCRIPT.contains("$HOME/.cargo/bin"));
+        assert!(PROBE_SCRIPT.contains("/usr/local/cuda/bin"));
+        assert!(PROBE_SCRIPT.contains("export PATH"));
     }
 
     #[test]
