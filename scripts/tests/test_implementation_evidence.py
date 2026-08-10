@@ -263,6 +263,23 @@ class ImplementationEvidenceTests(unittest.TestCase):
                 for other in {"json", "stdout", "stderr"} - {suffix}:
                     self.assertFalse(pathlib.Path(f"{base}.{other}").exists())
 
+        output_root = self.root / "collision-extra"
+        base = self.gate_base(output_root=output_root, name="collision")
+        base.parent.mkdir(parents=True)
+        extra = pathlib.Path(f"{base}.extra")
+        extra.write_bytes(b"immutable-extra")
+        before = (extra.stat().st_ino, extra.read_bytes())
+        marker = self.root / "child-extra.marker"
+        result = self.run_gate(
+            output_root=output_root,
+            name="collision",
+            child=self.marker_child(marker),
+        )
+        self.assert_child_not_run(result, marker)
+        self.assertEqual((extra.stat().st_ino, extra.read_bytes()), before)
+        for suffix in ("json", "stdout", "stderr"):
+            self.assertFalse(pathlib.Path(f"{base}.{suffix}").exists())
+
     def test_evidence_id_union_accepts_only_impl_or_hardening_01_through_07(self):
         valid_ids = [f"{family}-0{number}" for family in ("impl", "hardening") for number in range(1, 8)]
         self.assertEqual(len(valid_ids), 14)

@@ -614,7 +614,9 @@ Run:
 
 ```bash
 python3 -m unittest scripts.tests.test_run_exact_test scripts.tests.test_implementation_evidence -v
-TERSH_HARNESS_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/tersh-evidence-harness.XXXXXX")"
+TERSH_HARNESS_PARENT="${TMPDIR:-/tmp}"
+TERSH_HARNESS_RAW="$(mktemp -d "${TERSH_HARNESS_PARENT%/}/tersh-evidence-harness.XXXXXX")"
+TERSH_HARNESS_ROOT="$(cd "$TERSH_HARNESS_RAW" && pwd -P)"
 trap 'rm -rf -- "$TERSH_HARNESS_ROOT"' EXIT
 python3 scripts/implementation_evidence/run_gate.py --iteration impl-01 --attempt 001 --run-binding run-local --name expected-failure --candidate "$(git rev-parse HEAD)" --output-root "$TERSH_HARNESS_ROOT" --allow-failure -- sh -c 'exit 7'
 python3 -c 'import json,pathlib,sys; p=list(pathlib.Path(sys.argv[1]).glob("impl-01/attempt-001/candidate-*/run-local/gates/expected-failure.json")); assert len(p)==1; d=json.loads(p[0].read_text()); assert d["exit_code"] == 7 and d["evidence_attempt"] == "001"; assert p[0].with_suffix(".stdout").is_file() and p[0].with_suffix(".stderr").is_file()' "$TERSH_HARNESS_ROOT"

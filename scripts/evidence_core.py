@@ -222,6 +222,34 @@ def _entry_exists(parent_fd: int, name: str) -> bool:
     return True
 
 
+def _gate_namespace_extras(
+    gates_fd: int,
+    basename: str,
+    *,
+    allow_reservation: bool,
+) -> list[str]:
+    finals = {f"{basename}.{suffix}" for suffix in ("json", "stdout", "stderr")}
+    allowed = set(finals)
+    if allow_reservation:
+        allowed.add(f".{basename}.reservation")
+    try:
+        entries = os.listdir(gates_fd)
+    except OSError as error:
+        raise EvidenceError(f"cannot inventory gate evidence directory: {error}") from error
+    visible_prefix = f"{basename}."
+    internal_prefix = f".{basename}."
+    return sorted(
+        entry
+        for entry in entries
+        if (
+            entry == basename
+            or entry.startswith(visible_prefix)
+            or entry.startswith(internal_prefix)
+        )
+        and entry not in allowed
+    )
+
+
 @dataclass
 class GateReservation:
     directory_fd: int
@@ -247,6 +275,9 @@ class GateReservation:
 def reserve_gate_triplet(gates_fd: int, basename: str) -> GateReservation:
     validate_gate_name(basename)
     finals = tuple(f"{basename}.{suffix}" for suffix in ("json", "stdout", "stderr"))
+    extras = _gate_namespace_extras(gates_fd, basename, allow_reservation=False)
+    if extras:
+        raise EvidenceError(f"unexpected gate evidence entries: {', '.join(extras)}")
     colliding = [name for name in finals if _entry_exists(gates_fd, name)]
     if colliding:
         raise EvidenceError(f"gate evidence already exists: {', '.join(colliding)}")
@@ -264,12 +295,15 @@ def reserve_gate_triplet(gates_fd: int, basename: str) -> GateReservation:
     finally:
         os.close(reservation_fd)
     os.fsync(gates_fd)
+    extras = _gate_namespace_extras(gates_fd, basename, allow_reservation=True)
     colliding = [name for name in finals if _entry_exists(gates_fd, name)]
-    if colliding:
+    if extras or colliding:
         try:
             os.unlink(reservation_name, dir_fd=gates_fd)
         finally:
             os.fsync(gates_fd)
+        if extras:
+            raise EvidenceError(f"unexpected gate evidence entries appeared: {', '.join(extras)}")
         raise EvidenceError(f"gate evidence appeared during reservation: {', '.join(colliding)}")
     return GateReservation(os.dup(gates_fd), basename, reservation_name)
 
