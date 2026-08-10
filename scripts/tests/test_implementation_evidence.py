@@ -513,6 +513,27 @@ class ImplementationEvidenceTests(unittest.TestCase):
                             "bad-result-member-handle requires a member-producing operation"
                         )
                     reply["result"][member_field] = "not-a-handle"
+                if scenario == "reused-predecessor-context-handle":
+                    if context_handle is None:
+                        raise AssertionError(
+                            "reused-predecessor-context-handle requires an input handle"
+                        )
+                    reply["result"]["context_handle"] = context_handle
+                if scenario in (
+                    "member-aliases-predecessor",
+                    "member-aliases-successor",
+                ):
+                    member_field = {
+                        "capture-invocation": "invocation_handle",
+                        "capture-response": "response_handle",
+                    }.get(operation)
+                    if member_field is None or context_handle is None:
+                        raise AssertionError(f"{scenario} requires a member-producing operation")
+                    reply["result"][member_field] = (
+                        context_handle
+                        if scenario == "member-aliases-predecessor"
+                        else reply["result"]["context_handle"]
+                    )
                 fixture_send_frame(host, reply)
                 if scenario == "missing-reply-end":
                     host.shutdown(socket.SHUT_WR)
@@ -1921,7 +1942,14 @@ class ImplementationEvidenceTests(unittest.TestCase):
                 "bad-result-context-handle",
             ]
             if operation != "capture-context":
-                scenarios.append("bad-result-member-handle")
+                scenarios.extend(
+                    (
+                        "bad-result-member-handle",
+                        "reused-predecessor-context-handle",
+                        "member-aliases-predecessor",
+                        "member-aliases-successor",
+                    )
+                )
             for scenario in scenarios:
                 with self.subTest(result_operation=operation, result_attack=scenario):
                     store = ScriptedCaptureStore()
