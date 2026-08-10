@@ -111,7 +111,7 @@ def run_child(argv: Sequence[str], phase: str) -> tuple[str, str]:
 
 
 def parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
-    parser = ContractArgumentParser(prog="run_exact_test.py")
+    parser = ContractArgumentParser(prog="run_exact_test.py", allow_abbrev=False)
     parser.add_argument(
         "--test", dest="integration_target", action=SingleUseAction,
         rejection_code="selector",

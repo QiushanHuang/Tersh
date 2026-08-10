@@ -128,7 +128,7 @@ class ExactRunnerTests(unittest.TestCase):
         self, *extra, mode="ok", name="suite::works", case_payloads=None,
         list_case_payloads=None, stderr_case_payloads=None,
         list_stderr_case_payloads=None, list_stderr_lines=None,
-        execute_stderr_lines=None,
+        execute_stderr_lines=None, append_cargo_bin=True,
     ):
         env = os.environ.copy()
         env.update(
@@ -143,8 +143,11 @@ class ExactRunnerTests(unittest.TestCase):
             FAKE_CARGO_EXECUTE_STDERR_LINES=json.dumps(execute_stderr_lines or []),
             PYTHONDONTWRITEBYTECODE="1",
         )
+        command = [sys.executable, str(RUNNER), *extra]
+        if append_cargo_bin:
+            command += ["--cargo-bin", str(self.cargo)]
         return subprocess.run(
-            [sys.executable, str(RUNNER), *extra, "--cargo-bin", str(self.cargo)],
+            command,
             cwd=ROOT,
             env=env,
             text=True,
@@ -315,6 +318,32 @@ class ExactRunnerTests(unittest.TestCase):
             with self.subTest(argv=argv):
                 self.log.unlink(missing_ok=True)
                 result = self.run_runner(*argv)
+                self.assert_rejected(result, "arguments", 0)
+
+        abbreviated_options = (
+            (("--tes", "fixture", "--name", "suite::works"), True),
+            (("--test", "fixture", "--na", "suite::works"), True),
+            (("--test", "fixture", "--name", "suite::works", "--seri"), True),
+            (("--test", "fixture", "--name", "suite::works", "--igno"), True),
+            (
+                (
+                    "--test", "fixture", "--name", "suite::works",
+                    "--case-mat", "frozen-v1", "--expect-case", "alpha",
+                ),
+                True,
+            ),
+            (
+                (
+                    "--test", "fixture", "--name", "suite::works",
+                    "--cargo-b", str(self.cargo),
+                ),
+                False,
+            ),
+        )
+        for argv, append_cargo_bin in abbreviated_options:
+            with self.subTest(argv=argv):
+                self.log.unlink(missing_ok=True)
+                result = self.run_runner(*argv, append_cargo_bin=append_cargo_bin)
                 self.assert_rejected(result, "arguments", 0)
 
     def test_exact_runner_lib_rejects_zero_discovered_or_zero_executed(self):
