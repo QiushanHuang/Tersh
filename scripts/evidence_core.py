@@ -13,6 +13,8 @@ import os
 import re
 import secrets
 import stat
+import subprocess
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -31,10 +33,107 @@ RUN_BINDING_RE = re.compile(
     r"))$"
 )
 HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+DEFAULT_RETAIN_LIMIT = 1024 * 1024
 
 
 class EvidenceError(Exception):
     """A bounded, user-facing fail-closed evidence error."""
+
+
+@dataclass(frozen=True)
+class DrainedStream:
+    total_bytes: int
+    sha256: str
+    retained: bytes
+    retained_sha256: str
+
+
+def _drain_stream(
+    pipe: Any,
+    result: dict[str, DrainedStream],
+    key: str,
+    errors: list[BaseException],
+    retain_limit: int,
+) -> None:
+    digest = hashlib.sha256()
+    retained = bytearray()
+    total = 0
+    try:
+        while True:
+            chunk = pipe.read(65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            digest.update(chunk)
+            remaining = retain_limit - len(retained)
+            if remaining > 0:
+                retained.extend(chunk[:remaining])
+        retained_bytes = bytes(retained)
+        result[key] = DrainedStream(
+            total_bytes=total,
+            sha256=digest.hexdigest(),
+            retained=retained_bytes,
+            retained_sha256=hashlib.sha256(retained_bytes).hexdigest(),
+        )
+    except BaseException as error:
+        errors.append(error)
+    finally:
+        try:
+            pipe.close()
+        except BaseException as error:
+            errors.append(error)
+
+
+def run_and_drain(
+    argv: Sequence[str],
+    *,
+    retain_limit: int = DEFAULT_RETAIN_LIMIT,
+) -> tuple[int, DrainedStream, DrainedStream]:
+    """Run one argv without a shell and concurrently drain both byte streams."""
+
+    if isinstance(argv, (str, bytes)) or not argv:
+        raise EvidenceError("child argv must be a nonempty sequence")
+    command = list(argv)
+    if any(type(item) is not str or "\x00" in item for item in command):
+        raise EvidenceError("child argv contains a non-string or NUL")
+    require_exact_int(retain_limit, "retain limit", minimum=0)
+    try:
+        child = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=False,
+        )
+    except OSError as error:
+        raise EvidenceError(f"child could not start: {error}") from error
+    if child.stdout is None or child.stderr is None:
+        child.kill()
+        child.wait()
+        raise EvidenceError("child pipes were not created")
+
+    drained: dict[str, DrainedStream] = {}
+    errors: list[BaseException] = []
+    readers = [
+        threading.Thread(
+            target=_drain_stream,
+            args=(child.stdout, drained, "stdout", errors, retain_limit),
+        ),
+        threading.Thread(
+            target=_drain_stream,
+            args=(child.stderr, drained, "stderr", errors, retain_limit),
+        ),
+    ]
+    for reader in readers:
+        reader.start()
+    returncode = child.wait()
+    for reader in readers:
+        reader.join()
+    if errors:
+        raise EvidenceError(f"child output drain failed: {errors[0]}")
+    if set(drained) != {"stdout", "stderr"}:
+        raise EvidenceError("child output drain did not produce both streams")
+    return returncode, drained["stdout"], drained["stderr"]
 
 
 def canonical_json_bytes(value: Any) -> bytes:
@@ -376,6 +475,27 @@ def candidate_relative_log_path(run_binding: str, gate_name: str, stream: str) -
     if stream not in ("stdout", "stderr"):
         raise EvidenceError(f"invalid gate stream: {stream!r}")
     return f"{run_binding}/gates/{gate_name}.{stream}"
+
+
+def gate_stream_record(
+    drained: DrainedStream,
+    run_binding: str,
+    gate_name: str,
+    stream_name: str,
+) -> dict[str, Any]:
+    if not isinstance(drained, DrainedStream):
+        raise EvidenceError("gate stream must be a DrainedStream")
+    return {
+        "total_bytes": drained.total_bytes,
+        "sha256": drained.sha256,
+        "retained_bytes": len(drained.retained),
+        "retained_sha256": drained.retained_sha256,
+        "retained_log": candidate_relative_log_path(
+            run_binding,
+            gate_name,
+            stream_name,
+        ),
+    }
 
 
 def close_fds(*fds: int | None) -> None:

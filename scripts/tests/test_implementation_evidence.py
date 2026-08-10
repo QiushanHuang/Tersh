@@ -1,3 +1,4 @@
+import ast
 import hashlib
 import importlib
 import json
@@ -210,6 +211,76 @@ class ImplementationEvidenceTests(unittest.TestCase):
             self.assertEqual(stream["retained_sha256"], hashlib.sha256(retained).hexdigest())
             log_path = pathlib.Path(f"{base}.{stream_name}")
             self.assertEqual(log_path.read_bytes(), retained)
+
+    def test_run_gate_delegates_bounded_drain_and_stream_record_to_evidence_core(self):
+        tree = ast.parse(RUN_GATE.read_text(encoding="utf-8"), filename=str(RUN_GATE))
+        direct_imports = {
+            alias.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Import)
+            for alias in node.names
+        }
+        self.assertTrue(
+            {"hashlib", "threading"}.isdisjoint(direct_imports),
+            f"run_gate owns stream internals through imports: {direct_imports}",
+        )
+        self.assertFalse(
+            any(
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "Popen"
+                for node in ast.walk(tree)
+            ),
+            "run_gate must not spawn the gate child itself",
+        )
+        definitions = {
+            node.name
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        self.assertTrue(
+            {"DrainedStream", "_drain", "run_and_drain", "_stream_record"}.isdisjoint(definitions),
+            f"run_gate duplicates shared stream internals: {definitions}",
+        )
+        core_calls = {
+            node.func.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "core"
+        }
+        self.assertTrue({"run_and_drain", "gate_stream_record"}.issubset(core_calls), core_calls)
+
+        core = importlib.import_module("scripts.evidence_core")
+        run_and_drain = getattr(core, "run_and_drain", None)
+        stream_record = getattr(core, "gate_stream_record", None)
+        self.assertTrue(callable(run_and_drain), "evidence_core.run_and_drain is required")
+        self.assertTrue(callable(stream_record), "evidence_core.gate_stream_record is required")
+        exit_code, stdout, stderr = run_and_drain(
+            [
+                sys.executable,
+                "-c",
+                "import sys; sys.stdout.buffer.write(b'abc'); sys.stderr.buffer.write(b'defg'); raise SystemExit(9)",
+            ],
+            retain_limit=2,
+        )
+        self.assertEqual(exit_code, 9)
+        for stream, complete in ((stdout, b"abc"), (stderr, b"defg")):
+            self.assertEqual(stream.total_bytes, len(complete))
+            self.assertEqual(stream.sha256, hashlib.sha256(complete).hexdigest())
+            self.assertEqual(stream.retained, complete[:2])
+            self.assertEqual(stream.retained_sha256, hashlib.sha256(complete[:2]).hexdigest())
+        self.assertEqual(
+            stream_record(stdout, "run-local", "delegated", "stdout"),
+            {
+                "total_bytes": 3,
+                "sha256": hashlib.sha256(b"abc").hexdigest(),
+                "retained_bytes": 2,
+                "retained_sha256": hashlib.sha256(b"ab").hexdigest(),
+                "retained_log": "run-local/gates/delegated.stdout",
+            },
+        )
 
     def test_run_gate_preserves_child_status_candidate_attempt_and_run_binding(self):
         cases = (
