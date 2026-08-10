@@ -1719,9 +1719,11 @@ class ImplementationEvidenceTests(unittest.TestCase):
                 )
                 self.assertEqual(stderr.getvalue(), "")
 
+        oversized_fd = "9" * 1000
         invalid_argvs = (
             ("capture-context",),
             ("capture-context", "--host-store-fd"),
+            ("capture-context", "--host-store-fd", oversized_fd),
             (
                 "capture-invocation",
                 "--host-store-fd",
@@ -1773,6 +1775,9 @@ class ImplementationEvidenceTests(unittest.TestCase):
                     mock.patch.object(
                         adapter_module.core,
                         "open_authenticated_host_store_socket",
+                        side_effect=adapter_module.core.EvidenceError(
+                            "invalid argv reached authenticated opener"
+                        ),
                     ) as authenticated_open,
                     mock.patch.object(
                         adapter_module.core,
@@ -1789,6 +1794,24 @@ class ImplementationEvidenceTests(unittest.TestCase):
                 self.assertGreater(len(invalid_stderr.getvalue()), 0)
                 self.assertLessEqual(len(invalid_stderr.getvalue()), 8192)
                 self.assertNotIn("Traceback", invalid_stderr.getvalue())
+
+        oversized_fd_cli = subprocess.run(
+            [
+                *isolated_adapter_argv,
+                "capture-context",
+                "--host-store-fd",
+                oversized_fd,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=5,
+        )
+        self.assertNotEqual(oversized_fd_cli.returncode, 0)
+        self.assertEqual(oversized_fd_cli.stdout, b"")
+        self.assertGreater(len(oversized_fd_cli.stderr), 0)
+        self.assertLessEqual(len(oversized_fd_cli.stderr), 8192)
+        self.assertNotIn(b"Traceback", oversized_fd_cli.stderr)
 
         def run_with_fd(fd):
             return subprocess.run(
