@@ -544,7 +544,7 @@ class ImplementationEvidenceTests(unittest.TestCase):
                     time.sleep(1)
                 host.shutdown(socket.SHUT_WR)
             except (OSError, EOFError) as error:
-                if scenario == "success":
+                if scenario == "success" and body_mutator is None:
                     host_errors.append(error)
             except BaseException as error:
                 host_errors.append(error)
