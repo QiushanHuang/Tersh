@@ -153,6 +153,7 @@ def execute(arguments: argparse.Namespace, child_argv: list[str]) -> int:
         monotonic_end = time.monotonic_ns()
         ended_at = _utc_now()
         duration_ms = max(0, (monotonic_end - monotonic_start) // 1_000_000)
+        core.validate_gate_namespace(gates_fd, arguments.name, "reserved")
 
         record = {
             "schema": "tersh-implementation-gate-v1",
@@ -194,6 +195,9 @@ def execute(arguments: argparse.Namespace, child_argv: list[str]) -> int:
             f"{arguments.name}.json",
             core.canonical_json_bytes(record),
         )
+        core.validate_gate_namespace(gates_fd, arguments.name, "published")
+        reservation.release()
+        core.validate_gate_namespace(gates_fd, arguments.name, "complete")
         if arguments.allow_failure:
             return 0
         if exit_code >= 0:

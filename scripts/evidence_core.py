@@ -12,9 +12,12 @@ import json
 import os
 import re
 import secrets
+import selectors
+import signal
 import stat
 import subprocess
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -34,6 +37,9 @@ RUN_BINDING_RE = re.compile(
 )
 HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 DEFAULT_RETAIN_LIMIT = 1024 * 1024
+PROCESS_TERM_GRACE_SECONDS = 1.0
+PROCESS_KILL_GRACE_SECONDS = 1.0
+READER_CLEANUP_SECONDS = 1.0
 
 
 class EvidenceError(Exception):
@@ -54,13 +60,25 @@ def _drain_stream(
     key: str,
     errors: list[BaseException],
     retain_limit: int,
+    stop_event: threading.Event,
 ) -> None:
     digest = hashlib.sha256()
     retained = bytearray()
     total = 0
+    selector: selectors.BaseSelector | None = None
     try:
+        os.set_blocking(pipe.fileno(), False)
+        selector = selectors.DefaultSelector()
+        selector.register(pipe, selectors.EVENT_READ)
         while True:
-            chunk = pipe.read(65536)
+            if stop_event.is_set():
+                break
+            if not selector.select(timeout=0.05):
+                continue
+            try:
+                chunk = os.read(pipe.fileno(), 65536)
+            except BlockingIOError:
+                continue
             if not chunk:
                 break
             total += len(chunk)
@@ -78,10 +96,89 @@ def _drain_stream(
     except BaseException as error:
         errors.append(error)
     finally:
+        if selector is not None:
+            selector.close()
         try:
             pipe.close()
         except BaseException as error:
             errors.append(error)
+
+
+def _require_posix_process_groups() -> None:
+    if (
+        os.name != "posix"
+        or not callable(getattr(os, "killpg", None))
+        or not callable(getattr(os, "set_blocking", None))
+    ):
+        raise EvidenceError("POSIX process-group cleanup is unavailable")
+
+
+def _process_group_exists(process_group: int) -> bool:
+    try:
+        os.killpg(process_group, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _wait_process_group(child: subprocess.Popen[bytes], deadline: float) -> bool:
+    while True:
+        child.poll()
+        if not _process_group_exists(child.pid):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.01)
+
+
+def _cleanup_child_process_group(
+    child: subprocess.Popen[bytes],
+    readers: Sequence[threading.Thread],
+    stop_event: threading.Event | None,
+) -> None:
+    try:
+        os.killpg(child.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    term_deadline = time.monotonic() + PROCESS_TERM_GRACE_SECONDS
+    terminated = _wait_process_group(child, term_deadline)
+    if not terminated:
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        _wait_process_group(child, time.monotonic() + PROCESS_KILL_GRACE_SECONDS)
+
+    if child.poll() is None:
+        try:
+            child.wait(timeout=PROCESS_KILL_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait(timeout=PROCESS_KILL_GRACE_SECONDS)
+
+    reader_deadline = time.monotonic() + READER_CLEANUP_SECONDS
+    for reader in readers:
+        reader.join(timeout=max(0.0, reader_deadline - time.monotonic()))
+    if any(reader.is_alive() for reader in readers):
+        if stop_event is not None:
+            stop_event.set()
+        reader_deadline = time.monotonic() + READER_CLEANUP_SECONDS
+        for reader in readers:
+            reader.join(timeout=max(0.0, reader_deadline - time.monotonic()))
+    for pipe in (child.stdout, child.stderr):
+        if pipe is not None:
+            try:
+                pipe.close()
+            except OSError:
+                pass
+    if any(reader.is_alive() for reader in readers):
+        reader_deadline = time.monotonic() + READER_CLEANUP_SECONDS
+        for reader in readers:
+            reader.join(timeout=max(0.0, reader_deadline - time.monotonic()))
+    if any(reader.is_alive() for reader in readers):
+        raise EvidenceError("child output readers did not terminate during cleanup")
 
 
 def run_and_drain(
@@ -97,6 +194,7 @@ def run_and_drain(
     if any(type(item) is not str or "\x00" in item for item in command):
         raise EvidenceError("child argv contains a non-string or NUL")
     require_exact_int(retain_limit, "retain limit", minimum=0)
+    _require_posix_process_groups()
     try:
         child = subprocess.Popen(
             command,
@@ -104,6 +202,7 @@ def run_and_drain(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             shell=False,
+            start_new_session=True,
         )
     except OSError as error:
         raise EvidenceError(f"child could not start: {error}") from error
@@ -112,28 +211,36 @@ def run_and_drain(
         child.wait()
         raise EvidenceError("child pipes were not created")
 
-    drained: dict[str, DrainedStream] = {}
-    errors: list[BaseException] = []
-    readers = [
-        threading.Thread(
-            target=_drain_stream,
-            args=(child.stdout, drained, "stdout", errors, retain_limit),
-        ),
-        threading.Thread(
-            target=_drain_stream,
-            args=(child.stderr, drained, "stderr", errors, retain_limit),
-        ),
-    ]
-    for reader in readers:
-        reader.start()
-    returncode = child.wait()
-    for reader in readers:
-        reader.join()
-    if errors:
-        raise EvidenceError(f"child output drain failed: {errors[0]}")
-    if set(drained) != {"stdout", "stderr"}:
-        raise EvidenceError("child output drain did not produce both streams")
-    return returncode, drained["stdout"], drained["stderr"]
+    started_readers: list[threading.Thread] = []
+    stop_event: threading.Event | None = None
+    try:
+        drained: dict[str, DrainedStream] = {}
+        errors: list[BaseException] = []
+        stop_event = threading.Event()
+        readers = [
+            threading.Thread(
+                target=_drain_stream,
+                args=(child.stdout, drained, "stdout", errors, retain_limit, stop_event),
+            ),
+            threading.Thread(
+                target=_drain_stream,
+                args=(child.stderr, drained, "stderr", errors, retain_limit, stop_event),
+            ),
+        ]
+        for reader in readers:
+            reader.start()
+            started_readers.append(reader)
+        returncode = child.wait()
+        for reader in readers:
+            reader.join()
+        if errors:
+            raise EvidenceError(f"child output drain failed: {errors[0]}")
+        if set(drained) != {"stdout", "stderr"}:
+            raise EvidenceError("child output drain did not produce both streams")
+        return returncode, drained["stdout"], drained["stderr"]
+    except BaseException:
+        _cleanup_child_process_group(child, started_readers, stop_event)
+        raise
 
 
 def canonical_json_bytes(value: Any) -> bytes:
@@ -311,33 +418,14 @@ def open_internal_tree(root_fd: int, components: Iterable[str]) -> int:
         raise
 
 
-def _entry_exists(parent_fd: int, name: str) -> bool:
-    try:
-        os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-    except FileNotFoundError:
-        return False
-    except OSError as error:
-        raise EvidenceError(f"cannot inspect evidence entry {name!r}: {error}") from error
-    return True
-
-
-def _gate_namespace_extras(
-    gates_fd: int,
-    basename: str,
-    *,
-    allow_reservation: bool,
-) -> list[str]:
-    finals = {f"{basename}.{suffix}" for suffix in ("json", "stdout", "stderr")}
-    allowed = set(finals)
-    if allow_reservation:
-        allowed.add(f".{basename}.reservation")
+def _gate_namespace_entries(gates_fd: int, basename: str) -> set[str]:
     try:
         entries = os.listdir(gates_fd)
     except OSError as error:
         raise EvidenceError(f"cannot inventory gate evidence directory: {error}") from error
     visible_prefix = f"{basename}."
     internal_prefix = f".{basename}."
-    return sorted(
+    return {
         entry
         for entry in entries
         if (
@@ -345,8 +433,45 @@ def _gate_namespace_extras(
             or entry.startswith(visible_prefix)
             or entry.startswith(internal_prefix)
         )
-        and entry not in allowed
-    )
+    }
+
+
+def validate_gate_namespace(gates_fd: int, basename: str, state: str) -> None:
+    """Require one exact gate namespace state using only its directory FD."""
+
+    validate_gate_name(basename)
+    finals = {f"{basename}.{suffix}" for suffix in ("json", "stdout", "stderr")}
+    reservation = f".{basename}.reservation"
+    expected_by_state = {
+        "empty": set(),
+        "reserved": {reservation},
+        "published": finals | {reservation},
+        "complete": finals,
+    }
+    if state not in expected_by_state:
+        raise EvidenceError(f"unknown gate namespace state: {state!r}")
+    expected = expected_by_state[state]
+    entries = _gate_namespace_entries(gates_fd, basename)
+    if entries != expected:
+        raise EvidenceError(
+            f"gate namespace is not {state}: "
+            f"expected={sorted(expected)!r} actual={sorted(entries)!r}"
+        )
+    opened: list[int] = []
+    try:
+        for entry in sorted(expected):
+            try:
+                fd = os.open(entry, os.O_RDONLY | _nofollow_flag(), dir_fd=gates_fd)
+            except OSError as error:
+                raise EvidenceError(f"gate namespace entry is not no-follow readable: {entry!r}") from error
+            opened.append(fd)
+            metadata = os.fstat(fd)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise EvidenceError(f"gate namespace entry is not regular: {entry!r}")
+        if _gate_namespace_entries(gates_fd, basename) != expected:
+            raise EvidenceError(f"gate namespace changed while validating state {state}")
+    finally:
+        close_fds(*opened)
 
 
 @dataclass
@@ -373,13 +498,7 @@ class GateReservation:
 
 def reserve_gate_triplet(gates_fd: int, basename: str) -> GateReservation:
     validate_gate_name(basename)
-    finals = tuple(f"{basename}.{suffix}" for suffix in ("json", "stdout", "stderr"))
-    extras = _gate_namespace_extras(gates_fd, basename, allow_reservation=False)
-    if extras:
-        raise EvidenceError(f"unexpected gate evidence entries: {', '.join(extras)}")
-    colliding = [name for name in finals if _entry_exists(gates_fd, name)]
-    if colliding:
-        raise EvidenceError(f"gate evidence already exists: {', '.join(colliding)}")
+    validate_gate_namespace(gates_fd, basename, "empty")
     reservation_name = f".{basename}.reservation"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _nofollow_flag()
     try:
@@ -394,16 +513,14 @@ def reserve_gate_triplet(gates_fd: int, basename: str) -> GateReservation:
     finally:
         os.close(reservation_fd)
     os.fsync(gates_fd)
-    extras = _gate_namespace_extras(gates_fd, basename, allow_reservation=True)
-    colliding = [name for name in finals if _entry_exists(gates_fd, name)]
-    if extras or colliding:
+    try:
+        validate_gate_namespace(gates_fd, basename, "reserved")
+    except BaseException:
         try:
             os.unlink(reservation_name, dir_fd=gates_fd)
         finally:
             os.fsync(gates_fd)
-        if extras:
-            raise EvidenceError(f"unexpected gate evidence entries appeared: {', '.join(extras)}")
-        raise EvidenceError(f"gate evidence appeared during reservation: {', '.join(colliding)}")
+        raise
     return GateReservation(os.dup(gates_fd), basename, reservation_name)
 
 
@@ -430,17 +547,23 @@ def publish_new_at(parent_fd: int, final_name: str, body: bytes) -> None:
     if type(body) is not bytes:
         raise EvidenceError("published evidence body must be bytes")
     temporary = f".{final_name}.tmp-{os.getpid()}-{secrets.token_hex(12)}"
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _nofollow_flag()
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | _nofollow_flag()
     temporary_created = False
+    temporary_fd: int | None = None
+    final_fd: int | None = None
     try:
         temporary_fd = os.open(temporary, flags, 0o600, dir_fd=parent_fd)
         temporary_created = True
-        try:
-            os.fchmod(temporary_fd, 0o600)
-            _write_all(temporary_fd, body)
-            os.fsync(temporary_fd)
-        finally:
-            os.close(temporary_fd)
+        os.fchmod(temporary_fd, 0o600)
+        _write_all(temporary_fd, body)
+        os.fsync(temporary_fd)
+        temporary_metadata = os.fstat(temporary_fd)
+        if (
+            not stat.S_ISREG(temporary_metadata.st_mode)
+            or stat.S_IMODE(temporary_metadata.st_mode) != 0o600
+            or temporary_metadata.st_size != len(body)
+        ):
+            raise EvidenceError("temporary evidence file metadata is invalid")
         try:
             os.link(
                 temporary,
@@ -451,12 +574,43 @@ def publish_new_at(parent_fd: int, final_name: str, body: bytes) -> None:
             )
         except FileExistsError as error:
             raise EvidenceError(f"evidence file already exists: {final_name}") from error
+        final_fd = os.open(
+            final_name,
+            os.O_RDONLY | _nofollow_flag(),
+            dir_fd=parent_fd,
+        )
+        final_metadata = os.fstat(final_fd)
+        named_metadata = os.stat(final_name, dir_fd=parent_fd, follow_symlinks=False)
+        expected_identity = (temporary_metadata.st_dev, temporary_metadata.st_ino)
+        if (
+            (final_metadata.st_dev, final_metadata.st_ino) != expected_identity
+            or (named_metadata.st_dev, named_metadata.st_ino) != expected_identity
+            or not stat.S_ISREG(final_metadata.st_mode)
+            or stat.S_IMODE(final_metadata.st_mode) != 0o600
+            or final_metadata.st_size != len(body)
+        ):
+            raise EvidenceError(f"published evidence identity or metadata mismatch: {final_name}")
+        expected_digest = hashlib.sha256(body).digest()
+        actual_digest = hashlib.sha256()
+        offset = 0
+        while True:
+            chunk = os.read(final_fd, 65536)
+            if not chunk:
+                break
+            if body[offset : offset + len(chunk)] != chunk:
+                raise EvidenceError(f"published evidence bytes mismatch: {final_name}")
+            actual_digest.update(chunk)
+            offset += len(chunk)
+        if offset != len(body) or actual_digest.digest() != expected_digest:
+            raise EvidenceError(f"published evidence hash or length mismatch: {final_name}")
+        os.fsync(final_fd)
         os.fsync(parent_fd)
     except EvidenceError:
         raise
     except OSError as error:
         raise EvidenceError(f"cannot publish evidence file {final_name!r}: {error}") from error
     finally:
+        close_fds(final_fd, temporary_fd)
         if temporary_created:
             try:
                 os.unlink(temporary, dir_fd=parent_fd)

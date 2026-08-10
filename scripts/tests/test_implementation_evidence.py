@@ -598,6 +598,55 @@ class ImplementationEvidenceTests(unittest.TestCase):
                 os.close(opened_fd)
             os.close(parent_fd)
 
+    def test_publish_new_rejects_temp_path_replacement_before_hardlink(self):
+        core = importlib.import_module("scripts.evidence_core")
+        directory = self.root / "publish-temp-replacement"
+        directory.mkdir(mode=0o700)
+        directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        real_link = core.os.link
+        swapped = False
+
+        def replace_temp_then_link(
+            source,
+            destination,
+            *,
+            src_dir_fd=None,
+            dst_dir_fd=None,
+            follow_symlinks=True,
+        ):
+            nonlocal swapped
+            swapped = True
+            os.unlink(source, dir_fd=src_dir_fd)
+            attacker_fd = os.open(
+                source,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=src_dir_fd,
+            )
+            try:
+                os.write(attacker_fd, b"ATTACKER")
+                os.fsync(attacker_fd)
+            finally:
+                os.close(attacker_fd)
+            return real_link(
+                source,
+                destination,
+                src_dir_fd=src_dir_fd,
+                dst_dir_fd=dst_dir_fd,
+                follow_symlinks=follow_symlinks,
+            )
+
+        try:
+            with mock.patch.object(core.os, "link", side_effect=replace_temp_then_link):
+                with self.assertRaises(Exception):
+                    core.publish_new_at(directory_fd, "record.json", b"EXPECTED")
+            self.assertTrue(swapped, "temp replacement hook was not reached")
+            final = directory / "record.json"
+            self.assertEqual(final.read_bytes(), b"ATTACKER")
+            self.assertEqual([path.name for path in directory.iterdir()], ["record.json"])
+        finally:
+            os.close(directory_fd)
+
     def test_run_gate_passes_child_argv_without_a_shell(self):
         captured = self.root / "literal-argv.txt"
         injected = self.root / "shell-injected.txt"
@@ -694,6 +743,119 @@ class ImplementationEvidenceTests(unittest.TestCase):
             sorted(path.name for path in base.parent.iterdir()),
             ["concurrent-gate.json", "concurrent-gate.stderr", "concurrent-gate.stdout"],
         )
+
+    def test_run_gate_rejects_namespace_entry_created_while_child_runs(self):
+        output_root = self.root / "runtime-namespace"
+        base = self.gate_base(output_root=output_root, name="runtime-entry")
+        extra = pathlib.Path(f"{base}.extra")
+        unrelated = base.parent / "other-gate.extra"
+        child = [
+            sys.executable,
+            "-c",
+            "import pathlib,sys; pathlib.Path(sys.argv[1]).write_bytes(b'ATTACKER')",
+            str(extra),
+        ]
+        result = self.run_gate(output_root=output_root, name="runtime-entry", child=child)
+        self.assertNotEqual(result.returncode, 0, result.stderr[:1024])
+        self.assertEqual(extra.read_bytes(), b"ATTACKER")
+        for suffix in ("json", "stdout", "stderr"):
+            self.assertFalse(pathlib.Path(f"{base}.{suffix}").exists())
+        self.assertFalse((base.parent / ".runtime-entry.reservation").exists())
+
+        unrelated.parent.mkdir(parents=True, exist_ok=True)
+        unrelated.write_bytes(b"OTHER-GATE")
+        clean = self.run_gate(output_root=output_root, name="unaffected")
+        self.assertEqual(clean.returncode, 0, clean.stderr[:1024])
+        self.load_record(self.gate_base(output_root=output_root, name="unaffected"))
+        self.assertEqual(unrelated.read_bytes(), b"OTHER-GATE")
+
+    def test_run_gate_interrupt_kills_child_group_before_releasing_reservation(self):
+        output_root = self.root / "interrupt-cleanup"
+        base = self.gate_base(output_root=output_root, name="interrupt-cleanup")
+        reservation = base.parent / ".interrupt-cleanup.reservation"
+        pid_file = self.root / "interrupt-child.pid"
+        term_marker = self.root / "interrupt-child.term"
+        child_program = textwrap.dedent(
+            """
+            import os, pathlib, signal, sys, time
+            pid_file, term_marker = map(pathlib.Path, sys.argv[1:])
+            def ignore_term(signum, frame):
+                term_marker.write_bytes(b"TERM")
+            signal.signal(signal.SIGTERM, ignore_term)
+            pid_file.write_text(str(os.getpid()), encoding="ascii")
+            while True:
+                time.sleep(1)
+            """
+        )
+        command = [
+            sys.executable,
+            str(RUN_GATE),
+            "--iteration", "impl-01",
+            "--attempt", "001",
+            "--run-binding", "run-local",
+            "--name", "interrupt-cleanup",
+            "--candidate", self.candidate_b,
+            "--output-root", str(output_root),
+            "--", sys.executable, "-c", child_program, str(pid_file), str(term_marker),
+        ]
+        env = os.environ.copy()
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        runner = subprocess.Popen(
+            command,
+            cwd=self.repo,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        child_pid = None
+
+        def process_exists(pid):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return False
+            except PermissionError:
+                return True
+            return True
+
+        try:
+            deadline = time.monotonic() + 5
+            while not pid_file.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(pid_file.exists(), "gate child never reached ready state")
+            child_pid = int(pid_file.read_text(encoding="ascii"))
+            self.assertTrue(reservation.is_file(), "reservation was absent before interrupt")
+
+            interrupted_at = time.monotonic()
+            os.kill(runner.pid, signal.SIGINT)
+            term_deadline = time.monotonic() + 3
+            while not term_marker.exists() and time.monotonic() < term_deadline:
+                time.sleep(0.01)
+            self.assertTrue(term_marker.exists(), "interrupt did not terminate the child process group")
+            self.assertTrue(
+                reservation.is_file(),
+                "reservation was released before child-group cleanup completed",
+            )
+
+            output = runner.communicate(timeout=8)
+            self.assertNotEqual(runner.returncode, 0, output)
+            self.assertLess(time.monotonic() - interrupted_at, 6)
+            gone_deadline = time.monotonic() + 2
+            while process_exists(child_pid) and time.monotonic() < gone_deadline:
+                time.sleep(0.01)
+            self.assertFalse(process_exists(child_pid), f"child {child_pid} survived runner interrupt")
+            self.assertFalse(reservation.exists())
+            for suffix in ("json", "stdout", "stderr"):
+                self.assertFalse(pathlib.Path(f"{base}.{suffix}").exists())
+        finally:
+            if runner.poll() is None:
+                runner.kill()
+                runner.communicate(timeout=5)
+            if child_pid is not None and process_exists(child_pid):
+                os.kill(child_pid, signal.SIGKILL)
+                cleanup_deadline = time.monotonic() + 3
+                while process_exists(child_pid) and time.monotonic() < cleanup_deadline:
+                    time.sleep(0.01)
 
     def test_run_gate_record_and_stream_schemas_paths_versions_and_modes_are_closed(self):
         output_root = self.root / "closed-record"
