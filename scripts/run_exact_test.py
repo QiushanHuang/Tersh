@@ -30,6 +30,7 @@ SUMMARY_RE = re.compile(
     r"(?P<filtered>[0-9]+) filtered out; "
     r"finished in .+$"
 )
+TERMINAL_RE = re.compile(r"^test .+ \.\.\. (?:ok|FAILED|ignored)$")
 
 
 @dataclass(frozen=True)
@@ -41,6 +42,26 @@ class Rejection(Exception):
 class ContractArgumentParser(argparse.ArgumentParser):
     def error(self, message: str) -> None:
         raise Rejection("arguments", message)
+
+
+class SingleUseAction(argparse.Action):
+    def __init__(self, *args: Any, rejection_code: str = "arguments", **kwargs: Any) -> None:
+        self.rejection_code = rejection_code
+        super().__init__(*args, **kwargs)
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: Any,
+        option_string: str | None = None,
+    ) -> None:
+        seen = getattr(namespace, "_single_use_options", set())
+        if self.dest in seen:
+            raise Rejection(self.rejection_code, f"{option_string} may be supplied only once")
+        seen.add(self.dest)
+        namespace._single_use_options = seen
+        setattr(namespace, self.dest, self.const if self.nargs == 0 else values)
 
 
 def canonical_json(value: Any) -> str:
@@ -58,7 +79,7 @@ def child_excerpt(output: bytes) -> str:
     return diagnostic_text(output[:DIAGNOSTIC_LIMIT].decode("utf-8", errors="replace"))
 
 
-def run_child(argv: Sequence[str], phase: str) -> str:
+def run_child(argv: Sequence[str], phase: str) -> tuple[str, str]:
     try:
         completed = subprocess.run(
             list(argv),
@@ -80,31 +101,36 @@ def run_child(argv: Sequence[str], phase: str) -> str:
             f"{phase}-exit",
             f"child exited {completed.returncode}; stderr={child_excerpt(completed.stderr)}",
         )
-    try:
-        return completed.stdout.decode("utf-8", errors="strict")
-    except UnicodeDecodeError as error:
-        raise Rejection(f"{phase}-output", "child stdout is not UTF-8") from error
+    decoded = []
+    for stream_name, output in (("stdout", completed.stdout), ("stderr", completed.stderr)):
+        try:
+            decoded.append(output.decode("utf-8", errors="strict"))
+        except UnicodeDecodeError as error:
+            raise Rejection(f"{phase}-output", f"child {stream_name} is not UTF-8") from error
+    return decoded[0], decoded[1]
 
 
 def parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = ContractArgumentParser(prog="run_exact_test.py")
-    parser.add_argument("--test", dest="integration_targets", action="append", default=[])
-    parser.add_argument("--lib", dest="lib_count", action="count", default=0)
-    parser.add_argument("--name", required=True)
-    parser.add_argument("--ignored", action="store_true")
-    parser.add_argument("--serial", action="store_true")
-    parser.add_argument("--case-matrix")
+    parser.add_argument(
+        "--test", dest="integration_target", action=SingleUseAction,
+        rejection_code="selector",
+    )
+    parser.add_argument(
+        "--lib", action=SingleUseAction, nargs=0, const=True, default=False,
+        rejection_code="selector",
+    )
+    parser.add_argument("--name", action=SingleUseAction, required=True)
+    parser.add_argument("--ignored", action=SingleUseAction, nargs=0, const=True, default=False)
+    parser.add_argument("--serial", action=SingleUseAction, nargs=0, const=True, default=False)
+    parser.add_argument("--case-matrix", action=SingleUseAction)
     parser.add_argument("--expect-case", action="append", default=[])
-    parser.add_argument("--cargo-bin", default="cargo")
+    parser.add_argument("--cargo-bin", action=SingleUseAction, default="cargo")
     arguments = parser.parse_args(argv)
 
-    selector_count = len(arguments.integration_targets) + arguments.lib_count
+    selector_count = int(arguments.integration_target is not None) + int(arguments.lib)
     if selector_count != 1:
         raise Rejection("selector", "supply exactly one of --test TARGET or --lib")
-    arguments.integration_target = (
-        arguments.integration_targets[0] if arguments.integration_targets else None
-    )
-    arguments.lib = arguments.lib_count == 1
     if arguments.integration_target == "":
         raise Rejection("selector", "--test TARGET must not be empty")
     if arguments.name == "":
@@ -159,8 +185,21 @@ def require_exact_discovery(output: str, name: str) -> None:
         )
 
 
-def require_exact_execution(output: str, name: str) -> None:
-    summaries = [match for line in output.splitlines() if (match := SUMMARY_RE.fullmatch(line))]
+def output_lines(outputs: Sequence[str]) -> list[str]:
+    return [line for output in outputs for line in output.splitlines()]
+
+
+def case_payloads(outputs: Sequence[str]) -> list[str]:
+    return [
+        line[len(CASE_PREFIX) :]
+        for line in output_lines(outputs)
+        if line.startswith(CASE_PREFIX)
+    ]
+
+
+def require_exact_execution(outputs: Sequence[str], name: str) -> None:
+    lines = output_lines(outputs)
+    summaries = [match for line in lines if (match := SUMMARY_RE.fullmatch(line))]
     if not summaries:
         raise Rejection("execution-summary", "missing a complete successful libtest summary")
     if len(summaries) != 1:
@@ -175,17 +214,17 @@ def require_exact_execution(output: str, name: str) -> None:
     ):
         raise Rejection("execution-summary", "libtest did not report exactly one executed passing test")
 
-    exact_line = re.compile(rf"^test {re.escape(name)} \.\.\. ok$")
-    executed_count = sum(exact_line.fullmatch(line) is not None for line in output.splitlines())
-    if executed_count != 1:
+    terminal_lines = [line for line in lines if TERMINAL_RE.fullmatch(line)]
+    expected_terminal = f"test {name} ... ok"
+    if terminal_lines != [expected_terminal]:
         raise Rejection(
             "execution-proof",
-            f"expected one exact execution proof for {name!r}, found {executed_count}",
+            f"expected the sole terminal line to be {expected_terminal!r}",
         )
 
 
-def validate_case_record(output: str, arguments: argparse.Namespace) -> dict[str, Any] | None:
-    payloads = [line[len(CASE_PREFIX) :] for line in output.splitlines() if line.startswith(CASE_PREFIX)]
+def validate_case_record(outputs: Sequence[str], arguments: argparse.Namespace) -> dict[str, Any] | None:
+    payloads = case_payloads(outputs)
     if arguments.case_matrix is None:
         if payloads:
             raise Rejection("unexpected-case-record", "test emitted a case record without --case-matrix")
@@ -229,16 +268,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         arguments = parse_arguments(argv)
         selector, list_argv, execute_argv = selector_and_commands(arguments)
-        list_output = run_child(list_argv, "list")
-        if any(line.startswith(CASE_PREFIX) for line in list_output.splitlines()):
+        list_stdout, list_stderr = run_child(list_argv, "list")
+        if case_payloads((list_stdout, list_stderr)):
             raise Rejection(
                 "unexpected-list-case-record",
                 "case records are forbidden during test discovery",
             )
-        require_exact_discovery(list_output, arguments.name)
-        execute_output = run_child(execute_argv, "execute")
-        require_exact_execution(execute_output, arguments.name)
-        case_matrix = validate_case_record(execute_output, arguments)
+        require_exact_discovery(list_stdout, arguments.name)
+        execute_outputs = run_child(execute_argv, "execute")
+        require_exact_execution(execute_outputs, arguments.name)
+        case_matrix = validate_case_record(execute_outputs, arguments)
         result = {
             "schema": "tersh-exact-test-v1",
             "selector": selector,

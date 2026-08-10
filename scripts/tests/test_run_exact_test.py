@@ -34,6 +34,9 @@ if is_list:
         raise SystemExit(9)
     if mode == "signal-list":
         os.kill(os.getpid(), signal.SIGTERM)
+    if mode == "invalid-utf8-list-stderr":
+        sys.stderr.buffer.write(b"\xff")
+        sys.stderr.buffer.flush()
     if mode == "missing":
         names = []
     elif mode == "duplicate":
@@ -44,6 +47,10 @@ if is_list:
         names = [name]
     for payload in json.loads(os.environ.get("FAKE_CARGO_LIST_CASE_PAYLOADS", "[]")):
         print("tersh-case-count-v1 " + payload)
+    for payload in json.loads(os.environ.get("FAKE_CARGO_LIST_STDERR_CASE_PAYLOADS", "[]")):
+        print("tersh-case-count-v1 " + payload, file=sys.stderr)
+    for line in json.loads(os.environ.get("FAKE_CARGO_LIST_STDERR_LINES", "[]")):
+        print(line, file=sys.stderr)
     for listed_name in names:
         print(f"{listed_name}: test")
     print(f"{len(names)} tests, 0 benchmarks")
@@ -54,9 +61,16 @@ if mode == "nonzero-execute":
     raise SystemExit(8)
 if mode == "signal-execute":
     os.kill(os.getpid(), signal.SIGTERM)
+if mode == "invalid-utf8-execute-stderr":
+    sys.stderr.buffer.write(b"\xff")
+    sys.stderr.buffer.flush()
 
 for payload in json.loads(os.environ.get("FAKE_CARGO_CASE_PAYLOADS", "[]")):
     print("tersh-case-count-v1 " + payload)
+for payload in json.loads(os.environ.get("FAKE_CARGO_STDERR_CASE_PAYLOADS", "[]")):
+    print("tersh-case-count-v1 " + payload, file=sys.stderr)
+for line in json.loads(os.environ.get("FAKE_CARGO_EXECUTE_STDERR_LINES", "[]")):
+    print(line, file=sys.stderr)
 
 if mode == "zero-executed":
     print("test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s")
@@ -78,6 +92,18 @@ elif mode == "duplicate-summary":
     summary = "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
     print(summary)
     print(summary)
+elif mode == "extra-ok-terminal":
+    print(f"test {name} ... ok")
+    print("test suite::another ... ok")
+    print("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s")
+elif mode == "extra-ignored-terminal":
+    print(f"test {name} ... ok")
+    print("test suite::another ... ignored")
+    print("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s")
+elif mode == "extra-failed-terminal":
+    print(f"test {name} ... ok")
+    print("test suite::another ... FAILED")
+    print("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s")
 else:
     print(f"test {name} ... ok")
     print("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s")
@@ -100,7 +126,9 @@ class ExactRunnerTests(unittest.TestCase):
 
     def run_runner(
         self, *extra, mode="ok", name="suite::works", case_payloads=None,
-        list_case_payloads=None,
+        list_case_payloads=None, stderr_case_payloads=None,
+        list_stderr_case_payloads=None, list_stderr_lines=None,
+        execute_stderr_lines=None,
     ):
         env = os.environ.copy()
         env.update(
@@ -109,6 +137,10 @@ class ExactRunnerTests(unittest.TestCase):
             FAKE_CARGO_NAME=name,
             FAKE_CARGO_CASE_PAYLOADS=json.dumps(case_payloads or []),
             FAKE_CARGO_LIST_CASE_PAYLOADS=json.dumps(list_case_payloads or []),
+            FAKE_CARGO_STDERR_CASE_PAYLOADS=json.dumps(stderr_case_payloads or []),
+            FAKE_CARGO_LIST_STDERR_CASE_PAYLOADS=json.dumps(list_stderr_case_payloads or []),
+            FAKE_CARGO_LIST_STDERR_LINES=json.dumps(list_stderr_lines or []),
+            FAKE_CARGO_EXECUTE_STDERR_LINES=json.dumps(execute_stderr_lines or []),
             PYTHONDONTWRITEBYTECODE="1",
         )
         return subprocess.run(
@@ -170,13 +202,29 @@ class ExactRunnerTests(unittest.TestCase):
             },
         )
 
-        for mode in ("near-name", "wrong-executed-name", "duplicate-executed-name", "duplicate-summary"):
+        for mode in (
+            "near-name",
+            "wrong-executed-name",
+            "duplicate-executed-name",
+            "duplicate-summary",
+            "extra-ok-terminal",
+            "extra-ignored-terminal",
+            "extra-failed-terminal",
+        ):
             with self.subTest(mode=mode):
                 self.log.unlink(missing_ok=True)
                 rejected = self.run_runner("--test", "fixture", "--name", "suite::works", mode=mode)
                 code = "discovery-count" if mode == "near-name" else "execution-proof"
                 calls = 1 if mode == "near-name" else 2
                 self.assert_rejected(rejected, code, calls)
+
+        self.log.unlink(missing_ok=True)
+        with_stderr = self.run_runner(
+            "--test", "fixture", "--name", "suite::works",
+            list_stderr_lines=["ordinary cargo list diagnostic"],
+            execute_stderr_lines=["ordinary cargo execute diagnostic"],
+        )
+        self.success_record(with_stderr)
 
     def test_exact_runner_rejects_missing_duplicate_ignored_or_zero_without_explicit_flags(self):
         cases = (
@@ -189,6 +237,8 @@ class ExactRunnerTests(unittest.TestCase):
             ("signal-list", "list-signal", 1),
             ("nonzero-execute", "execute-exit", 2),
             ("signal-execute", "execute-signal", 2),
+            ("invalid-utf8-list-stderr", "list-output", 1),
+            ("invalid-utf8-execute-stderr", "execute-output", 2),
         )
         for mode, code, calls in cases:
             with self.subTest(mode=mode):
@@ -247,6 +297,26 @@ class ExactRunnerTests(unittest.TestCase):
                 result = self.run_runner(*argv)
                 self.assert_rejected(result, "selector", 0)
 
+        duplicate_options = (
+            ("--test", "fixture", "--name", "first", "--name", "suite::works"),
+            ("--test", "fixture", "--name", "suite::works", "--ignored", "--ignored"),
+            ("--test", "fixture", "--name", "suite::works", "--serial", "--serial"),
+            (
+                "--test", "fixture", "--name", "suite::works",
+                "--case-matrix", "first-v1", "--case-matrix", "frozen-v1",
+                "--expect-case", "alpha",
+            ),
+            (
+                "--test", "fixture", "--name", "suite::works",
+                "--cargo-bin", str(self.cargo),
+            ),
+        )
+        for argv in duplicate_options:
+            with self.subTest(argv=argv):
+                self.log.unlink(missing_ok=True)
+                result = self.run_runner(*argv)
+                self.assert_rejected(result, "arguments", 0)
+
     def test_exact_runner_lib_rejects_zero_discovered_or_zero_executed(self):
         cases = (
             ("missing", "discovery-count", 1),
@@ -279,6 +349,14 @@ class ExactRunnerTests(unittest.TestCase):
         )
         record = self.success_record(result)
         self.assertEqual(record["case_matrix"], valid)
+
+        self.log.unlink(missing_ok=True)
+        stderr_result = self.run_runner(
+            "--test", "fixture", "--name", "suite::works", "--case-matrix", "frozen-v1",
+            "--expect-case", "alpha", "--expect-case", "beta",
+            stderr_case_payloads=[canonical_json(valid)],
+        )
+        self.assertEqual(self.success_record(stderr_result)["case_matrix"], valid)
 
         invalid_records = (
             self.case_record(cases, matrix="wrong-v1"),
@@ -323,13 +401,34 @@ class ExactRunnerTests(unittest.TestCase):
                 self.assert_rejected(result, code, 2)
 
         for declare_matrix in (False, True):
-            with self.subTest(list_marker=True, declare_matrix=declare_matrix):
-                self.log.unlink(missing_ok=True)
-                args = ["--test", "fixture", "--name", "suite::works"]
-                if declare_matrix:
-                    args += ["--case-matrix", "frozen-v1", "--expect-case", "alpha"]
-                result = self.run_runner(*args, list_case_payloads=[valid])
-                self.assert_rejected(result, "unexpected-list-case-record", 1)
+            for stream in ("stdout", "stderr"):
+                with self.subTest(list_marker=True, declare_matrix=declare_matrix, stream=stream):
+                    self.log.unlink(missing_ok=True)
+                    args = ["--test", "fixture", "--name", "suite::works"]
+                    if declare_matrix:
+                        args += ["--case-matrix", "frozen-v1", "--expect-case", "alpha"]
+                    marker_arguments = (
+                        {"list_case_payloads": [valid]}
+                        if stream == "stdout"
+                        else {"list_stderr_case_payloads": [valid]}
+                    )
+                    result = self.run_runner(*args, **marker_arguments)
+                    self.assert_rejected(result, "unexpected-list-case-record", 1)
+
+        self.log.unlink(missing_ok=True)
+        stderr_without_matrix = self.run_runner(
+            "--test", "fixture", "--name", "suite::works",
+            stderr_case_payloads=[valid],
+        )
+        self.assert_rejected(stderr_without_matrix, "unexpected-case-record", 2)
+
+        self.log.unlink(missing_ok=True)
+        cross_stream_duplicate = self.run_runner(
+            "--test", "fixture", "--name", "suite::works",
+            "--case-matrix", "frozen-v1", "--expect-case", "alpha",
+            case_payloads=[valid], stderr_case_payloads=[valid],
+        )
+        self.assert_rejected(cross_stream_duplicate, "case-record-count", 2)
 
     def test_exact_runner_rejects_missing_duplicate_extra_or_reordered_case_ids(self):
         expected = ["alpha", "beta"]
