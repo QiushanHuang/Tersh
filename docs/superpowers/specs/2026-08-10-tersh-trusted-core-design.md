@@ -1314,3 +1314,203 @@ The full product-optimization objective is complete only when:
 
 Until then, the task remains active and no partial milestone is described as the
 full product optimization objective.
+
+## Normative Clarifications From Adversarial Review
+
+The clauses below close implementation ambiguities found during the independent
+plan review. They are part of the product contract. Where an earlier paragraph
+can be read more than one way, these clauses control.
+
+### Prepare mutations before freezing their durable identity
+
+G0b may adapt the existing synchronous executor to the immutable report model,
+but G1b moves filesystem preflight and durable reservation off the UI thread.
+The G1b coordination sequence is exactly:
+
+```text
+MutationIntent + ephemeral SubmissionId
+  -> background filesystem preflight and create-new reservations
+  -> Prepared(final OperationRequest, ItemPlans, reservations, fence set)
+  -> UI installs the final fences and returns FenceInstalled
+  -> Started
+  -> filesystem mutation
+```
+
+The UI performs only bounded syntax, selection-count, and confirmation checks
+before submission. It installs conservative provisional fences from the raw
+intent before placing the intent in the bounded worker slot. The worker then
+captures current identities, generates the final `OperationId` and `ItemId`
+values, and reserves every applicable fixed marker or bundle with create-new
+semantics. A pre-existing candidate is never opened or overwritten; only that
+candidate ID is regenerated. The request and item plans become immutable only
+after all required reservations and final fence roots are known.
+
+`Prepared` and its acknowledgement are non-droppable coordination events. The
+worker cannot publish, rename, unlink, or otherwise create a user-visible effect
+before `FenceInstalled`. A missing acknowledgement, cancellation, panic, or
+disconnect before that point produces a terminal no-effect report only after
+all created reservations are proved removed and their parents synced. Any
+reservation whose cleanup cannot be proved remains discoverable and is reported
+as `CleanupRequired` or `Indeterminate`; it is not silently abandoned while a
+new ID is tried. Restore, trash, same-filesystem mutation, permanent delete, and
+the EXDEV path all use this preparation boundary. The 10,000-target preflight
+therefore never runs on the event/render thread.
+
+### Use one claimed fixed control per item
+
+There is at most one fixed
+`transactions/pending/<item-id>/` control bundle for an `ItemId`. Its typed
+outer protocol is `SourceClaimV1`, `TrashIngestV1`, `ExdevMoveV1`, or
+`RestoreV1`. Trash, EXDEV, and restore embed their `SourceClaimState` as a
+substate of that same outer envelope; `SourceClaim` never creates a second
+fixed bundle for the same item.
+
+An unclaimed control handle is read-only. Exclusive mutation consumes the
+handle and returns an owning claimed handle that holds the no-follow lock for
+the entire read/transition/remove sequence. Only that claimed handle may
+advance a receipt or remove a terminal bundle. A transition validates the same
+schema, protocol, operation and item IDs, the expected current revision,
+revision `+1`, the legal edge, and the disk facts required by that edge. Raw
+receipt replacement is not exposed. Lock acquisition order is fixed control
+first, adjacent bundle second.
+
+An adjacent trash or EXDEV receipt records local payload facts, but it is not a
+second independent authority. Mirrored transitions use fixed mirror intent,
+then the adjacent next revision, then fixed confirmation of that exact revision
+and hash; source removal is forbidden unless both match. An adjacent-ahead
+state, disagreement, or missing fixed control is inspect-only `Indeterminate`.
+A cleanup-specific EXDEV attempt gets fresh report IDs but must reacquire and
+continue the original fixed control's private tombstone; it creates no sibling control, source claim, or copy/publish path.
+
+### Make fd-relative names capabilities, not unchecked strings
+
+Every fd-relative API that accepts a single child component accepts
+`RawUnixName`, never `OsStr`, `Path`, or a display string. This includes child
+open/create/stat/lock/rename/unlink and receipt-file creation. Construction
+rejects empty, `.`, `..`, slash, and NUL before a syscall. Directory enumeration
+returns validated names or an inspect-only escaped observation; it never turns
+an invalid entry into a mutation capability. No module exposes a raw directory
+descriptor merely to bypass these APIs.
+
+### Keep bounded read work without cross-kind supersession
+
+G1a has one directory slot in the scan worker and one preview slot in the
+preview worker. When G2 adds recovery discovery, the same scan worker owns two
+concrete keyed replace slots: `Directory` and `RecoveryCatalog`. Requests are
+latest-wins within their own kind, never replace the other kind, and are drained
+with fair alternation. The bound is therefore two pending scan requests, not an
+open-ended queue or generic job runtime.
+
+### Identify and claim the exact observed recovery bundle
+
+A recovery catalog key and action reference contain the record class, raw ID or
+raw name, `BundleLocation`, and the no-follow observed bundle identity. Verified
+records carry that reference. Pagination uses the complete key, a stable
+location order, streaming fd-relative enumeration, and O(page-size) retained
+memory. The scanner must not first accumulate all observations.
+
+Before mutation, recovery opens the referenced object, verifies its identity,
+acquires its no-follow claim lock, re-verifies the location/name/identity, moves
+the whole bundle no-replace into `claims`, syncs both parents, and reopens and
+validates the receipt/header. The catalog observation alone never authorizes a
+mutation. If the same `ItemId` appears in more than one of staging, items,
+claims, or quarantine, every occurrence is contradictory inspect-only and no
+restore is offered. CLI lookup by ID succeeds only for exactly one verified
+recoverable bundle.
+
+### Drain truth before joining workers or child processes
+
+Mutation shutdown closes new commands, requests cancellation, and drains
+progress plus non-progress events without holding coordinator mutexes until the
+single `Finished` is observed. Only then may it drop the receiver and join the
+worker or observer. Render or terminal failure uses the same noninteractive
+drain. A full bounded channel can never be joined before it is drained.
+
+The outer cluster event loop remains the sole owner of `TerminalSession`.
+Launching a remote workbench suspends the dashboard, transfers terminal I/O to
+one proxy owner, and always terminates/waits/reaps the child, drains and joins
+all stream readers, then resumes or restores the dashboard. Pre-READY timeout,
+malformed frame, spawn/read failure, user interrupt, and panic use this same
+guard. There is one stdin reader; PTY resize is forwarded; retained diagnostics
+are bounded while excess output continues to be drained. `TerminalSession`
+installs the process's sole signal broker before worker threads exist; suspension
+transfers exclusive consumption of `SIGWINCH` and HUP/INT/TERM to the proxy, so
+the synchronous proxy remains resizable and interruptible without a second
+control thread, a caller-supplied receiver, or a still-running dashboard loop.
+
+Probe completion is likewise per-record and fail-contained. A direct child exit
+with descendants still holding pipes enters a bounded draining phase, followed
+by TERM, 500 ms, KILL, reap, and reader join as needed. One probe or reader error
+becomes that probe's terminal failure and cannot abandon other active records.
+The first terminal intent is monotonic: startup failure or timeout cannot later
+be weakened to cancellation by quit. Containment errors accumulate on the same
+owning record until reap/join, and any such error makes the emitted terminal
+result failed without erasing the original reason cleanup began. Bulk shutdown
+attempts every record before returning an aggregate error.
+
+### Build release evidence without circular trust
+
+Remote READY identity for an official build is derived from the actual clean
+checkout and computed `Cargo.lock`, not accepted from format-checked environment
+variables alone. The build verifies the full Git commit, tracked and untracked
+dirty state, lock hash, and compatibility-registry provenance; a mismatch may
+build a standalone binary only without official READY identity. All identity
+inputs participate in the build system's rerun rules.
+
+Release assembly is staged:
+
+```text
+build
+  -> canonical AssetDescriptor(commit/lock/name/size/hash)
+  -> upload unverified draft assets
+  -> native jobs re-download and validate that descriptor
+  -> SmokeEvidence(descriptor hash, exact environment facts, result)
+  -> assemble the final supported manifest
+  -> independently re-download and validate manifest plus assets
+```
+
+The final manifest cannot be an input to the smoke result it is meant to attest.
+macOS minimum evidence requires exact build `23F79`, not a `23F79+` comparison.
+Linux kernel-floor evidence requires a native runner or VM whose recorded
+`uname -r` is in the declared 4.18.x floor; a container that merely reuses a
+newer host kernel is not minimum-kernel evidence. OCI images are recorded as
+complete immutable `registry/repository@sha256:...` references.
+
+Every focused test gate first lists tests and proves the intended exact test is
+discovered exactly once before executing it. Zero discovered or zero executed
+tests is a gate failure even when Cargo exits zero. Parameterized gates record
+and validate their expected case count.
+
+### Preserve review provenance across all fourteen cycles
+
+Cycle evidence is append-only by role, wave, and attempt. Each record carries
+the orchestrator-issued task/agent/run identity, start and end time, baseline
+and candidate commit, parent finding references, resolutions, and direct gate
+hashes. A cycle closes only with planning records, an execution record,
+independent safety and verification records, and final reports from all five
+roles on the same candidate. Later reports never overwrite earlier discussion
+or failed attempts. External native, CI, or release evidence binds the exact
+committed candidate; an evidence-only follow-up commit cannot retroactively
+change the candidate it attests.
+
+### Prevent deserialization and proof-token capability forgery
+
+Private fields alone are not a capability boundary because derived
+deserialization can populate them without invoking a constructor. `RawUnixName`
+and `RawUnixPath` therefore use custom deserializers that decode, re-encode, and
+require the exact canonical URL-safe-no-pad spelling, then rerun the same
+component/path validation as live capture. A receipt cannot deserialize an
+empty, dot, dot-dot, slash-containing, NUL-containing, padded, aliased, or
+malformed child capability. Inspect-only observed names expose escaped display
+and ordering only, never raw bytes or a conversion accepted by a child syscall.
+Canonical receipt serialization and every no-follow receipt read/re-read are
+bounded to 64 KiB; an oversized or concurrently growing receipt is inspect-only
+or unreadable and can never allocate without bound or mint transition facts.
+
+Likewise, a transition's disk facts are opaque verifier-issued tokens, not
+serialized fact structs or caller-supplied booleans. They have private fields,
+no public constructor, and no `Serialize`, `Deserialize`, or `Clone`
+implementation. Each transition token binds installation, operation/item,
+revision, retained identity, exact edge, and sync observations. Terminal
+authority instead moves the original claim/lock/snapshot into a consuming typestate. The claimed control rechecks every binding, so a real token from a different bundle, revision, or transition cannot be replayed.
+Every authorizing fact borrows or owns the actual no-follow lock and verified receipt snapshot until the consuming transition returns; a prior unlocked observation is not authorization. A transition consumes its token, and terminal verify/remove consumes its typestate, so neither can be applied twice even to the same bundle.
