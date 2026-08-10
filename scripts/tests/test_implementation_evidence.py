@@ -6,6 +6,7 @@ import io
 import json
 import os
 import pathlib
+import re
 import signal
 import socket
 import stat
@@ -269,9 +270,13 @@ class ImplementationEvidenceTests(unittest.TestCase):
     def host_envelope_bodies(self):
         context_nonce = "c" * 64
         dispatch_id = "d" * 64
+        harness_bundle_revision = "7" * 40
+        harness_bundle_sha256 = "8" * 64
         context = {
             "schema": "tersh-host-dispatch-context-v1",
             "context_nonce": context_nonce,
+            "harness_bundle_revision": harness_bundle_revision,
+            "harness_bundle_sha256": harness_bundle_sha256,
             "evidence_id": "impl-01",
             "evidence_attempt": "001",
             "role": "safety",
@@ -290,6 +295,8 @@ class ImplementationEvidenceTests(unittest.TestCase):
             "schema": "tersh-host-spawn-invocation-v1",
             "context_nonce": context_nonce,
             "dispatch_id": dispatch_id,
+            "harness_bundle_revision": harness_bundle_revision,
+            "harness_bundle_sha256": harness_bundle_sha256,
             "requested_model": "gpt-5.6-sol",
             "requested_reasoning_effort": "xhigh",
             "selected_model": "gpt-5.6-sol",
@@ -300,6 +307,8 @@ class ImplementationEvidenceTests(unittest.TestCase):
             "schema": "tersh-host-spawn-response-v1",
             "context_nonce": context_nonce,
             "dispatch_id": dispatch_id,
+            "harness_bundle_revision": harness_bundle_revision,
+            "harness_bundle_sha256": harness_bundle_sha256,
             "agent_id": "fixture-agent",
             "canonical_task_path": "/root/safety/reviewer",
             "agent_run_id": "fixture-run",
@@ -2346,6 +2355,281 @@ class ImplementationEvidenceTests(unittest.TestCase):
         )
         self.assertIn(response_result["context_handle"], store.contexts)
         self.assertIn(response_result["response_handle"], store.responses)
+
+    def test_host_context_binds_root_owned_harness_bundle_revision_and_digest(self):
+        core = importlib.import_module("scripts.evidence_core")
+        adapter = ROOT / "scripts" / "implementation_evidence" / "host_envelope_adapter.py"
+        adapter_source = adapter.read_text(encoding="utf-8")
+        adapter_tree = ast.parse(adapter_source, filename=str(adapter))
+
+        with self.subTest(source_contract="harness-root-only"):
+            self.assertEqual(
+                adapter_source.count("REPOSITORY_ROOT"),
+                0,
+                "adapter must not derive trusted tooling from the repository root",
+            )
+            self.assertEqual(
+                adapter_source.count("CANDIDATE_ROOT"),
+                0,
+                "adapter must not derive trusted tooling from a candidate root",
+            )
+            tool_root_assignments = [
+                node
+                for node in ast.walk(adapter_tree)
+                if isinstance(node, (ast.Assign, ast.AnnAssign))
+                and any(
+                    isinstance(target, ast.Name) and target.id == "HARNESS_ROOT"
+                    for target in (
+                        node.targets if isinstance(node, ast.Assign) else [node.target]
+                    )
+                )
+            ]
+            self.assertEqual(len(tool_root_assignments), 1)
+            harness_root_value = tool_root_assignments[0].value
+            self.assertEqual(
+                {
+                    node.id
+                    for node in ast.walk(harness_root_value)
+                    if isinstance(node, ast.Name)
+                },
+                {"Path", "__file__"},
+                "HARNESS_ROOT must derive only from the exact adapter file",
+            )
+            self.assertIn(
+                "resolve",
+                {
+                    node.attr
+                    for node in ast.walk(harness_root_value)
+                    if isinstance(node, ast.Attribute)
+                },
+            )
+
+        with self.subTest(source_contract="exact-core-load-from-harness-root"):
+            core_path_assignments = [
+                node
+                for node in ast.walk(adapter_tree)
+                if isinstance(node, (ast.Assign, ast.AnnAssign))
+                and any(
+                    isinstance(target, ast.Name) and target.id == "CORE_PATH"
+                    for target in (
+                        node.targets if isinstance(node, ast.Assign) else [node.target]
+                    )
+                )
+            ]
+            self.assertEqual(len(core_path_assignments), 1)
+            core_path_value = core_path_assignments[0].value
+            self.assertEqual(
+                {
+                    node.id
+                    for node in ast.walk(core_path_value)
+                    if isinstance(node, ast.Name)
+                },
+                {"HARNESS_ROOT"},
+                "CORE_PATH must derive only from HARNESS_ROOT",
+            )
+            exact_loads = [
+                node
+                for node in ast.walk(adapter_tree)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "spec_from_file_location"
+                and len(node.args) >= 2
+                and isinstance(node.args[1], ast.Name)
+                and node.args[1].id == "CORE_PATH"
+            ]
+            self.assertEqual(len(exact_loads), 1)
+
+        plan_paths = (
+            ROOT
+            / "docs"
+            / "superpowers"
+            / "plans"
+            / "2026-08-10-tersh-implementation-iteration-evidence.md",
+            ROOT
+            / "docs"
+            / "superpowers"
+            / "plans"
+            / "2026-08-10-tersh-seven-cycle-hardening-implementation.md",
+        )
+        for plan_path in plan_paths:
+            plan = plan_path.read_text(encoding="utf-8")
+            with self.subTest(plan=plan_path.name, contract="harness-root-metavariable"):
+                self.assertEqual(
+                    plan.count("SUPERVISOR_CANDIDATE_ROOT"),
+                    0,
+                    "candidate-root execution metavariable remains in the plan",
+                )
+                self.assertIn("SUPERVISOR_HARNESS_ROOT", plan)
+            for semantic, pattern in (
+                (
+                    "root-owned-harness-bundle",
+                    r"(?is)(?:root-owned.{0,400}harness bundle|harness bundle.{0,400}root-owned)",
+                ),
+                (
+                    "non-agent-writable-harness-bundle",
+                    r"(?is)(?:harness bundle.{0,400}(?:non-agent-writable|not (?:agent|operator)[ -]writable|not writable by (?:the )?(?:agent|operator))|(?:non-agent-writable|not (?:agent|operator)[ -]writable).{0,400}harness bundle)",
+                ),
+                (
+                    "digest-pinned-harness-bundle",
+                    r"(?is)(?:harness bundle.{0,400}(?:digest-pinned|pinned.{0,120}(?:digest|sha-256)|(?:digest|sha-256).{0,120}pinned)|(?:digest-pinned|pinned.{0,120}(?:digest|sha-256)|(?:digest|sha-256).{0,120}pinned).{0,400}harness bundle)",
+                ),
+                (
+                    "candidate-never-executable",
+                    r"(?is)(?:candidate(?: code| tree| scripts?)?.{0,80}(?:must )?(?:never be|not be) execut|(?:never|must not) execut.{0,80}candidate)",
+                ),
+            ):
+                with self.subTest(plan=plan_path.name, semantic=semantic):
+                    self.assertIsNotNone(
+                        re.search(pattern, plan),
+                        f"plan lacks {semantic} semantics",
+                    )
+
+        context_body, invocation_body, response_body = self.host_envelope_bodies()
+        expected_bundle_identity = {
+            "harness_bundle_revision": "7" * 40,
+            "harness_bundle_sha256": "8" * 64,
+        }
+        for body_kind, body in (
+            ("context", context_body),
+            ("invocation", invocation_body),
+            ("response", response_body),
+        ):
+            with self.subTest(valid_fixture_body=body_kind):
+                self.assertEqual(
+                    {field: body[field] for field in expected_bundle_identity},
+                    expected_bundle_identity,
+                )
+
+        def seeded_store(operation):
+            store = ScriptedCaptureStore()
+            if operation == "capture-context":
+                return store, None
+            predecessor = store.new_handle()
+            store.contexts[predecessor] = copy.deepcopy(context_body)
+            return store, predecessor
+
+        valid_operations = {}
+        for operation in (
+            "capture-context",
+            "capture-invocation",
+            "capture-response",
+        ):
+            valid_operations[operation] = False
+            with self.subTest(valid_bundle_transcript=operation):
+                store, predecessor = seeded_store(operation)
+                result, error, _ = self.run_scripted_capture(
+                    store,
+                    operation,
+                    predecessor,
+                )
+                valid_operations[operation] = error is None and result is not None
+                self.assertIsNone(error)
+                self.assertIsNotNone(result)
+
+        def mutate_body(body_index, mutation):
+            def mutate(bodies):
+                body = bodies[body_index][1]
+                if mutation == "missing-revision":
+                    del body["harness_bundle_revision"]
+                elif mutation == "missing-digest":
+                    del body["harness_bundle_sha256"]
+                elif mutation == "extra":
+                    body["harness_bundle_path"] = "/candidate-controlled"
+                elif mutation == "wrong-revision":
+                    body["harness_bundle_revision"] = "G" * 40
+                elif mutation == "wrong-digest":
+                    body["harness_bundle_sha256"] = "G" * 64
+                elif mutation == "mismatched-revision":
+                    body["harness_bundle_revision"] = "1" * 40
+                elif mutation == "mismatched-digest":
+                    body["harness_bundle_sha256"] = "2" * 64
+                else:
+                    raise AssertionError(f"unknown bundle mutation {mutation}")
+                return bodies
+
+            return mutate
+
+        body_targets = (
+            ("context", "capture-context", 0),
+            ("invocation", "capture-invocation", 1),
+            ("response", "capture-response", 1),
+        )
+        for body_kind, operation, body_index in body_targets:
+            if not valid_operations[operation]:
+                continue
+            for mutation in (
+                "missing-revision",
+                "missing-digest",
+                "extra",
+                "wrong-revision",
+                "wrong-digest",
+            ):
+                with self.subTest(
+                    bundle_body=body_kind,
+                    bundle_attack=mutation,
+                ):
+                    store, predecessor = seeded_store(operation)
+                    before = (
+                        copy.deepcopy(store.contexts),
+                        set(store.invocations),
+                        set(store.responses),
+                        store.next_handle,
+                    )
+                    result, error, _ = self.run_scripted_capture(
+                        store,
+                        operation,
+                        predecessor,
+                        body_mutator=mutate_body(body_index, mutation),
+                    )
+                    self.assertIsNone(result)
+                    self.assertIsInstance(error, core.EvidenceError)
+                    self.assertEqual(
+                        (
+                            store.contexts,
+                            store.invocations,
+                            store.responses,
+                            store.next_handle,
+                        ),
+                        before,
+                    )
+
+        mismatch_targets = (
+            ("context", "capture-invocation", 0),
+            ("invocation", "capture-invocation", 1),
+            ("response", "capture-response", 1),
+        )
+        for body_kind, operation, body_index in mismatch_targets:
+            if not valid_operations[operation]:
+                continue
+            for mutation in ("mismatched-revision", "mismatched-digest"):
+                with self.subTest(
+                    bundle_body=body_kind,
+                    bundle_attack=mutation,
+                ):
+                    store, predecessor = seeded_store(operation)
+                    before = (
+                        copy.deepcopy(store.contexts),
+                        set(store.invocations),
+                        set(store.responses),
+                        store.next_handle,
+                    )
+                    result, error, _ = self.run_scripted_capture(
+                        store,
+                        operation,
+                        predecessor,
+                        body_mutator=mutate_body(body_index, mutation),
+                    )
+                    self.assertIsNone(result)
+                    self.assertIsInstance(error, core.EvidenceError)
+                    self.assertEqual(
+                        (
+                            store.contexts,
+                            store.invocations,
+                            store.responses,
+                            store.next_handle,
+                        ),
+                        before,
+                    )
 
 
 if __name__ == "__main__":
