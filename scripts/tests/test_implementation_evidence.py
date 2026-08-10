@@ -1454,6 +1454,53 @@ class ImplementationEvidenceTests(unittest.TestCase):
     def test_host_envelope_adapter_rejects_same_principal_fifo_stdin_regular_file_trailing_bytes_and_reuse(self):
         adapter = ROOT / "scripts" / "implementation_evidence" / "host_envelope_adapter.py"
         self.assertTrue(adapter.is_file(), "host envelope adapter entrypoint is required")
+        hostile_scripts = self.root / "hostile-pythonpath" / "scripts"
+        hostile_scripts.mkdir(parents=True)
+        hostile_marker = self.root / "hostile-core-imported.marker"
+        (hostile_scripts / "__init__.py").write_text("", encoding="utf-8")
+        (hostile_scripts / "evidence_core.py").write_text(
+            textwrap.dedent(
+                """
+                import os
+                import pathlib
+
+                pathlib.Path(os.environ["TERSH_HOSTILE_IMPORT_MARKER"]).write_text(
+                    "hostile-core-imported", encoding="utf-8"
+                )
+
+                class EvidenceError(Exception):
+                    pass
+                """
+            ),
+            encoding="utf-8",
+        )
+        hostile_environment = os.environ.copy()
+        hostile_environment["PYTHONPATH"] = os.pathsep.join(
+            filter(
+                None,
+                (
+                    str(hostile_scripts.parent),
+                    hostile_environment.get("PYTHONPATH", ""),
+                ),
+            )
+        )
+        hostile_environment["TERSH_HOSTILE_IMPORT_MARKER"] = str(hostile_marker)
+        hostile_help = subprocess.run(
+            [sys.executable, str(adapter), "--help"],
+            env=hostile_environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=5,
+        )
+        self.assertEqual(hostile_help.returncode, 0)
+        self.assertFalse(
+            hostile_marker.exists(),
+            "adapter imported an attacker-controlled scripts.evidence_core",
+        )
+        self.assertIn(b"capture-context", hostile_help.stdout)
+        self.assertNotIn(b"Traceback", hostile_help.stderr)
+
         adapter_source = adapter.read_text(encoding="utf-8")
         adapter_tree = ast.parse(adapter_source, filename=str(adapter))
         core_call_names = {
