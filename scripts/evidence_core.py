@@ -9,16 +9,21 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
 import selectors
 import signal
+import socket
 import stat
+import struct
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -36,7 +41,16 @@ RUN_BINDING_RE = re.compile(
     r"))$"
 )
 HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+TASK_PATH_RE = re.compile(r"^/root(?:/[a-z][a-z0-9_]{0,63})+$")
+HOST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+RFC3339_NANO_RE = re.compile(
+    r"^(?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2})T"
+    r"(?P<time>[0-9]{2}:[0-9]{2}:[0-9]{2})\."
+    r"(?P<fraction>[0-9]{1,9})Z$"
+)
 DEFAULT_RETAIN_LIMIT = 1024 * 1024
+HOST_FRAME_MAX_BYTES = 65536
+HOST_TRANSACTION_TIMEOUT_SECONDS = 5.0
 PROCESS_TERM_GRACE_SECONDS = 1.0
 PROCESS_KILL_GRACE_SECONDS = 1.0
 READER_CLEANUP_SECONDS = 1.0
@@ -329,6 +343,521 @@ def validate_run_binding(value: Any) -> str:
 
 def validate_sha256(value: Any, field: str = "sha256") -> str:
     return _require_match(value, field, HEX64_RE)
+
+
+def validate_host_peer_identity(
+    peer_uid: Any,
+    fd_owner_uid: Any,
+    client_euid: Any,
+) -> None:
+    """Bind a host connection to the fixed root-owned supervisor TCB."""
+
+    for value, field in (
+        (peer_uid, "host peer UID"),
+        (fd_owner_uid, "host socket owner UID"),
+        (client_euid, "client effective UID"),
+    ):
+        require_exact_int(value, field, minimum=0)
+    if peer_uid != 0 or fd_owner_uid != 0 or client_euid == 0:
+        raise EvidenceError(
+            "host connection requires root peer and owner with a nonroot client"
+        )
+
+
+def parse_macos_local_peercred(raw: Any) -> tuple[int, tuple[int, ...]]:
+    """Parse one exact macOS xucred returned by LOCAL_PEERCRED."""
+
+    if type(raw) is not bytes or len(raw) != 76:
+        raise EvidenceError("macOS LOCAL_PEERCRED must be exactly 76 bytes")
+    try:
+        version, uid, group_count, *groups = struct.unpack("=III16I", raw)
+    except struct.error as error:
+        raise EvidenceError(f"invalid macOS LOCAL_PEERCRED: {error}") from error
+    if version != 0:
+        raise EvidenceError("macOS LOCAL_PEERCRED version must be zero")
+    if group_count > 16:
+        raise EvidenceError("macOS LOCAL_PEERCRED group count exceeds 16")
+    return uid, tuple(groups[:group_count])
+
+
+def parse_linux_so_peercred(raw: Any) -> tuple[int, int, int]:
+    """Parse one exact Linux ucred returned by SO_PEERCRED."""
+
+    if type(raw) is not bytes or len(raw) != 12:
+        raise EvidenceError("Linux SO_PEERCRED must be exactly 12 bytes")
+    try:
+        pid, uid, gid = struct.unpack("=iii", raw)
+    except struct.error as error:
+        raise EvidenceError(f"invalid Linux SO_PEERCRED: {error}") from error
+    if pid < 0 or uid < 0 or gid < 0:
+        raise EvidenceError("Linux SO_PEERCRED fields must be nonnegative")
+    return pid, uid, gid
+
+
+def open_authenticated_host_store_socket(fd: Any) -> socket.socket:
+    """Duplicate and authenticate one connected production host-store socket."""
+
+    require_exact_int(fd, "host store FD", minimum=3)
+    try:
+        duplicate = os.dup(fd)
+    except (OSError, OverflowError) as error:
+        raise EvidenceError(f"cannot duplicate host store FD: {error}") from error
+    try:
+        metadata = os.fstat(duplicate)
+    except OSError as error:
+        os.close(duplicate)
+        raise EvidenceError(f"cannot inspect duplicated host store FD: {error}") from error
+    connection: socket.socket | None = None
+    try:
+        connection = socket.socket(fileno=duplicate)
+        duplicate = -1
+        if connection.family != socket.AF_UNIX:
+            raise EvidenceError("host store FD is not AF_UNIX")
+        if connection.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE) != socket.SOCK_STREAM:
+            raise EvidenceError("host store FD is not SOCK_STREAM")
+        try:
+            connection.getpeername()
+        except OSError as error:
+            raise EvidenceError("host store FD is not connected") from error
+
+        if sys.platform == "darwin":
+            option = getattr(socket, "LOCAL_PEERCRED", None)
+            if type(option) is not int:
+                raise EvidenceError("macOS LOCAL_PEERCRED is unavailable")
+            raw = connection.getsockopt(0, option, 76)
+            peer_uid, _ = parse_macos_local_peercred(raw)
+        elif sys.platform.startswith("linux"):
+            option = getattr(socket, "SO_PEERCRED", None)
+            if type(option) is not int:
+                raise EvidenceError("Linux SO_PEERCRED is unavailable")
+            raw = connection.getsockopt(socket.SOL_SOCKET, option, 12)
+            _, peer_uid, _ = parse_linux_so_peercred(raw)
+        else:
+            raise EvidenceError("host peer credentials are unsupported on this platform")
+
+        validate_host_peer_identity(peer_uid, metadata.st_uid, os.geteuid())
+        return connection
+    except EvidenceError:
+        if connection is not None:
+            connection.close()
+        elif duplicate >= 0:
+            os.close(duplicate)
+        raise
+    except OSError as error:
+        if connection is not None:
+            connection.close()
+        elif duplicate >= 0:
+            os.close(duplicate)
+        raise EvidenceError(f"cannot authenticate host store FD: {error}") from error
+
+
+def _remaining_host_deadline(deadline: Any) -> float:
+    if type(deadline) not in (int, float) or not math.isfinite(deadline):
+        raise EvidenceError("host transaction deadline must be finite monotonic time")
+    remaining = float(deadline) - time.monotonic()
+    if remaining <= 0:
+        raise EvidenceError("host transaction deadline expired")
+    return remaining
+
+
+def _require_host_socket(sock: Any) -> socket.socket:
+    if not isinstance(sock, socket.socket):
+        raise EvidenceError("host transport must be a socket")
+    return sock
+
+
+def _recv_host_exact(sock: socket.socket, size: int, deadline: float) -> bytes:
+    received = bytearray()
+    while len(received) < size:
+        try:
+            sock.settimeout(_remaining_host_deadline(deadline))
+            chunk = sock.recv(size - len(received))
+        except (OSError, TimeoutError) as error:
+            raise EvidenceError(f"host frame receive failed: {error}") from error
+        if not chunk:
+            raise EvidenceError("host frame ended before its declared length")
+        received.extend(chunk)
+    return bytes(received)
+
+
+def send_host_frame(sock: Any, value: Any, deadline: Any) -> None:
+    """Send one bounded canonical length-prefixed host JSON object."""
+
+    connection = _require_host_socket(sock)
+    if type(value) is not dict:
+        raise EvidenceError("host frame must be a JSON object")
+    body = canonical_json_bytes(value)
+    if not 1 <= len(body) <= HOST_FRAME_MAX_BYTES:
+        raise EvidenceError("host frame body is outside 1..65536 bytes")
+    frame = struct.pack(">I", len(body)) + body
+    try:
+        connection.settimeout(_remaining_host_deadline(deadline))
+        connection.sendall(frame)
+    except (OSError, TimeoutError) as error:
+        raise EvidenceError(f"host frame send failed: {error}") from error
+
+
+def recv_host_frame(sock: Any, deadline: Any) -> dict[str, Any]:
+    """Receive one bounded byte-for-byte canonical host JSON object."""
+
+    connection = _require_host_socket(sock)
+    prefix = _recv_host_exact(connection, 4, deadline)
+    size = struct.unpack(">I", prefix)[0]
+    if not 1 <= size <= HOST_FRAME_MAX_BYTES:
+        raise EvidenceError("host frame body is outside 1..65536 bytes")
+    value = load_canonical_json_bytes(_recv_host_exact(connection, size, deadline))
+    if type(value) is not dict:
+        raise EvidenceError("host frame must be a JSON object")
+    return value
+
+
+def require_host_eof(sock: Any, deadline: Any) -> None:
+    """Require peer write-half-close with no trailing byte."""
+
+    connection = _require_host_socket(sock)
+    try:
+        connection.settimeout(_remaining_host_deadline(deadline))
+        trailing = connection.recv(1)
+    except (OSError, TimeoutError) as error:
+        raise EvidenceError(f"host EOF observation failed: {error}") from error
+    if trailing != b"":
+        raise EvidenceError("host transaction contains trailing bytes")
+
+
+def _require_closed_object(
+    value: Any,
+    keys: set[str],
+    field: str,
+) -> dict[str, Any]:
+    if type(value) is not dict or set(value) != keys:
+        actual = sorted(value) if type(value) is dict else type(value).__name__
+        raise EvidenceError(
+            f"{field} is not a closed object: expected={sorted(keys)!r} actual={actual!r}"
+        )
+    return value
+
+
+def _require_literal(value: Any, expected: str, field: str) -> str:
+    if type(value) is not str or value != expected:
+        raise EvidenceError(f"{field} must be exactly {expected!r}")
+    return value
+
+
+def _require_enum(value: Any, allowed: set[str], field: str) -> str:
+    if type(value) is not str or value not in allowed:
+        raise EvidenceError(f"invalid {field}: {value!r}")
+    return value
+
+
+def _require_nullable_candidate(value: Any, field: str) -> str | None:
+    if value is None:
+        return None
+    return _require_match(value, field, CANDIDATE_RE)
+
+
+def _parse_rfc3339_nano(value: Any, field: str) -> tuple[datetime, int]:
+    if type(value) is not str:
+        raise EvidenceError(f"{field} must be an RFC 3339 UTC string")
+    match = RFC3339_NANO_RE.fullmatch(value)
+    if match is None:
+        raise EvidenceError(f"invalid {field}: {value!r}")
+    try:
+        whole = datetime.strptime(
+            f"{match.group('date')}T{match.group('time')}",
+            "%Y-%m-%dT%H:%M:%S",
+        ).replace(tzinfo=timezone.utc)
+    except ValueError as error:
+        raise EvidenceError(f"invalid {field}: {value!r}") from error
+    return whole, int(match.group("fraction").ljust(9, "0"))
+
+
+def _validate_context_body(value: Any) -> dict[str, Any]:
+    keys = {
+        "schema", "context_nonce", "harness_bundle_revision",
+        "harness_bundle_sha256", "evidence_id", "evidence_attempt", "role",
+        "wave", "review_attempt", "run_binding", "baseline_commit",
+        "review_target", "canonical_task_path", "worktree_handle",
+        "requested_model", "requested_reasoning_effort", "created_at",
+    }
+    body = _require_closed_object(value, keys, "context body")
+    _require_literal(body["schema"], "tersh-host-dispatch-context-v1", "context schema")
+    validate_sha256(body["context_nonce"], "context nonce")
+    validate_candidate(body["harness_bundle_revision"])
+    validate_sha256(body["harness_bundle_sha256"], "harness bundle sha256")
+    validate_evidence_id(body["evidence_id"])
+    validate_attempt(body["evidence_attempt"])
+    _require_enum(
+        body["role"],
+        {"product", "architecture", "implementation", "safety", "verification"},
+        "context role",
+    )
+    _require_enum(
+        body["wave"],
+        {"wave-a", "wave-b", "wave-c", "closure-a", "closure-b"},
+        "context wave",
+    )
+    validate_attempt(body["review_attempt"])
+    validate_run_binding(body["run_binding"])
+    validate_candidate(body["baseline_commit"])
+    _require_nullable_candidate(body["review_target"], "context review target")
+    _require_match(body["canonical_task_path"], "context task path", TASK_PATH_RE)
+    _require_match(body["worktree_handle"], "context worktree handle", HOST_ID_RE)
+    _require_literal(body["requested_model"], "gpt-5.6-sol", "requested model")
+    _require_literal(body["requested_reasoning_effort"], "xhigh", "requested effort")
+    _parse_rfc3339_nano(body["created_at"], "context created_at")
+    return body
+
+
+def _validate_invocation_body(value: Any) -> dict[str, Any]:
+    keys = {
+        "schema", "context_nonce", "harness_bundle_revision",
+        "harness_bundle_sha256", "dispatch_id", "requested_model",
+        "requested_reasoning_effort", "selected_model",
+        "selected_reasoning_effort", "dispatched_at",
+    }
+    body = _require_closed_object(value, keys, "invocation body")
+    _require_literal(body["schema"], "tersh-host-spawn-invocation-v1", "invocation schema")
+    validate_sha256(body["context_nonce"], "invocation context nonce")
+    validate_candidate(body["harness_bundle_revision"])
+    validate_sha256(body["harness_bundle_sha256"], "harness bundle sha256")
+    validate_sha256(body["dispatch_id"], "invocation dispatch ID")
+    _require_literal(body["requested_model"], "gpt-5.6-sol", "requested model")
+    _require_literal(body["requested_reasoning_effort"], "xhigh", "requested effort")
+    _require_literal(body["selected_model"], "gpt-5.6-sol", "selected model")
+    _require_literal(body["selected_reasoning_effort"], "xhigh", "selected effort")
+    _parse_rfc3339_nano(body["dispatched_at"], "invocation dispatched_at")
+    return body
+
+
+def _validate_response_body(value: Any) -> dict[str, Any]:
+    keys = {
+        "schema", "context_nonce", "harness_bundle_revision",
+        "harness_bundle_sha256", "dispatch_id", "agent_id",
+        "canonical_task_path", "agent_run_id", "started_at", "ended_at",
+        "terminal_status", "reported_result_commit",
+    }
+    body = _require_closed_object(value, keys, "response body")
+    _require_literal(body["schema"], "tersh-host-spawn-response-v1", "response schema")
+    validate_sha256(body["context_nonce"], "response context nonce")
+    validate_candidate(body["harness_bundle_revision"])
+    validate_sha256(body["harness_bundle_sha256"], "harness bundle sha256")
+    validate_sha256(body["dispatch_id"], "response dispatch ID")
+    _require_match(body["agent_id"], "response agent ID", HOST_ID_RE)
+    _require_match(body["canonical_task_path"], "response task path", TASK_PATH_RE)
+    _require_match(body["agent_run_id"], "response agent run ID", HOST_ID_RE)
+    started = _parse_rfc3339_nano(body["started_at"], "response started_at")
+    ended = _parse_rfc3339_nano(body["ended_at"], "response ended_at")
+    if started > ended:
+        raise EvidenceError("response started_at is after ended_at")
+    _require_enum(
+        body["terminal_status"],
+        {"completed", "failed", "cancelled", "interrupted"},
+        "response terminal status",
+    )
+    _require_nullable_candidate(body["reported_result_commit"], "reported result commit")
+    return body
+
+
+def _validate_capture_relationships(
+    operation: str,
+    bodies: dict[str, dict[str, Any]],
+) -> None:
+    context = bodies["context"]
+    created = _parse_rfc3339_nano(context["created_at"], "context created_at")
+    if operation == "capture-invocation":
+        invocation = bodies["invocation"]
+        if invocation["context_nonce"] != context["context_nonce"]:
+            raise EvidenceError("invocation context nonce does not match context")
+        for field in (
+            "harness_bundle_revision",
+            "harness_bundle_sha256",
+            "requested_model",
+            "requested_reasoning_effort",
+        ):
+            if invocation[field] != context[field]:
+                raise EvidenceError(f"invocation {field} does not match context")
+        if created > _parse_rfc3339_nano(invocation["dispatched_at"], "invocation dispatched_at"):
+            raise EvidenceError("context created_at is after invocation dispatched_at")
+    elif operation == "capture-response":
+        response = bodies["response"]
+        if response["context_nonce"] != context["context_nonce"]:
+            raise EvidenceError("response context nonce does not match context")
+        for field in ("harness_bundle_revision", "harness_bundle_sha256"):
+            if response[field] != context[field]:
+                raise EvidenceError(f"response {field} does not match context")
+        if response["canonical_task_path"] != context["canonical_task_path"]:
+            raise EvidenceError("response task path does not match context")
+        if created > _parse_rfc3339_nano(response["started_at"], "response started_at"):
+            raise EvidenceError("context created_at is after response started_at")
+
+
+def _validate_capture_result(
+    operation: str,
+    value: Any,
+    predecessor: str | None,
+) -> dict[str, Any]:
+    member_by_operation = {
+        "capture-context": None,
+        "capture-invocation": "invocation_handle",
+        "capture-response": "response_handle",
+    }
+    schema_by_operation = {
+        "capture-context": "tersh-host-capture-context-result-v1",
+        "capture-invocation": "tersh-host-capture-invocation-result-v1",
+        "capture-response": "tersh-host-capture-response-result-v1",
+    }
+    member = member_by_operation[operation]
+    keys = {"schema", "context_handle"}
+    if member is not None:
+        keys.add(member)
+    result = _require_closed_object(value, keys, "capture result")
+    _require_literal(result["schema"], schema_by_operation[operation], "capture result schema")
+    successor = validate_sha256(result["context_handle"], "successor context handle")
+    if predecessor is not None and successor == predecessor:
+        raise EvidenceError("successor context handle aliases its consumed predecessor")
+    if member is not None:
+        member_handle = validate_sha256(result[member], member.replace("_", " "))
+        if member_handle == successor or member_handle == predecessor:
+            raise EvidenceError("member handle aliases its context generation")
+    return result
+
+
+def capture_host_envelope_on_authenticated_socket(
+    sock: Any,
+    operation: Any,
+    context_handle: Any = None,
+    *,
+    deadline: Any = None,
+) -> dict[str, Any]:
+    """Execute one exact capture transaction over an authenticated socket."""
+
+    connection = _require_host_socket(sock)
+    body_order_by_operation = {
+        "capture-context": ("context",),
+        "capture-invocation": ("context", "invocation"),
+        "capture-response": ("context", "response"),
+    }
+    if type(operation) is not str or operation not in body_order_by_operation:
+        raise EvidenceError("invalid host capture operation")
+    if operation == "capture-context":
+        if context_handle is not None:
+            raise EvidenceError("capture-context does not accept a context handle")
+    else:
+        validate_sha256(context_handle, "context handle")
+    if deadline is None:
+        deadline = time.monotonic() + HOST_TRANSACTION_TIMEOUT_SECONDS
+    _remaining_host_deadline(deadline)
+
+    transaction_nonce = secrets.token_hex(32)
+    begin = {
+        "schema": "tersh-host-transaction-begin-v1",
+        "transaction_nonce": transaction_nonce,
+        "operation": operation,
+    }
+    if context_handle is not None:
+        begin["context_handle"] = context_handle
+    send_host_frame(connection, begin, deadline)
+
+    body_order = body_order_by_operation[operation]
+    body_hashes: list[str] = []
+    bodies: dict[str, dict[str, Any]] = {}
+    validators = {
+        "context": _validate_context_body,
+        "invocation": _validate_invocation_body,
+        "response": _validate_response_body,
+    }
+    wrapper_keys = {
+        "schema", "transaction_nonce", "operation", "body_kind", "ordinal",
+        "total", "body", "body_sha256",
+    }
+    for ordinal, body_kind in enumerate(body_order, start=1):
+        wrapper = _require_closed_object(
+            recv_host_frame(connection, deadline),
+            wrapper_keys,
+            "host BODY wrapper",
+        )
+        _require_literal(wrapper["schema"], "tersh-host-transaction-body-v1", "BODY schema")
+        _require_literal(wrapper["transaction_nonce"], transaction_nonce, "BODY transaction nonce")
+        _require_literal(wrapper["operation"], operation, "BODY operation")
+        _require_literal(wrapper["body_kind"], body_kind, "BODY kind")
+        if require_exact_int(wrapper["ordinal"], "BODY ordinal", minimum=1) != ordinal:
+            raise EvidenceError("BODY ordinal is not the expected one-based value")
+        if require_exact_int(wrapper["total"], "BODY total", minimum=1) != len(body_order):
+            raise EvidenceError("BODY total does not match operation body count")
+        body = validators[body_kind](wrapper["body"])
+        digest = sha256_bytes(canonical_json_bytes(body))
+        validate_sha256(wrapper["body_sha256"], "BODY sha256")
+        if wrapper["body_sha256"] != digest:
+            raise EvidenceError("BODY sha256 does not match its canonical body")
+        bodies[body_kind] = body
+        body_hashes.append(digest)
+
+    body_end = _require_closed_object(
+        recv_host_frame(connection, deadline),
+        {"schema", "transaction_nonce", "operation", "total", "body_sha256s"},
+        "host BODY-END",
+    )
+    _require_literal(body_end["schema"], "tersh-host-transaction-body-end-v1", "BODY-END schema")
+    _require_literal(body_end["transaction_nonce"], transaction_nonce, "BODY-END transaction nonce")
+    _require_literal(body_end["operation"], operation, "BODY-END operation")
+    if require_exact_int(body_end["total"], "BODY-END total", minimum=1) != len(body_order):
+        raise EvidenceError("BODY-END total does not match operation body count")
+    if type(body_end["body_sha256s"]) is not list:
+        raise EvidenceError("BODY-END body_sha256s must be an array")
+    for digest in body_end["body_sha256s"]:
+        validate_sha256(digest, "BODY-END digest")
+    if body_end["body_sha256s"] != body_hashes:
+        raise EvidenceError("BODY-END digests do not match BODY sequence")
+    _validate_capture_relationships(operation, bodies)
+
+    commit = {
+        "schema": "tersh-host-transaction-commit-v1",
+        "transaction_nonce": transaction_nonce,
+        "operation": operation,
+        "body_sha256s": body_hashes,
+    }
+    send_host_frame(connection, commit, deadline)
+    request_end = {
+        "schema": "tersh-host-transaction-request-end-v1",
+        "transaction_nonce": transaction_nonce,
+        "operation": operation,
+        "commit_sha256": sha256_bytes(canonical_json_bytes(commit)),
+    }
+    send_host_frame(connection, request_end, deadline)
+    try:
+        connection.shutdown(socket.SHUT_WR)
+    except OSError as error:
+        raise EvidenceError(f"host request half-close failed: {error}") from error
+
+    reply = _require_closed_object(
+        recv_host_frame(connection, deadline),
+        {"schema", "transaction_nonce", "operation", "body_sha256s", "result"},
+        "host REPLY",
+    )
+    _require_literal(reply["schema"], "tersh-host-transaction-reply-v1", "REPLY schema")
+    _require_literal(reply["transaction_nonce"], transaction_nonce, "REPLY transaction nonce")
+    _require_literal(reply["operation"], operation, "REPLY operation")
+    if type(reply["body_sha256s"]) is not list:
+        raise EvidenceError("REPLY body_sha256s must be an array")
+    for digest in reply["body_sha256s"]:
+        validate_sha256(digest, "REPLY body digest")
+    if reply["body_sha256s"] != body_hashes:
+        raise EvidenceError("REPLY body digests do not match committed bodies")
+    result = _validate_capture_result(operation, reply["result"], context_handle)
+
+    reply_end = _require_closed_object(
+        recv_host_frame(connection, deadline),
+        {"schema", "transaction_nonce", "operation", "reply_sha256"},
+        "host REPLY-END",
+    )
+    _require_literal(reply_end["schema"], "tersh-host-transaction-reply-end-v1", "REPLY-END schema")
+    _require_literal(reply_end["transaction_nonce"], transaction_nonce, "REPLY-END transaction nonce")
+    _require_literal(reply_end["operation"], operation, "REPLY-END operation")
+    validate_sha256(reply_end["reply_sha256"], "REPLY-END digest")
+    if reply_end["reply_sha256"] != sha256_bytes(canonical_json_bytes(reply)):
+        raise EvidenceError("REPLY-END digest does not match REPLY")
+    require_host_eof(connection, deadline)
+    return result
 
 
 def parse_output_root(raw: Any) -> tuple[bool, tuple[str, ...]]:
