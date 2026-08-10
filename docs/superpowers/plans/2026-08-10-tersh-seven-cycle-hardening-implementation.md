@@ -473,13 +473,17 @@ Add exact Python tests `test_run_gate_preserves_child_exit`, `test_allow_failure
 
 The host tests additionally lock the shared trust and linearization boundaries.
 The synthetic credential parser succeeds only for `(peer_uid, fd_st_uid,
-client_euid) == (0, 0, nonzero)` and rejects every matching nonroot peer/socket
-owner, including `(501, 501, 502)`; a UID-0 TCB-created socket followed by a
-nonroot adapter is the real positive path, while a root client and same-UID peer
-are negative. Pre-COMMIT failures leave every handle retryable and mutate
-nothing. Post-COMMIT missing, malformed, or trailing replies keep stdout empty,
-reject old-handle replay, and leave the complete successor/receipt set as
-private orphans, never a partial or absent transition. Query fixtures use
+client_euid) == (0, 0, nonzero)`. It rejects matching nonroot `(501, 501, 502)`,
+nonroot peer `(501, 0, 502)`, nonroot FD owner `(0, 501, 502)`, and root client
+`(0, 0, 0)`. The ordinary nonroot repository suite runs a real production-CLI
+same-UID negative socketpair but never requires root, changes UID, or skips a
+privileged positive while reporting success. The UID-0 TCB-created socketpair
+followed by a dropped-nonroot adapter belongs only to privileged host
+preflight/acceptance when the platform supplies that supervisor; otherwise
+formal evidence fails closed. Pre-COMMIT failures leave every handle retryable
+and mutate nothing. Post-COMMIT missing, malformed, or trailing replies keep
+stdout empty, reject old-handle replay, and leave the complete successor/receipt
+set as private orphans, never a partial or absent transition. Query fixtures use
 `128`, `129`, `325`, and `999` receipts and reject an oversized page, index gap
 or reorder, cross-page duplicate, wrong total/page count/order digest, BODY-ID
 mismatch, and aggregate body-digest mismatch.

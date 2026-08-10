@@ -439,14 +439,18 @@ partial or absent transition. A committed successor or receipt whose reply is
 rejected is private and unreachable and never becomes evidence. Socketpair tests
 exercise framing only. The internal credential-parser seam accepts synthetic
 peer/store/current UID triples, and its only positive class is `(0, 0,
-nonzero)`; `(501, 501, 502)` and every other matching nonroot peer/socket owner
-fail. Production always obtains family, type, owner, peer credentials, and
-effective UID from the kernel and exposes no expected-principal, environment,
-or test override. The real positive integration fixture has a UID-0 TCB create
-the socketpair and then launches the adapter after dropping it to a nonroot UID;
-real root-client and same-UID socketpairs are negative fixtures. FIFO/plain-pipe,
-regular-file, stdin, wrong-nonce, replay, caller-JSON, closed-schema,
-receipt-binding, and missing-supervisor cases all fail. Hung child
+nonzero)`. It rejects matching nonroot `(501, 501, 502)`, nonroot peer
+`(501, 0, 502)`, nonroot FD owner `(0, 501, 502)`, and root client `(0, 0, 0)`.
+Production always obtains family, type, owner, peer credentials, and effective
+UID from the kernel and exposes no expected-principal, environment, or test
+override. The ordinary nonroot repository suite runs one real production-CLI
+same-UID negative socketpair but never requires root, changes UID, or skips a
+privileged positive while reporting success. The UID-0 TCB-created socketpair
+followed by a dropped-nonroot adapter is tested only by privileged host
+preflight/acceptance when the platform actually supplies that supervisor; when
+it does not, formal evidence fails closed. FIFO/plain-pipe, regular-file, stdin,
+wrong-nonce, replay, caller-JSON, closed-schema, receipt-binding, and
+missing-supervisor cases all fail. Hung child
 fixtures cover Git, `gh`, artifact download, and
 verifier calls. Tests never contact GitHub and prove no push occurs when the
 online inventory is empty, partial registration cancels only already bound
