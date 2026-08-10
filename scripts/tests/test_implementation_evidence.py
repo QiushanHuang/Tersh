@@ -5,7 +5,9 @@ import json
 import os
 import pathlib
 import signal
+import socket
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -958,6 +960,180 @@ class ImplementationEvidenceTests(unittest.TestCase):
                     **overrides,
                 )
                 self.assert_child_not_run(result, marker)
+
+    def test_host_envelope_adapter_requires_distinct_peer_credential_unix_stream_socket(self):
+        core = importlib.import_module("scripts.evidence_core")
+        validator = getattr(core, "validate_host_peer_identity", None)
+        mac_parser = getattr(core, "parse_macos_local_peercred", None)
+        linux_parser = getattr(core, "parse_linux_so_peercred", None)
+        opener = getattr(core, "open_authenticated_host_store_socket", None)
+        self.assertTrue(callable(validator), "shared host peer validator is required")
+        self.assertTrue(callable(mac_parser), "exact macOS xucred parser is required")
+        self.assertTrue(callable(linux_parser), "exact Linux SO_PEERCRED parser is required")
+        self.assertTrue(callable(opener), "production kernel-authenticated socket opener is required")
+
+        self.assertEqual(
+            mac_parser(struct.pack("=III16I", 0, 0, 1, 0, *([0] * 15))),
+            (0, (0,)),
+        )
+        for raw in (
+            b"\0" * 75,
+            b"\0" * 77,
+            struct.pack("=III16I", 1, 0, 1, 0, *([0] * 15)),
+            struct.pack("=III16I", 0, 0, 17, *([0] * 16)),
+        ):
+            with self.subTest(mac_raw_len=len(raw), mac_raw=raw[:12]):
+                with self.assertRaises(core.EvidenceError):
+                    mac_parser(raw)
+
+        self.assertEqual(linux_parser(struct.pack("=iii", 123, 0, 0)), (123, 0, 0))
+        for raw in (
+            b"\0" * 11,
+            b"\0" * 13,
+            struct.pack("=iii", -1, 0, 0),
+            struct.pack("=iii", 123, -1, 0),
+            struct.pack("=iii", 123, 0, -1),
+        ):
+            with self.subTest(linux_raw_len=len(raw), linux_raw=raw):
+                with self.assertRaises(core.EvidenceError):
+                    linux_parser(raw)
+
+        self.assertIsNone(validator(0, 0, 501))
+        for peer_uid, owner_uid, client_euid in (
+            (501, 501, 502),
+            (501, 0, 502),
+            (0, 501, 502),
+            (0, 0, 0),
+            (True, 0, 501),
+            (0, False, 501),
+            (0, 0, True),
+        ):
+            with self.subTest(
+                peer_uid=peer_uid,
+                owner_uid=owner_uid,
+                client_euid=client_euid,
+            ):
+                with self.assertRaises(core.EvidenceError):
+                    validator(peer_uid, owner_uid, client_euid)
+
+        client, peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        peer.settimeout(1)
+        try:
+            with self.assertRaises(core.EvidenceError):
+                opener(client.fileno())
+            client.close()
+            self.assertEqual(peer.recv(1), b"", "failed production authentication sent bytes")
+        finally:
+            client.close()
+            peer.close()
+
+    def test_host_envelope_adapter_rejects_same_principal_fifo_stdin_regular_file_trailing_bytes_and_reuse(self):
+        adapter = ROOT / "scripts" / "implementation_evidence" / "host_envelope_adapter.py"
+        self.assertTrue(adapter.is_file(), "host envelope adapter entrypoint is required")
+
+        def run_with_fd(fd):
+            return subprocess.run(
+                [
+                    sys.executable,
+                    str(adapter),
+                    "capture-context",
+                    "--host-store-fd",
+                    str(fd),
+                ],
+                pass_fds=() if fd == 0 else (fd,),
+                stdin=subprocess.DEVNULL if fd != 0 else None,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=5,
+            )
+
+        client, peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(client.close)
+        self.addCleanup(peer.close)
+        peer.settimeout(1)
+        same_uid = run_with_fd(client.fileno())
+        self.assertNotEqual(same_uid.returncode, 0)
+        self.assertEqual(same_uid.stdout, b"")
+        self.assertGreater(len(same_uid.stderr), 0)
+        self.assertLessEqual(len(same_uid.stderr), 8192)
+        self.assertNotIn(b"Traceback", same_uid.stderr)
+        client.close()
+        self.assertEqual(peer.recv(1), b"", "rejected same-UID peer received protocol bytes")
+
+        regular_path = self.root / "host-store.regular"
+        regular_fd = os.open(regular_path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            regular = run_with_fd(regular_fd)
+        finally:
+            os.close(regular_fd)
+        self.assertNotEqual(regular.returncode, 0)
+        self.assertEqual(regular.stdout, b"")
+        self.assertGreater(len(regular.stderr), 0)
+        self.assertNotIn(b"Traceback", regular.stderr)
+        self.assertEqual(regular_path.stat().st_size, 0)
+
+        fifo_path = self.root / "host-store.fifo"
+        os.mkfifo(fifo_path, 0o600)
+        fifo_fd = os.open(fifo_path, os.O_RDWR | os.O_NONBLOCK)
+        try:
+            fifo = run_with_fd(fifo_fd)
+        finally:
+            os.close(fifo_fd)
+        self.assertNotEqual(fifo.returncode, 0)
+        self.assertEqual(fifo.stdout, b"")
+        self.assertGreater(len(fifo.stderr), 0)
+        self.assertNotIn(b"Traceback", fifo.stderr)
+
+        stdin_result = run_with_fd(0)
+        self.assertNotEqual(stdin_result.returncode, 0)
+        self.assertEqual(stdin_result.stdout, b"")
+        self.assertGreater(len(stdin_result.stderr), 0)
+        self.assertNotIn(b"Traceback", stdin_result.stderr)
+
+        core = importlib.import_module("scripts.evidence_core")
+        send_frame = getattr(core, "send_host_frame", None)
+        recv_frame = getattr(core, "recv_host_frame", None)
+        require_eof = getattr(core, "require_host_eof", None)
+        self.assertTrue(callable(send_frame), "shared bounded frame writer is required")
+        self.assertTrue(callable(recv_frame), "shared bounded frame reader is required")
+        self.assertTrue(callable(require_eof), "shared exact EOF verifier is required")
+
+        sender, receiver = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(sender.close)
+        self.addCleanup(receiver.close)
+        deadline = time.monotonic() + 2
+        send_frame(sender, {"schema": "tersh-host-test-frame-v1"}, deadline)
+        sender.sendall(b"trailing")
+        sender.shutdown(socket.SHUT_WR)
+        self.assertEqual(
+            recv_frame(receiver, deadline),
+            {"schema": "tersh-host-test-frame-v1"},
+        )
+        with self.assertRaises(core.EvidenceError):
+            require_eof(receiver, deadline)
+
+    def test_host_transaction_old_early_half_close_sequence_reproduces_epipe(self):
+        host, adapter = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(host.close)
+        self.addCleanup(adapter.close)
+        body = b"obsolete-host-body"
+        request = b"late-create-request"
+        host.sendall(body)
+        host.shutdown(socket.SHUT_WR)
+        self.assertEqual(adapter.recv(len(body)), body)
+        self.assertEqual(adapter.recv(1), b"")
+        adapter.sendall(request)
+        self.assertEqual(host.recv(len(request)), request)
+        with self.assertRaises(BrokenPipeError):
+            host.sendall(b"impossible-reply")
+
+        core = importlib.import_module("scripts.evidence_core")
+        capture = getattr(core, "capture_host_envelope_on_authenticated_socket", None)
+        self.assertTrue(
+            callable(capture),
+            "new request/commit-first capture transaction seam is required",
+        )
 
 
 if __name__ == "__main__":
