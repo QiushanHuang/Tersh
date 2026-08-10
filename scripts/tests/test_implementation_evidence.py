@@ -1454,9 +1454,25 @@ class ImplementationEvidenceTests(unittest.TestCase):
     def test_host_envelope_adapter_rejects_same_principal_fifo_stdin_regular_file_trailing_bytes_and_reuse(self):
         adapter = ROOT / "scripts" / "implementation_evidence" / "host_envelope_adapter.py"
         self.assertTrue(adapter.is_file(), "host envelope adapter entrypoint is required")
-        hostile_scripts = self.root / "hostile-pythonpath" / "scripts"
+        isolated_adapter_argv = [sys.executable, "-I", "-S", "-B", str(adapter)]
+        hostile_root = self.root / "hostile-pythonpath"
+        hostile_scripts = hostile_root / "scripts"
         hostile_scripts.mkdir(parents=True)
         hostile_marker = self.root / "hostile-core-imported.marker"
+        hostile_site_marker = self.root / "hostile-sitecustomize.marker"
+        (hostile_root / "sitecustomize.py").write_text(
+            textwrap.dedent(
+                """
+                import os
+                import pathlib
+
+                pathlib.Path(os.environ["TERSH_HOSTILE_SITE_MARKER"]).write_text(
+                    "hostile-sitecustomize", encoding="utf-8"
+                )
+                """
+            ),
+            encoding="utf-8",
+        )
         (hostile_scripts / "__init__.py").write_text("", encoding="utf-8")
         (hostile_scripts / "evidence_core.py").write_text(
             textwrap.dedent(
@@ -1485,8 +1501,23 @@ class ImplementationEvidenceTests(unittest.TestCase):
             )
         )
         hostile_environment["TERSH_HOSTILE_IMPORT_MARKER"] = str(hostile_marker)
+        hostile_environment["TERSH_HOSTILE_SITE_MARKER"] = str(hostile_site_marker)
+        hostile_probe = subprocess.run(
+            [sys.executable, "-c", "pass"],
+            env=hostile_environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=5,
+        )
+        self.assertEqual(hostile_probe.returncode, 0)
+        self.assertTrue(
+            hostile_site_marker.is_file(),
+            "hostile sitecustomize fixture did not execute without isolation",
+        )
+        hostile_site_marker.unlink()
         hostile_help = subprocess.run(
-            [sys.executable, str(adapter), "--help"],
+            [*isolated_adapter_argv, "--help"],
             env=hostile_environment,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1497,6 +1528,10 @@ class ImplementationEvidenceTests(unittest.TestCase):
         self.assertFalse(
             hostile_marker.exists(),
             "adapter imported an attacker-controlled scripts.evidence_core",
+        )
+        self.assertFalse(
+            hostile_site_marker.exists(),
+            "isolated adapter executed attacker-controlled sitecustomize",
         )
         self.assertIn(b"capture-context", hostile_help.stdout)
         self.assertNotIn(b"Traceback", hostile_help.stderr)
@@ -1523,26 +1558,16 @@ class ImplementationEvidenceTests(unittest.TestCase):
             )
         ]
         self.assertEqual(len(main_guards), 1, "adapter requires one executable __main__ guard")
-        self.assertTrue(
-            any(
-                isinstance(node, ast.Call)
-                and (
-                    (isinstance(node.func, ast.Name) and node.func.id == "main")
-                    or (
-                        isinstance(node.func, ast.Name)
-                        and node.func.id == "SystemExit"
-                        and any(
-                            isinstance(argument, ast.Call)
-                            and isinstance(argument.func, ast.Name)
-                            and argument.func.id == "main"
-                            for argument in node.args
-                        )
-                    )
-                )
-                for statement in main_guards[0].body
-                for node in ast.walk(statement)
-            ),
-            "adapter __main__ guard must execute main()",
+        guarded_calls = {
+            node.func.id
+            for statement in main_guards[0].body
+            for node in ast.walk(statement)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+        self.assertIn(
+            "_isolated_cli_main",
+            guarded_calls,
+            "adapter __main__ guard must execute the isolated CLI guard",
         )
         for forbidden in (
             "expected-uid",
@@ -1562,8 +1587,21 @@ class ImplementationEvidenceTests(unittest.TestCase):
             importlib.import_module("scripts.evidence_core"),
             "adapter must call the shared evidence_core module",
         )
-        help_result = subprocess.run(
+        unisolated_help = subprocess.run(
             [sys.executable, str(adapter), "--help"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=5,
+        )
+        self.assertNotEqual(unisolated_help.returncode, 0)
+        self.assertEqual(unisolated_help.stdout, b"")
+        self.assertGreater(len(unisolated_help.stderr), 0)
+        self.assertLessEqual(len(unisolated_help.stderr), 8192)
+        self.assertNotIn(b"Traceback", unisolated_help.stderr)
+
+        help_result = subprocess.run(
+            [*isolated_adapter_argv, "--help"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
@@ -1576,7 +1614,7 @@ class ImplementationEvidenceTests(unittest.TestCase):
         for operation in ("capture-context", "capture-invocation", "capture-response"):
             with self.subTest(help_operation=operation):
                 operation_help = subprocess.run(
-                    [sys.executable, str(adapter), operation, "--help"],
+                    [*isolated_adapter_argv, operation, "--help"],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     check=False,
@@ -1755,8 +1793,7 @@ class ImplementationEvidenceTests(unittest.TestCase):
         def run_with_fd(fd):
             return subprocess.run(
                 [
-                    sys.executable,
-                    str(adapter),
+                    *isolated_adapter_argv,
                     "capture-context",
                     "--host-store-fd",
                     str(fd),
