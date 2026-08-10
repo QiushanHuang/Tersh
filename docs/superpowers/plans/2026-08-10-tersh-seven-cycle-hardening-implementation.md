@@ -25,10 +25,10 @@ Tasks 1-6 must not describe the full optimization objective as complete. Cycle 6
 | File | Responsibility |
 | --- | --- |
 | `scripts/evidence_core.py` | Shared, already committed implementation/hardening primitives for canonical atomic JSON, bounded process drain, exact candidate/job/run binding, test inventory, and append-only review closure. |
-| `scripts/implementation_evidence/host_envelope_adapter.py` | Already committed host-only context/invocation/terminal-response ingress: require a distinct-principal peer-credential-authenticated `AF_UNIX/SOCK_STREAM` FD with bounded length framing, create-new store the closed envelope outside the agent sandbox, and return only an opaque single-use handle. |
-| `scripts/implementation_evidence/record_orchestration.py` | Shared single-record writer that consumes fixed dispatch contexts and single-use host-owned invocation/response handles for both implementation and hardening provenance. |
+| `scripts/implementation_evidence/host_envelope_adapter.py` | Already committed host-only context/invocation/terminal-response ingress: run the exact shared BEGIN/BODY/COMMIT/REPLY transaction over one distinct-principal peer-credential-authenticated `AF_UNIX/SOCK_STREAM` FD and rotate opaque single-use context capabilities while the closed bodies remain in the private store. |
+| `scripts/implementation_evidence/record_orchestration.py` | Shared single-record writer that uses the same transaction to atomically consume the final rotated context capability and host-owned invocation/response handles, validate a receipt bound to the derived record facts, and then create-new publish implementation or hardening provenance. |
 | `scripts/hardening/run_gate.py` | Execute one argv without a shell, capture bounded stdout/stderr files, hash them, and atomically write a canonical gate record while preserving the child exit code. |
-| `scripts/hardening/finalize_cycle.py` | Validate and embed required gate/external-manifest bodies plus the latest complete five-role closure set, preserve every earlier append-only attempt, reject unresolved P0/P1 or candidate drift, and atomically emit one cycle manifest. |
+| `scripts/hardening/finalize_cycle.py` | Query the ordered immutable receipt set over the exact shared single-FD protocol in create mode, validate and embed required gate/external-manifest bodies plus the latest complete five-role closure set, preserve every earlier append-only attempt, reject unresolved P0/P1 or candidate drift, and atomically emit one cycle manifest. |
 | `scripts/hardening/gate_catalog.json` | Closed, ordered local gate and frozen case-matrix catalog for `hardening-01` through `hardening-07`; a later cycle contains the union of every earlier cycle entry. |
 | `scripts/hardening/run_cumulative_gates.py` | Thin shared-core adapter that executes the catalog prefix through one cycle into one attempt/candidate root and rejects missing, duplicate, reordered, or extra gates/cases. |
 | `scripts/hardening/run_prior_gates.sh` | Run the complete locked local regression, MSRV, policy, and build union used after every cycle. |
@@ -218,24 +218,53 @@ Every dispatch uses the already committed shared recorder plus Host Envelope
 Supervisor. Before spawn the distinct-principal supervisor fixes the context;
 its store is outside the agent/operator sandbox, and only its peer-credential-
 authenticated `AF_UNIX/SOCK_STREAM` FD can create/read the mode-0600 entries. It
-returns opaque single-use handles and fails closed when that host boundary is
-unavailable.
-When model metadata exists, the executor runs this exact command:
+uses exactly one pre-opened connected `FD > 2` for each transaction and the
+shared `tersh-host-transaction-*-v1` BEGIN/BODY/BODY-END/COMMIT/REQUEST-END/
+REPLY/REPLY-END protocol locked by the implementation-evidence plan. Every
+frame field set, operation arm, body order, transaction nonce, digest, end
+marker, final half-close, peer-credential check, atomic store transition,
+private-orphan rule, and typed result is byte-for-byte the shared contract;
+hardening defines no projection, alternate transport, second FD, expected-UID
+override, or reusable-handle alias. Unsupported production peer authentication,
+a same-principal peer, or any missing host boundary fails closed.
+
+The platform-envelope capture sequence is:
 
 ```text
-python3 scripts/implementation_evidence/record_orchestration.py append-platform --context-handle CONTEXT_HANDLE --invocation-handle INVOCATION_HANDLE --response-handle RESPONSE_HANDLE --host-store-fd FD
+python3 scripts/implementation_evidence/host_envelope_adapter.py capture-context --host-store-fd FD
+python3 scripts/implementation_evidence/host_envelope_adapter.py capture-invocation --context-handle CONTEXT_HANDLE_H0 --host-store-fd FD
+python3 scripts/implementation_evidence/host_envelope_adapter.py capture-response --context-handle CONTEXT_HANDLE_H1 --host-store-fd FD
+```
+
+The three closed stdout results yield `H0`, then `(H1, HI)`, then `(H2, HR)`
+under schemas `tersh-host-capture-context-result-v1`,
+`tersh-host-capture-invocation-result-v1`, and
+`tersh-host-capture-response-result-v1`. Each successful capture immediately
+invalidates its predecessor context capability. When model metadata exists, the
+executor then runs this exact command with only the final context generation:
+
+```text
+python3 scripts/implementation_evidence/record_orchestration.py append-platform --context-handle CONTEXT_HANDLE_H2 --invocation-handle INVOCATION_HANDLE_HI --response-handle RESPONSE_HANDLE_HR --host-store-fd FD
 ```
 
 It records provenance mode `platform-envelope`. When the host response still
 contains trustworthy agent/task/run identity and lifecycle but model/effort
-metadata is unavailable, it runs this exact command:
+metadata is unavailable, it skips invocation capture, consumes `H0` during
+response capture to obtain `(H1, HR)`, and runs this exact command:
 
 ```text
-python3 scripts/implementation_evidence/record_orchestration.py attest --context-handle CONTEXT_HANDLE --response-handle RESPONSE_HANDLE --operator-id ID --host-store-fd FD
+python3 scripts/implementation_evidence/record_orchestration.py attest --context-handle CONTEXT_HANDLE_H1 --response-handle RESPONSE_HANDLE_HR --operator-id ID --host-store-fd FD
 ```
 
-It records provenance mode `operator-attestation` with reason
-`platform-model-metadata-unavailable`. The latter attests only the fixed
+The record operation first retrieves and validates the fixed BODY sequence,
+derives the clean candidate, destination, and preparatory-record hash, and then
+COMMITs. Only REQUEST-END plus EOF permits the host to atomically consume the
+final context/member handles and create a receipt; only a validated REPLY,
+REPLY-END, and EOF permits create-new record publication. A publish failure can
+leave only the shared contract's private, agent-unaddressable orphan receipt and
+cannot form evidence. The fallback records provenance mode
+`operator-attestation` with reason `platform-model-metadata-unavailable`. The
+latter attests only the fixed
 `gpt-5.6-sol`/`xhigh` request; identity and lifecycle come only from the
 host-owned response. If that response does not exist, the dispatch cannot
 produce evidence. The provenance object is byte-for-byte the shared closed
@@ -247,9 +276,12 @@ reject missing/unhashed bodies, mixed arms, extra keys, agent/reviewer JSON, and
 CLI/environment identity, timestamp, model, effort, destination, or free-form
 reason overrides. The available embedded bodies use the exact shared context,
 invocation, and response field sets/types/grammars (attestation has no
-invocation body); finalization queries the
-supervisor receipt through its own injected FD, while committed `--verify-only`
-rehashes the embedded bodies without the private store.
+invocation body). Create-mode finalization sends one shared `query-receipts`
+BEGIN with the complete ordered receipt-ID set, validates the ordered receipt
+BODY sequence and exact read-only query REPLY, and binds each receipt's body
+hashes, record facts, clean candidate, and destination. Committed
+`--verify-only` rejects a host FD and rehashes the embedded bodies and
+preparatory records without the private store.
 
 Every create-mode `finalize_cycle.py` block below is launched by that supervisor,
 which injects the already open numeric descriptor as `TERSH_HOST_STORE_FD`; an
@@ -427,7 +459,7 @@ mkdir -p target/hardening/cycle-01
 git rev-parse HEAD > target/hardening/cycle-01/hardening-start.txt
 ```
 
-Add exact Python tests `test_run_gate_preserves_child_exit`, `test_allow_failure_records_nonzero`, `test_output_is_drained_hashed_and_capped`, `test_gate_json_is_canonical_and_atomic`, `test_gate_requires_exact_json_stdout_stderr_triplet`, `test_run_gate_requires_create_new_attempt_candidate_root`, `test_run_gate_rejects_reused_attempt_or_existing_output`, `test_concurrent_attempt_marker_has_one_valid_winner`, `test_run_gate_rejects_head_or_evidence_id_drift`, `test_gate_and_review_attempts_are_three_character_strings`, `test_shared_run_binding_rejects_empty_doubled_trailing_duplicate_reordered_zero_or_unknown_components`, `test_hardening_uses_shared_per_file_orchestration_and_review_schemas`, `test_hardening_rejects_aggregate_orchestration_legacy_schema_and_numeric_attempts`, `test_platform_provenance_consumes_host_owned_invocation_and_response_handles`, `test_operator_attestation_requires_host_response_and_rejects_identity_overrides`, `test_shared_provenance_union_rejects_extra_fields_mixed_arms_or_unhashed_bodies`, `test_missing_host_response_cannot_produce_hardening_evidence`, `test_finalize_requires_supervisor_receipt_hashes_and_destination`, `test_verify_only_rehashes_embedded_envelopes_and_rejects_host_fd`, `test_finalize_embeds_every_failed_superseded_and_accepting_attempt`, `test_finalize_rejects_missing_intermediate_or_unembedded_attempt`, `test_finalize_requires_append_only_wave_a_b_c_and_five_role_closure`, `test_finalize_crosschecks_orchestrator_agent_task_and_run_ids`, `test_finalize_embeds_every_review_canonical_body_and_hash`, `test_finalize_embeds_required_gate_and_external_manifest_bodies`, `test_finalize_rejects_unbound_direct_gate_hash`, `test_finalize_requires_parent_finding_resolution_chain`, `test_resolution_ref_binds_attempt_candidate_run_file_and_body_hash`, `test_hardening_rejects_legacy_finding_ids_and_ambiguous_resolution_refs`, `test_finalize_rejects_unresolved_p0_or_p1`, `test_finalize_rejects_candidate_drift`, `test_verify_only_rejects_tampered_manifest`, `test_external_gate_requires_shared_result_manifest`, `test_external_gate_rejects_manifest_path_escape_or_symlink`, `test_external_gate_requires_exact_artifact_templates_and_rejects_extra`, `test_external_artifact_manifest_excludes_itself_and_outer_index_hashes_it`, `test_exact_runner_lists_then_executes_every_required_test`, `test_exact_runner_rejects_zero_discovered_or_executed`, `test_exact_runner_rejects_parameter_case_id_or_count_mismatch`, and `test_prior_gate_script_contains_locked_commands`. Use temporary directories, a child that writes 2 MiB per stream, fixed environment metadata, append-only multi-attempt per-file orchestration/review fixtures, fake distinct-principal bounded `AF_UNIX/SOCK_STREAM` supervisor fixtures with mode-0600 create-new context/invocation/response envelopes, receipt queries, and opaque single-consumption handles, and synthetic shared `tersh-external-candidate-result-v1` plus referenced-manifest fixtures. Include negative fixtures for missing response handles, caller-supplied identity/lifecycle/model fields, numeric attempts, legacy hardening schema names, aggregate `orchestration.json`, path-only or hashless resolution references, self-listed artifact manifests, and unlisted payload files.
+Add exact Python tests `test_run_gate_preserves_child_exit`, `test_allow_failure_records_nonzero`, `test_output_is_drained_hashed_and_capped`, `test_gate_json_is_canonical_and_atomic`, `test_gate_requires_exact_json_stdout_stderr_triplet`, `test_run_gate_requires_create_new_attempt_candidate_root`, `test_run_gate_rejects_reused_attempt_or_existing_output`, `test_concurrent_attempt_marker_has_one_valid_winner`, `test_run_gate_rejects_head_or_evidence_id_drift`, `test_gate_and_review_attempts_are_three_character_strings`, `test_shared_run_binding_rejects_empty_doubled_trailing_duplicate_reordered_zero_or_unknown_components`, `test_hardening_uses_shared_per_file_orchestration_and_review_schemas`, `test_hardening_rejects_aggregate_orchestration_legacy_schema_and_numeric_attempts`, `test_hardening_host_protocol_reuses_shared_exact_frame_state_machine`, `test_hardening_provenance_uses_rotating_context_capabilities`, `test_hardening_finalizer_queries_ordered_receipts`, `test_platform_provenance_consumes_host_owned_invocation_and_response_handles`, `test_operator_attestation_requires_host_response_and_rejects_identity_overrides`, `test_shared_provenance_union_rejects_extra_fields_mixed_arms_or_unhashed_bodies`, `test_missing_host_response_cannot_produce_hardening_evidence`, `test_finalize_requires_supervisor_receipt_hashes_and_destination`, `test_verify_only_rehashes_embedded_envelopes_and_rejects_host_fd`, `test_finalize_embeds_every_failed_superseded_and_accepting_attempt`, `test_finalize_rejects_missing_intermediate_or_unembedded_attempt`, `test_finalize_requires_append_only_wave_a_b_c_and_five_role_closure`, `test_finalize_crosschecks_orchestrator_agent_task_and_run_ids`, `test_finalize_embeds_every_review_canonical_body_and_hash`, `test_finalize_embeds_required_gate_and_external_manifest_bodies`, `test_finalize_rejects_unbound_direct_gate_hash`, `test_finalize_requires_parent_finding_resolution_chain`, `test_resolution_ref_binds_attempt_candidate_run_file_and_body_hash`, `test_hardening_rejects_legacy_finding_ids_and_ambiguous_resolution_refs`, `test_finalize_rejects_unresolved_p0_or_p1`, `test_finalize_rejects_candidate_drift`, `test_verify_only_rejects_tampered_manifest`, `test_external_gate_requires_shared_result_manifest`, `test_external_gate_rejects_manifest_path_escape_or_symlink`, `test_external_gate_requires_exact_artifact_templates_and_rejects_extra`, `test_external_artifact_manifest_excludes_itself_and_outer_index_hashes_it`, `test_exact_runner_lists_then_executes_every_required_test`, `test_exact_runner_rejects_zero_discovered_or_executed`, `test_exact_runner_rejects_parameter_case_id_or_count_mismatch`, and `test_prior_gate_script_contains_locked_commands`. Use temporary directories, a child that writes 2 MiB per stream, fixed environment metadata, append-only multi-attempt per-file orchestration/review fixtures, and synthetic shared `tersh-external-candidate-result-v1` plus referenced-manifest fixtures. Host framing uses local `AF_UNIX/SOCK_STREAM` socketpairs and a scripted shared host state machine: first reproduce `EPIPE` for the obsolete body-then-host-half-close sequence, then exercise the exact shared frame order, end markers, final half-closes, rotating `H0 -> H1 -> H2` capabilities, atomic member consumption, and ordered receipt query. Reject early half-close, reply before COMMIT, missing/duplicate/extra/reordered frames or receipt results, wrong nonce/digest/count, trailing bytes, replay, cross-generation mixing, and partial consumption, always with empty client stdout. Socketpairs test framing only; a pure internal parser accepts synthetic peer/store/current UID triples, while a real production CLI socketpair remains same-UID and fails because production has no expected-UID, environment, or test override. Include negative fixtures for missing response handles, caller-supplied identity/lifecycle/model fields, numeric attempts, legacy hardening schema names, aggregate `orchestration.json`, path-only or hashless resolution references, self-listed artifact manifests, and unlisted payload files.
 
 Also add `test_hardening_wrappers_delegate_to_shared_evidence_core`, `test_hardening_exact_runner_reuses_shared_exact_parser`, `test_evidence_id_and_push_ref_use_shared_union_grammar`, `test_entry_requires_impl01_through_impl07`, `test_entry_requires_head_equal_impl07_evidence_closure`, `test_entry_rejects_schema_hash_candidate_or_lineage_drift`, `test_entry_records_start_and_manifest_hashes`, `test_hardening_has_no_external_selector_or_verifier`, `test_exact_runner_requires_external_frozen_case_inventory`, `test_exact_runner_rejects_self_declared_case_drift`, `test_cumulative_catalog_replays_every_prior_cycle_matrix`, `test_cumulative_catalog_rejects_removed_reordered_or_extra_cases`, `test_native_exdev_capability_is_closed_and_not_argv_interpolated`, and `test_finalize_requires_committed_candidate_and_evidence_only_output`. Source-contract fixtures fail if a hardening wrapper defines a second drain loop, canonical writer, libtest summary parser, case-record parser, run selector, job verifier, release verifier, or review-closure algorithm. The native-capability test rejects positional root interpolation, unknown environment keys, relative/missing/equal-device roots, and any cumulative attempt that tries to reuse an earlier gate record.
 

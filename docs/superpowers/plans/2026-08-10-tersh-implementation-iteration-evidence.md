@@ -48,9 +48,9 @@ No executor may run Plan1 Task6b or Task7b before `impl-01` is closed. Plan1 Tas
 | `scripts/run_exact_test.py` | List one exact Rust integration or private library test, require one discovery and one execution, and validate an optional frozen parameter-case ID list |
 | `scripts/tests/test_run_exact_test.py` | Exact discovery/execution, ignored/serial, malformed summary, and frozen case-matrix tests |
 | `scripts/implementation_evidence/run_gate.py` | Run one argv without a shell, drain/hash bounded output, and atomically write one canonical gate record |
-| `scripts/implementation_evidence/host_envelope_adapter.py` | Host-only context/invocation/response ingress: require a distinct-principal peer-credential-authenticated `AF_UNIX/SOCK_STREAM` FD, create-new store the closed envelope outside the agent sandbox, and return only an opaque single-use handle |
-| `scripts/implementation_evidence/record_orchestration.py` | Consume an orchestrator-fixed context plus single-use host-owned invocation/response handles, or record an explicitly labeled model/effort attestation only when the immutable host identity/lifecycle response still exists |
-| `scripts/implementation_evidence/finalize_iteration.py` | Enumerate every attempt and per-commit subtree for one evidence ID, validate orchestration/reviews/gates and the accepting candidate, and emit one canonical iteration manifest |
+| `scripts/implementation_evidence/host_envelope_adapter.py` | Run the closed single-FD Host Envelope transaction over a distinct-principal peer-credential-authenticated `AF_UNIX/SOCK_STREAM`, create-new store each host body outside the agent sandbox, and rotate opaque single-use context capabilities while returning typed closed results |
+| `scripts/implementation_evidence/record_orchestration.py` | Consume the final rotated context capability plus single-use host-owned invocation/response handles in one Host Envelope transaction, bind the immutable receipt to the derived record facts, then create-new publish platform provenance or the narrowly allowed operator attestation |
+| `scripts/implementation_evidence/finalize_iteration.py` | Enumerate every attempt and per-commit subtree for one evidence ID, query an ordered immutable receipt set over the same authenticated protocol in create mode, validate orchestration/reviews/gates and the accepting candidate, and emit one canonical iteration manifest |
 | `scripts/implementation_evidence/run_external_candidate.py` | Perform one runner-inventory/repository-wide run-ID snapshot/unique-push bootstrap, bind all requested workflow runs, enforce one remaining-deadline budget, cancel bound nonterminal runs on every failure, and record exact artifacts/results |
 | `scripts/implementation_evidence/verify_ci_evidence.py` | Verify exact committed candidate, workflow attempt, and unique successful CI job IDs |
 | `scripts/implementation_evidence/verify_release_candidate.py` | Verify exact release job IDs, AssetDescriptor/SmokeEvidence/manifest chain, downloaded artifact hashes, and downloaded-binary READY identity |
@@ -184,11 +184,18 @@ a distinct OS principal. That store contains the host-issued agent ID,
 canonical task path, agent run ID, start/end timestamps, terminal status, and a
 nullable host-returned reported-result-commit field. The recorder, not that
 field, observes the clean worktree commit and compares it when present. Neither
-the agent nor an operator can address, write, or edit the store. Context,
-invocation, and response handles are single-consumption; immutable receipts are
-read-only/queryable through closure so a failed finalizer retry cannot erase
-provenance. If this supervisor boundary is unavailable, neither provenance mode
-is evidence-bearing.
+the agent nor an operator can address, write, or edit the store. The first
+context capability `H0` is single-consumption. Capturing an invocation consumes
+`H0` and atomically returns successor context capability `H1` plus invocation
+handle `HI`; capturing a response consumes the current context capability and
+atomically returns its successor plus response handle `HR`. Thus the platform
+path is `H0 -> (H1, HI) -> (H2, HR)`, while the no-invocation attestation path is
+`H0 -> (H1, HR)`. A predecessor capability becomes invalid as soon as its
+successful transaction commits. The recorder atomically consumes the final
+context capability and its member handles; no handle can be replayed or mixed
+across context generations. Immutable receipt IDs are read-only/queryable
+through closure so a failed finalizer retry cannot erase provenance. If this
+supervisor boundary is unavailable, neither provenance mode is evidence-bearing.
 
 When the platform also supplies immutable requested/selected model metadata, the
 adapter stores one spawn-invocation envelope and the recorder compares its
@@ -366,6 +373,10 @@ Add exact Python unittest methods:
 - `test_resolution_ref_binds_attempt_candidate_run_file_and_canonical_body_hash`
 - `test_host_envelope_adapter_requires_distinct_peer_credential_unix_stream_socket`
 - `test_host_envelope_adapter_rejects_same_principal_fifo_stdin_regular_file_trailing_bytes_and_reuse`
+- `test_host_transaction_old_early_half_close_sequence_reproduces_epipe`
+- `test_host_transaction_rejects_frame_order_end_trailing_nonce_digest_and_reply_before_commit`
+- `test_context_capability_rotates_and_rejects_replay_cross_generation_or_partial_consume`
+- `test_finalizer_queries_ordered_receipts_over_authenticated_host_transaction`
 - `test_host_provenance_preflight_fails_without_distinct_supervisor`
 - `test_context_invocation_response_envelope_schemas_are_closed_typed_and_nonce_bound`
 - `test_finalizer_requires_host_receipt_body_hashes_and_destination_binding`
@@ -405,12 +416,26 @@ timestamp, one ASCII space, and the payload on every line. The producer fixture
 uses a bare 64-lowercase-hex `upload-artifact` output and a
 `sha256:`-prefixed REST digest for the same bytes. One fixture returns 404 for both
 workflow-path endpoints to prove the helper never calls them before the first
-candidate push. Host-envelope fixtures use an `AF_UNIX/SOCK_STREAM` socketpair and a fake
-supervisor/store adapter whose internal API pins a distinct synthetic peer
-principal; production exposes no expected-principal override. Same-principal,
-FIFO/plain-pipe, regular-file, stdin, wrong-nonce, trailing-byte, replay,
-caller-JSON, closed-schema, receipt-binding, and missing-supervisor cases all
-fail. Hung child
+candidate push. Host-envelope framing fixtures use an `AF_UNIX/SOCK_STREAM`
+socketpair and a scripted host state machine. A regression fixture first runs
+the obsolete sequence in which the host shuts down writes before the
+request/reply exchange, and requires its later reply to fail with `EPIPE`; the
+accepted fixture follows the exact BEGIN/BODY/BODY-END/COMMIT/REQUEST-END/
+REPLY/REPLY-END order below. Negative transcripts cover an early half-close,
+missing, duplicate, extra, or reordered frames, missing or duplicate end
+markers, bytes or frames after an end marker, early or late EOF, reply before
+commit, wrong frame type/count/transaction nonce/body digest, noncanonical or
+open JSON, rotating-handle replay, cross-generation handle mixing, partial
+consumption, and missing, duplicate, extra, or reordered receipt-query results.
+Every rejected transcript leaves adapter stdout empty; a private orphan that a
+host creates after a valid commit but whose reply the adapter rejects never
+becomes evidence. Socketpair tests exercise framing only. The internal
+credential-parser seam accepts synthetic peer/store/current UID triples, while
+the production CLI always obtains family, type, owner, peer credentials, and
+effective UID from the kernel and exposes no expected-principal, environment,
+or test override. A real same-UID CLI socketpair therefore remains a negative
+fixture. FIFO/plain-pipe, regular-file, stdin, wrong-nonce, replay, caller-JSON,
+closed-schema, receipt-binding, and missing-supervisor cases all fail. Hung child
 fixtures cover Git, `gh`, artifact download, and
 verifier calls. Tests never contact GitHub and prove no push occurs when the
 online inventory is empty, partial registration cancels only already bound
@@ -486,83 +511,195 @@ returns successfully:
 python3 scripts/implementation_evidence/host_envelope_adapter.py capture-context --host-store-fd FD
 ```
 
-The supervisor injects `FD` as a pre-opened connected
-`AF_UNIX/SOCK_STREAM` socket; it is not inherited by the agent and is not accepted from
-stdin, a pathname, environment, or a caller-owned pipe. The adapter verifies
-address family `AF_UNIX`, `SO_TYPE == SOCK_STREAM`, plus the platform peer UID.
-On macOS it calls `getsockopt(SOL_LOCAL=0, LOCAL_PEERCRED, 76)` and unpacks the
-returned `xucred` as native `=III16I`; on Linux it calls
-`getsockopt(SOL_SOCKET, SO_PEERCRED, 12)` and unpacks native `=iii` pid/uid/gid.
-It requires exactly 76 bytes, `xucred` version `0`, and group count `0..16` on
-macOS, and exactly 12 bytes plus nonnegative pid/uid/gid on Linux. It requires the parsed UID to
-equal the supervisor/store owner and differ from the worktree process UID.
-There is no `--expected-uid`, test-mode, body, nonce, model, or identity override.
-The adapter reads the same four-byte big-endian 1..65536 length plus exact body
-and requires a no-trailing-byte peer write-half close, validates the closed
-schema, sends its digest/create-new request back over that same socket,
-and accepts exactly one store reply containing a random 64-lowercase-hex
-`CONTEXT_HANDLE`; the nonce remains inside the host store until the final record
-embeds the body.
+For each command the supervisor injects `FD > 2` as the one pre-opened connected
+`AF_UNIX/SOCK_STREAM` socket for that transaction; it is not inherited by the
+agent and is not accepted from stdin, a pathname, environment, or a caller-owned
+pipe. Before sending any byte, the client obtains the address family and
+connected state from the socket, requires `SO_TYPE == SOCK_STREAM`, calls
+`fstat(FD)`, and obtains the platform peer credential. On macOS it calls
+`getsockopt(SOL_LOCAL=0, LOCAL_PEERCRED, 76)` and unpacks the exact 76 returned
+bytes as native `=III16I`; `xucred` version is exactly `0` and group count is
+`0..16`. On Linux it calls `getsockopt(SOL_SOCKET, SO_PEERCRED, 12)`, requires
+exactly 12 bytes, and unpacks native `=iii` pid/uid/gid, all nonnegative. The
+parsed peer UID must equal `fstat(FD).st_uid`, which is the supervisor/private-
+store owner, and must differ from the client's effective UID. Any unsupported
+production platform or unavailable exact kernel check fails before protocol
+I/O. There is no `--expected-uid`, environment, test-mode, pathname, stdin,
+body, nonce, model, identity, or same-principal override.
+
+Every protocol frame is four-byte big-endian unsigned length `1..65536`
+followed by exactly that many compact, sorted-key, closed-schema canonical UTF-8
+JSON bytes including one trailing LF. Duplicate keys, non-finite numbers,
+noncanonical bytes, unknown keys, and a boolean where an integer is required
+fail. A transaction nonce, context/invocation/response handle, receipt ID, every
+SHA-256 field, and every digest-array member is exactly 64 lowercase hex. The
+client generates a fresh transaction nonce and
+sends one BEGIN frame before the host sends any body. The host then sends the
+operation's fixed BODY frames followed by BODY-END but keeps its write side
+open. After validating all bodies and relationships, the client sends COMMIT,
+REQUEST-END, and then `shutdown(SHUT_WR)`. The host must read that exact end frame
+and EOF before it atomically mutates the private store; it then sends REPLY,
+REPLY-END, and `shutdown(SHUT_WR)`. The client accepts a result only after the
+exact reply, end frame, and EOF. Missing, extra, duplicated, or reordered frames,
+wrong type/count/nonce/digest, early or late EOF, bytes after an end marker, or a
+reply before COMMIT fails with empty stdout.
+
+The frame schemas and field sets are closed as follows:
+
+- BEGIN has schema `tersh-host-transaction-begin-v1`. The `capture-context` arm
+  is exactly `{schema,transaction_nonce,operation}`. The `capture-invocation`
+  and `capture-response` arms are exactly
+  `{schema,transaction_nonce,operation,context_handle}`. The `append-platform`
+  arm is exactly
+  `{schema,transaction_nonce,operation,context_handle,invocation_handle,response_handle}`.
+  The `attest` arm is exactly
+  `{schema,transaction_nonce,operation,context_handle,response_handle}`. The
+  `query-receipts` arm is exactly
+  `{schema,transaction_nonce,operation,receipt_ids}`, where `receipt_ids` is a
+  nonempty ordered array with no duplicate.
+- Every BODY wrapper is exactly
+  `{schema,transaction_nonce,operation,body_kind,ordinal,total,body,body_sha256}`
+  with schema `tersh-host-transaction-body-v1`; `ordinal` is one-based, `total`
+  is the operation's exact positive body count, and `body_sha256` hashes the
+  nested body's canonical bytes including its LF. BODY-END is exactly
+  `{schema,transaction_nonce,operation,total,body_sha256s}` with schema
+  `tersh-host-transaction-body-end-v1`; its ordered digest array equals the BODY
+  sequence byte-for-byte.
+- COMMIT has schema `tersh-host-transaction-commit-v1`. Capture and query arms
+  are exactly `{schema,transaction_nonce,operation,body_sha256s}`. The two
+  record arms are exactly
+  `{schema,transaction_nonce,operation,body_sha256s,record_facts}`.
+  `append-platform` record facts are exactly
+  `{evidence_id,evidence_attempt,run_binding,candidate,destination,record_sha256_without_receipt}`.
+  `attest` record facts have those fields plus exactly
+  `{operator_id,attested_at,reason,requested_model,requested_reasoning_effort}`.
+  The candidate is the clean observed HEAD, destination is the derived
+  candidate-relative orchestration path, reason is exactly
+  `platform-model-metadata-unavailable`, and requested model/effort are exactly
+  `gpt-5.6-sol`/`xhigh`. `record_sha256_without_receipt` hashes the canonical
+  preparatory record obtained from the final closed record by omitting only the
+  provenance member `host_receipt_id`; the finalizer can reproduce that object.
+  REQUEST-END is exactly
+  `{schema,transaction_nonce,operation,commit_sha256}` with schema
+  `tersh-host-transaction-request-end-v1`, where the digest covers the canonical
+  COMMIT frame.
+- REPLY is exactly
+  `{schema,transaction_nonce,operation,body_sha256s,result}` with schema
+  `tersh-host-transaction-reply-v1`. For `capture-context`, result is exactly
+  `{schema,context_handle}` with schema `tersh-host-capture-context-result-v1`.
+  For `capture-invocation`, it is exactly
+  `{schema,context_handle,invocation_handle}` with schema
+  `tersh-host-capture-invocation-result-v1`. For `capture-response`, it is
+  exactly `{schema,context_handle,response_handle}` with schema
+  `tersh-host-capture-response-result-v1`. For either record arm, it is exactly
+  `{schema,receipt}` with schema `tersh-host-record-result-v1`, and `receipt` is
+  the exact closed receipt body below. For `query-receipts`, it is exactly
+  `{schema,receipt_ids,receipt_sha256s}` with schema
+  `tersh-host-receipt-query-result-v1`; both ordered arrays correspond exactly
+  to the requested receipt BODY sequence. REPLY-END is exactly
+  `{schema,transaction_nonce,operation,reply_sha256}` with schema
+  `tersh-host-transaction-reply-end-v1`, where the digest covers the canonical
+  REPLY frame.
+
+The fixed BODY orders are: `capture-context` = `context`;
+`capture-invocation` = `context, invocation`; `capture-response` = `context,
+response`; `append-platform` = `context, invocation, response`; `attest` =
+`context, response`; and `query-receipts` = one `receipt` BODY for each ordered
+BEGIN receipt ID. No operation permits a null, optional, additional, or
+different-kind BODY. The host applies these atomic state transitions only after
+REQUEST-END plus EOF: create `H0`; consume `H0` and create `(H1, HI)`; consume
+the current context capability and create `(Hnext, HR)`; atomically consume the
+final context and required member handles and create one immutable receipt; or
+read the ordered receipt set without consuming it. A failed capture or record
+transaction consumes nothing and publishes no subset.
 
 Immediately before spawn and at its terminal callback, the same supervisor
 stores the exact invocation/response bodies with these host-side commands:
 
 ```text
-python3 scripts/implementation_evidence/host_envelope_adapter.py capture-invocation --context-handle CONTEXT_HANDLE --host-store-fd FD
-python3 scripts/implementation_evidence/host_envelope_adapter.py capture-response --context-handle CONTEXT_HANDLE --host-store-fd FD
+python3 scripts/implementation_evidence/host_envelope_adapter.py capture-invocation --context-handle CONTEXT_HANDLE_H0 --host-store-fd FD
+python3 scripts/implementation_evidence/host_envelope_adapter.py capture-response --context-handle CONTEXT_HANDLE_H1 --host-store-fd FD
 ```
 
-Each command re-authenticates the `AF_UNIX/SOCK_STREAM` peer, reads one
-four-byte big-endian unsigned length in the closed range 1..65536, then exactly
-that many canonical-body bytes, then requires the peer to half-close its write
-side with no trailing byte. It verifies the
-context nonce/dispatch ID and closed field set, create-new stores it, and prints
-one random 64-lowercase-hex handle. It rejects same-principal/fake peers, FIFO or
-plain pipes, regular files, TTY/stdin, caller JSON, wrong nonce, replay, trailing
-bytes, and unknown options. The supervisor records only callback fields it
-actually exposes; if invocation model metadata is absent there is no invocation
-handle, and if terminal identity/lifecycle is absent there is no response handle.
+`capture-context` prints exactly
+`{schema,context_handle}` with schema `tersh-host-capture-context-result-v1` and
+the returned handle is `H0`. `capture-invocation` consumes `H0` and prints
+exactly `{schema,context_handle,invocation_handle}` with schema
+`tersh-host-capture-invocation-result-v1`, yielding `H1` and `HI`.
+`capture-response` consumes `H1` and prints exactly
+`{schema,context_handle,response_handle}` with schema
+`tersh-host-capture-response-result-v1`, yielding `H2` and `HR`. The old context
+handle is invalid immediately after each accepted reply. If invocation metadata
+is absent, the invocation command is not run; response capture instead consumes
+`H0` and yields `H1` plus `HR`. The supervisor records only callback fields it
+actually exposes, and absence of terminal identity/lifecycle means no response
+handle. Every command uses a fresh authenticated FD and the exact transaction
+above; same-principal/fake peers, FIFO or plain pipes, regular files, TTY/stdin,
+caller JSON, wrong nonce, replay, trailing bytes, and unknown options fail.
 
 In `platform-envelope` mode the supervisor launches the recorder with a fresh
 authenticated store connection:
 
 ```text
-python3 scripts/implementation_evidence/record_orchestration.py append-platform --context-handle CONTEXT_HANDLE --invocation-handle INVOCATION_HANDLE --response-handle RESPONSE_HANDLE --host-store-fd FD
+python3 scripts/implementation_evidence/record_orchestration.py append-platform --context-handle CONTEXT_HANDLE_H2 --invocation-handle INVOCATION_HANDLE_HI --response-handle RESPONSE_HANDLE_HR --host-store-fd FD
 ```
 
-The recorder retrieves all three bodies from the authenticated peer, consumes
-the handles once, verifies every digest/nonce/dispatch ID/duplicated field,
-derives the destination, observes the clean worktree HEAD, compares the nullable
-reported commit, and create-new publishes the record. The supervisor returns a
-64-lowercase-hex `host_receipt_id` for the exact closed receipt body
-`{schema,receipt_id,mode,context_sha256,invocation_sha256,response_sha256,destination,created_at}`
-with schema `tersh-host-record-receipt-v1`; `mode` is one provenance tag,
-`invocation_sha256` is 64 lowercase hex for platform mode and JSON null for
-attestation, and `destination` is the derived candidate-relative orchestration
-record path. The record embeds only the receipt ID; finalization retrieves and
-cross-checks the full receipt from the private store. No model, effort, identity,
-timestamp, response body, destination, or receipt override exists on CLI or
-environment.
+The recorder sends BEGIN and retrieves the three ordered bodies without yet
+consuming any handle. It verifies every closed envelope, digest, nonce, dispatch
+ID, and duplicated field, observes a clean worktree HEAD, compares the nullable
+reported commit, derives the only permitted destination, and constructs the
+complete record without `host_receipt_id`. Its COMMIT carries the ordered body
+hashes and exact derived record facts. Only after REQUEST-END plus EOF does the
+host atomically consume `H2`, `HI`, and `HR` and create the receipt. The recorder
+validates REPLY, REPLY-END, and EOF, inserts that receipt ID into the otherwise
+unchanged record, and only then uses dirfd create-new publication. A publication
+failure may leave one private, agent-unaddressable orphan receipt, but produces
+no evidence record.
+
+The receipt body is exactly
+`{schema,receipt_id,mode,context_sha256,invocation_sha256,response_sha256,record_facts,created_at}`
+with schema `tersh-host-record-receipt-v1`. `mode` is exactly
+`platform-envelope|operator-attestation`; `invocation_sha256` is 64 lowercase
+hex in platform mode and JSON null in attestation mode; `record_facts` is the
+exact corresponding nested record-facts object from COMMIT. The record embeds
+only `receipt_id` as `host_receipt_id`. No model, effort, identity, timestamp, response body,
+destination, or receipt override exists on CLI or environment.
 
 If and only if the authenticated response exists but invocation model metadata
 does not, the operator requests this supervisor-launched fallback:
 
 ```text
-python3 scripts/implementation_evidence/record_orchestration.py attest --context-handle CONTEXT_HANDLE --response-handle RESPONSE_HANDLE --operator-id ID --host-store-fd FD
+python3 scripts/implementation_evidence/record_orchestration.py attest --context-handle CONTEXT_HANDLE_H1 --response-handle RESPONSE_HANDLE_HR --operator-id ID --host-store-fd FD
 ```
 
-It consumes context/response through the authenticated peer, derives identity
-and lifecycle only from the response, independently observes the worktree commit,
-and writes the exact `operator-attestation` arm plus fixed reason
-`platform-model-metadata-unavailable`; only the context's model/effort request is
-operator-attested. The CLI rejects identity, task, run, timestamp, commit, model,
-effort, output, receipt, or free-form reason arguments. `finalize_iteration.py`
-uses its own supervisor-injected store FD to require every `host_receipt_id` to
-bind the embedded body hashes and destination before closure; fake/local handles
-or records cannot satisfy that query. After the evidence commit, `--verify-only`
-rehashes the embedded canonical bodies and no longer needs the private store. A
-missing supervisor, context, response, receipt, or host FD means no evidence
-entry; no mode invents metadata the callback did not expose.
+It uses the same retrieve-before-commit transaction, atomically consumes `H1`
+and `HR`, derives identity and lifecycle only from the response, independently
+observes the worktree commit, and writes the exact `operator-attestation` arm
+plus fixed reason `platform-model-metadata-unavailable`; only the context's
+model/effort request is operator-attested. The CLI rejects identity, task, run,
+timestamp, commit, model, effort, output, receipt, or free-form reason arguments.
+
+In create mode `finalize_iteration.py` obtains one fresh supervisor-injected FD,
+sends one `query-receipts` BEGIN containing the complete nonempty ordered list of
+embedded receipt IDs, validates the corresponding ordered receipt BODY sequence,
+commits the read-only query, and accepts only the exact query REPLY and EOF. It
+rehashes every embedded context/invocation/response body and the preparatory
+record without `host_receipt_id`, and requires every queried receipt to bind
+those hashes, the provenance mode, clean candidate, and derived destination.
+Missing, duplicate, extra, or reordered query bodies/results fail; receipt
+queries never consume receipts. Fake/local handles or records cannot satisfy the
+query. After the evidence commit, `--verify-only` rejects a host FD, rehashes the
+embedded canonical bodies and preparatory record, and does not access the
+private store. A missing supervisor, context, response, receipt, or create-mode
+host FD means no evidence entry; no mode invents metadata the callback did not
+expose.
+
+The host may have atomically stored a capture object or receipt after a valid
+COMMIT even if its REPLY is missing, malformed, or followed by trailing data.
+Such an object is a private orphan: the client emits no handle, receipt, or
+evidence, the agent cannot address it, and the host may garbage-collect it. This
+plan does not require zero private-store side effects before reply/trailing-byte
+validation and therefore does not introduce a second FD or connection.
 
 The evidence entrypoints accept only argparse argument vectors. They write
 sorted-key compact UTF-8 JSON plus trailing newline using the create-new
