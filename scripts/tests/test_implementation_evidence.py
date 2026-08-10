@@ -1,6 +1,8 @@
 import ast
+import copy
 import hashlib
 import importlib
+import io
 import json
 import os
 import pathlib
@@ -12,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import unittest
 from unittest import mock
@@ -20,6 +23,97 @@ from unittest import mock
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 RUN_GATE = ROOT / "scripts" / "implementation_evidence" / "run_gate.py"
 MIB = 1024 * 1024
+
+
+def fixture_canonical_json(value):
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8") + b"\n"
+
+
+def fixture_send_frame(sock, value):
+    body = fixture_canonical_json(value)
+    sock.sendall(struct.pack(">I", len(body)) + body)
+
+
+def fixture_recv_exact(sock, size):
+    result = bytearray()
+    while len(result) < size:
+        chunk = sock.recv(size - len(result))
+        if not chunk:
+            raise EOFError("scripted host received early EOF")
+        result.extend(chunk)
+    return bytes(result)
+
+
+def fixture_recv_frame(sock):
+    size = struct.unpack(">I", fixture_recv_exact(sock, 4))[0]
+    if not 1 <= size <= 65536:
+        raise ValueError(f"scripted host received invalid frame size {size}")
+    raw = fixture_recv_exact(sock, size)
+    value = json.loads(raw)
+    if fixture_canonical_json(value) != raw:
+        raise ValueError("scripted host received noncanonical JSON frame")
+    return value
+
+
+class ScriptedCaptureStore:
+    def __init__(self):
+        self.contexts = {}
+        self.invocations = set()
+        self.responses = set()
+        self.next_handle = 1
+
+    def new_handle(self):
+        value = f"{self.next_handle:064x}"
+        self.next_handle += 1
+        return value
+
+    def valid_context(self, handle):
+        return handle is not None and handle in self.contexts
+
+    def prepare_bodies(self, operation, context_handle, context_body, invocation_body, response_body):
+        if operation == "capture-context":
+            return [("context", copy.deepcopy(context_body))]
+        if not self.valid_context(context_handle):
+            return None
+        current = copy.deepcopy(self.contexts[context_handle])
+        if operation == "capture-invocation":
+            return [("context", current), ("invocation", copy.deepcopy(invocation_body))]
+        if operation == "capture-response":
+            return [("context", current), ("response", copy.deepcopy(response_body))]
+        raise AssertionError(f"unexpected scripted capture operation {operation}")
+
+    def commit(self, operation, context_handle, context_body):
+        if operation == "capture-context":
+            successor = self.new_handle()
+            self.contexts[successor] = copy.deepcopy(context_body)
+            return {"schema": "tersh-host-capture-context-result-v1", "context_handle": successor}
+        if context_handle not in self.contexts:
+            raise AssertionError("scripted host committed an invalid context handle")
+        current = self.contexts.pop(context_handle)
+        successor = self.new_handle()
+        self.contexts[successor] = current
+        if operation == "capture-invocation":
+            member = self.new_handle()
+            self.invocations.add(member)
+            return {
+                "schema": "tersh-host-capture-invocation-result-v1",
+                "context_handle": successor,
+                "invocation_handle": member,
+            }
+        if operation == "capture-response":
+            member = self.new_handle()
+            self.responses.add(member)
+            return {
+                "schema": "tersh-host-capture-response-result-v1",
+                "context_handle": successor,
+                "response_handle": member,
+            }
+        raise AssertionError(f"unexpected scripted commit operation {operation}")
 
 
 FALLBACK_RUN_GATE = r'''#!/usr/bin/env python3
@@ -171,6 +265,311 @@ class ImplementationEvidenceTests(unittest.TestCase):
             "import pathlib,sys; pathlib.Path(sys.argv[1]).write_text('ran',encoding='utf-8')",
             str(marker),
         ]
+
+    def host_envelope_bodies(self):
+        context_nonce = "c" * 64
+        dispatch_id = "d" * 64
+        context = {
+            "schema": "tersh-host-dispatch-context-v1",
+            "context_nonce": context_nonce,
+            "evidence_id": "impl-01",
+            "evidence_attempt": "001",
+            "role": "safety",
+            "wave": "wave-c",
+            "review_attempt": "001",
+            "run_binding": "run-local",
+            "baseline_commit": self.candidate_a,
+            "review_target": self.candidate_b,
+            "canonical_task_path": "/root/safety/reviewer",
+            "worktree_handle": "fixture-worktree",
+            "requested_model": "gpt-5.6-sol",
+            "requested_reasoning_effort": "xhigh",
+            "created_at": "2026-08-10T00:00:00.000000001Z",
+        }
+        invocation = {
+            "schema": "tersh-host-spawn-invocation-v1",
+            "context_nonce": context_nonce,
+            "dispatch_id": dispatch_id,
+            "requested_model": "gpt-5.6-sol",
+            "requested_reasoning_effort": "xhigh",
+            "selected_model": "gpt-5.6-sol",
+            "selected_reasoning_effort": "xhigh",
+            "dispatched_at": "2026-08-10T00:00:01.000000001Z",
+        }
+        response = {
+            "schema": "tersh-host-spawn-response-v1",
+            "context_nonce": context_nonce,
+            "dispatch_id": dispatch_id,
+            "agent_id": "fixture-agent",
+            "canonical_task_path": "/root/safety/reviewer",
+            "agent_run_id": "fixture-run",
+            "started_at": "2026-08-10T00:00:02.000000001Z",
+            "ended_at": "2026-08-10T00:00:03.000000001Z",
+            "terminal_status": "completed",
+            "reported_result_commit": self.candidate_b,
+        }
+        return context, invocation, response
+
+    def run_scripted_capture(
+        self,
+        store,
+        operation,
+        context_handle=None,
+        *,
+        scenario="success",
+        body_mutator=None,
+    ):
+        core = importlib.import_module("scripts.evidence_core")
+        capture = getattr(core, "capture_host_envelope_on_authenticated_socket", None)
+        self.assertTrue(callable(capture), "shared capture transaction seam is required")
+        context_body, invocation_body, response_body = self.host_envelope_bodies()
+        client, host = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(2)
+        host.settimeout(2)
+        host_errors = []
+        transcript = []
+
+        def scripted_host():
+            try:
+                begin = fixture_recv_frame(host)
+                transcript.append(("client", begin))
+                expected_begin = {
+                    "schema": "tersh-host-transaction-begin-v1",
+                    "transaction_nonce": begin.get("transaction_nonce"),
+                    "operation": operation,
+                }
+                if operation != "capture-context":
+                    expected_begin["context_handle"] = context_handle
+                if begin != expected_begin:
+                    raise AssertionError(f"client BEGIN is not exact: {begin!r}")
+                nonce = begin["transaction_nonce"]
+                if (
+                    type(nonce) is not str
+                    or len(nonce) != 64
+                    or any(character not in "0123456789abcdef" for character in nonce)
+                ):
+                    raise AssertionError("client transaction nonce is not 64 lowercase hex")
+                if scenario == "reply-before-commit":
+                    fixture_send_frame(
+                        host,
+                        {
+                            "schema": "tersh-host-transaction-reply-v1",
+                            "transaction_nonce": nonce,
+                            "operation": operation,
+                            "body_sha256s": [],
+                            "result": {"schema": "unexpected-reply-v1"},
+                        },
+                    )
+                    host.shutdown(socket.SHUT_WR)
+                    return
+
+                bodies = store.prepare_bodies(
+                    operation,
+                    context_handle,
+                    context_body,
+                    invocation_body,
+                    response_body,
+                )
+                if bodies is None:
+                    host.shutdown(socket.SHUT_WR)
+                    return
+                if body_mutator is not None:
+                    bodies = body_mutator(copy.deepcopy(bodies))
+                digests = [hashlib.sha256(fixture_canonical_json(body)).hexdigest() for _, body in bodies]
+                wrappers = []
+                for ordinal, ((kind, body), digest) in enumerate(zip(bodies, digests), start=1):
+                    wrappers.append(
+                        {
+                            "schema": "tersh-host-transaction-body-v1",
+                            "transaction_nonce": nonce,
+                            "operation": operation,
+                            "body_kind": kind,
+                            "ordinal": ordinal,
+                            "total": len(bodies),
+                            "body": body,
+                            "body_sha256": digest,
+                        }
+                    )
+                body_end = {
+                    "schema": "tersh-host-transaction-body-end-v1",
+                    "transaction_nonce": nonce,
+                    "operation": operation,
+                    "total": len(bodies),
+                    "body_sha256s": digests,
+                }
+                if scenario == "wrong-body-nonce":
+                    wrappers[0]["transaction_nonce"] = "e" * 64
+                if scenario == "wrong-body-digest":
+                    wrappers[0]["body_sha256"] = "f" * 64
+                if scenario == "bool-body-ordinal":
+                    wrappers[0]["ordinal"] = True
+                if scenario == "wrong-body-schema":
+                    wrappers[0]["schema"] = "tersh-host-transaction-body-v0"
+                if scenario == "wrong-body-operation":
+                    wrappers[0]["operation"] = (
+                        "capture-response" if operation != "capture-response" else "capture-context"
+                    )
+                if scenario == "wrong-body-kind":
+                    wrappers[0]["body_kind"] = "response"
+                if scenario == "wrong-body-total":
+                    wrappers[0]["total"] = len(bodies) + 1
+                if scenario == "bool-body-total":
+                    wrappers[0]["total"] = True
+                if scenario == "extra-body-key":
+                    wrappers[0]["extra"] = None
+                if scenario == "duplicate-body":
+                    wrappers.insert(1, copy.deepcopy(wrappers[0]))
+                if scenario == "reordered-bodies":
+                    wrappers.reverse()
+                if scenario == "extra-body":
+                    extra = copy.deepcopy(wrappers[-1])
+                    extra["ordinal"] = len(wrappers) + 1
+                    wrappers.append(extra)
+                if scenario == "wrong-body-end-nonce":
+                    body_end["transaction_nonce"] = "e" * 64
+                if scenario == "wrong-body-end-schema":
+                    body_end["schema"] = "tersh-host-transaction-body-end-v0"
+                if scenario == "wrong-body-end-operation":
+                    body_end["operation"] = (
+                        "capture-response" if operation != "capture-response" else "capture-context"
+                    )
+                if scenario == "wrong-body-end-total":
+                    body_end["total"] = len(bodies) + 1
+                if scenario == "bool-body-end-total":
+                    body_end["total"] = True
+                if scenario == "wrong-body-end-digests":
+                    body_end["body_sha256s"] = ["f" * 64 for _ in digests]
+                if scenario == "extra-body-end-key":
+                    body_end["extra"] = None
+                if scenario == "body-end-before-body":
+                    fixture_send_frame(host, body_end)
+                    for wrapper in wrappers:
+                        fixture_send_frame(host, wrapper)
+                    host.shutdown(socket.SHUT_WR)
+                    return
+                for wrapper in wrappers:
+                    fixture_send_frame(host, wrapper)
+                if scenario == "missing-body-end":
+                    host.shutdown(socket.SHUT_WR)
+                    return
+                fixture_send_frame(host, body_end)
+                if scenario == "duplicate-body-end":
+                    fixture_send_frame(host, body_end)
+
+                commit = fixture_recv_frame(host)
+                request_end = fixture_recv_frame(host)
+                transcript.extend((("client", commit), ("client", request_end)))
+                expected_commit = {
+                    "schema": "tersh-host-transaction-commit-v1",
+                    "transaction_nonce": nonce,
+                    "operation": operation,
+                    "body_sha256s": digests,
+                }
+                if commit != expected_commit:
+                    raise AssertionError(f"client COMMIT is not exact: {commit!r}")
+                expected_request_end = {
+                    "schema": "tersh-host-transaction-request-end-v1",
+                    "transaction_nonce": nonce,
+                    "operation": operation,
+                    "commit_sha256": hashlib.sha256(fixture_canonical_json(commit)).hexdigest(),
+                }
+                if request_end != expected_request_end:
+                    raise AssertionError(f"client REQUEST-END is not exact: {request_end!r}")
+                if host.recv(1) != b"":
+                    raise AssertionError("client did not half-close after REQUEST-END")
+                result = store.commit(operation, context_handle, context_body)
+                reply = {
+                    "schema": "tersh-host-transaction-reply-v1",
+                    "transaction_nonce": nonce,
+                    "operation": operation,
+                    "body_sha256s": digests,
+                    "result": result,
+                }
+                if scenario == "wrong-reply-nonce":
+                    reply["transaction_nonce"] = "e" * 64
+                if scenario == "wrong-reply-digest":
+                    reply["body_sha256s"] = ["f" * 64 for _ in digests]
+                if scenario == "wrong-reply-schema":
+                    reply["schema"] = "tersh-host-transaction-reply-v0"
+                if scenario == "wrong-reply-operation":
+                    reply["operation"] = (
+                        "capture-response" if operation != "capture-response" else "capture-context"
+                    )
+                if scenario == "extra-reply-key":
+                    reply["extra"] = None
+                if scenario == "wrong-result-schema":
+                    reply["result"]["schema"] = "tersh-host-capture-result-v0"
+                if scenario == "extra-result-key":
+                    reply["result"]["extra"] = None
+                if scenario == "bad-result-context-handle":
+                    reply["result"]["context_handle"] = "not-a-handle"
+                if scenario == "bad-result-member-handle":
+                    member_field = {
+                        "capture-invocation": "invocation_handle",
+                        "capture-response": "response_handle",
+                    }.get(operation)
+                    if member_field is None:
+                        raise AssertionError(
+                            "bad-result-member-handle requires a member-producing operation"
+                        )
+                    reply["result"][member_field] = "not-a-handle"
+                fixture_send_frame(host, reply)
+                if scenario == "missing-reply-end":
+                    host.shutdown(socket.SHUT_WR)
+                    return
+                reply_end = {
+                    "schema": "tersh-host-transaction-reply-end-v1",
+                    "transaction_nonce": nonce,
+                    "operation": operation,
+                    "reply_sha256": hashlib.sha256(fixture_canonical_json(reply)).hexdigest(),
+                }
+                if scenario == "wrong-reply-end-nonce":
+                    reply_end["transaction_nonce"] = "e" * 64
+                if scenario == "wrong-reply-end-schema":
+                    reply_end["schema"] = "tersh-host-transaction-reply-end-v0"
+                if scenario == "wrong-reply-end-operation":
+                    reply_end["operation"] = (
+                        "capture-response" if operation != "capture-response" else "capture-context"
+                    )
+                if scenario == "wrong-reply-end-digest":
+                    reply_end["reply_sha256"] = "f" * 64
+                if scenario == "extra-reply-end-key":
+                    reply_end["extra"] = None
+                fixture_send_frame(host, reply_end)
+                if scenario == "duplicate-reply-end":
+                    fixture_send_frame(host, reply_end)
+                if scenario == "trailing":
+                    host.sendall(b"trailing")
+                if scenario == "late-eof":
+                    time.sleep(1)
+                host.shutdown(socket.SHUT_WR)
+            except (OSError, EOFError) as error:
+                if scenario == "success":
+                    host_errors.append(error)
+            except BaseException as error:
+                host_errors.append(error)
+            finally:
+                host.close()
+
+        thread = threading.Thread(target=scripted_host)
+        thread.start()
+        result = None
+        error = None
+        try:
+            result = capture(
+                client,
+                operation,
+                context_handle,
+                deadline=time.monotonic() + 0.7,
+            )
+        except BaseException as caught:
+            error = caught
+        finally:
+            client.close()
+            thread.join(timeout=2)
+        self.assertFalse(thread.is_alive(), f"scripted host did not terminate for {scenario}")
+        self.assertFalse(host_errors, f"scripted host errors for {scenario}: {host_errors!r}")
+        return result, error, transcript
 
     def test_run_gate_drains_hashes_and_caps_both_streams(self):
         stdout_tail = b"stdout-tail-after-cap"
@@ -999,15 +1398,19 @@ class ImplementationEvidenceTests(unittest.TestCase):
                     linux_parser(raw)
 
         self.assertIsNone(validator(0, 0, 501))
-        for peer_uid, owner_uid, client_euid in (
-            (501, 501, 502),
-            (501, 0, 502),
-            (0, 501, 502),
+        rejected_identities = [
+            (uid, uid, 502) for uid in (1, 2, 501, 65534)
+        ] + [
+            (uid, 0, 502) for uid in (1, 2, 501, 65534)
+        ] + [
+            (0, uid, 502) for uid in (1, 2, 501, 65534)
+        ] + [
             (0, 0, 0),
             (True, 0, 501),
             (0, False, 501),
             (0, 0, True),
-        ):
+        ]
+        for peer_uid, owner_uid, client_euid in rejected_identities:
             with self.subTest(
                 peer_uid=peer_uid,
                 owner_uid=owner_uid,
@@ -1030,6 +1433,256 @@ class ImplementationEvidenceTests(unittest.TestCase):
     def test_host_envelope_adapter_rejects_same_principal_fifo_stdin_regular_file_trailing_bytes_and_reuse(self):
         adapter = ROOT / "scripts" / "implementation_evidence" / "host_envelope_adapter.py"
         self.assertTrue(adapter.is_file(), "host envelope adapter entrypoint is required")
+        adapter_source = adapter.read_text(encoding="utf-8")
+        adapter_tree = ast.parse(adapter_source, filename=str(adapter))
+        core_call_names = {
+            node.func.attr
+            for node in ast.walk(adapter_tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        }
+        self.assertIn("open_authenticated_host_store_socket", core_call_names)
+        self.assertIn("capture_host_envelope_on_authenticated_socket", core_call_names)
+        main_guards = [
+            node
+            for node in ast.walk(adapter_tree)
+            if isinstance(node, ast.If)
+            and isinstance(node.test, ast.Compare)
+            and isinstance(node.test.left, ast.Name)
+            and node.test.left.id == "__name__"
+            and any(
+                isinstance(comparator, ast.Constant) and comparator.value == "__main__"
+                for comparator in node.test.comparators
+            )
+        ]
+        self.assertEqual(len(main_guards), 1, "adapter requires one executable __main__ guard")
+        self.assertTrue(
+            any(
+                isinstance(node, ast.Call)
+                and (
+                    (isinstance(node.func, ast.Name) and node.func.id == "main")
+                    or (
+                        isinstance(node.func, ast.Name)
+                        and node.func.id == "SystemExit"
+                        and any(
+                            isinstance(argument, ast.Call)
+                            and isinstance(argument.func, ast.Name)
+                            and argument.func.id == "main"
+                            for argument in node.args
+                        )
+                    )
+                )
+                for statement in main_guards[0].body
+                for node in ast.walk(statement)
+            ),
+            "adapter __main__ guard must execute main()",
+        )
+        for forbidden in (
+            "expected-uid",
+            "expected_uid",
+            "test-mode",
+            "test_mode",
+            "allow-same-principal",
+            "HOST_STORE_PATH",
+        ):
+            self.assertNotIn(forbidden, adapter_source)
+
+        adapter_module = importlib.import_module(
+            "scripts.implementation_evidence.host_envelope_adapter"
+        )
+        self.assertIs(
+            getattr(adapter_module, "core", None),
+            importlib.import_module("scripts.evidence_core"),
+            "adapter must call the shared evidence_core module",
+        )
+        help_result = subprocess.run(
+            [sys.executable, str(adapter), "--help"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=5,
+        )
+        self.assertEqual(help_result.returncode, 0)
+        self.assertNotIn(b"Traceback", help_result.stderr)
+        for token in (b"capture-context", b"capture-invocation", b"capture-response"):
+            self.assertIn(token, help_result.stdout)
+        for operation in ("capture-context", "capture-invocation", "capture-response"):
+            with self.subTest(help_operation=operation):
+                operation_help = subprocess.run(
+                    [sys.executable, str(adapter), operation, "--help"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                    timeout=5,
+                )
+                self.assertEqual(operation_help.returncode, 0)
+                self.assertNotIn(b"Traceback", operation_help.stderr)
+                self.assertIn(b"--host-store-fd", operation_help.stdout)
+                if operation == "capture-context":
+                    self.assertNotIn(b"--context-handle", operation_help.stdout)
+                else:
+                    self.assertIn(b"--context-handle", operation_help.stdout)
+
+        context_handle = "a" * 64
+        operation_results = {
+            "capture-context": {
+                "schema": "tersh-host-capture-context-result-v1",
+                "context_handle": "1" * 64,
+            },
+            "capture-invocation": {
+                "schema": "tersh-host-capture-invocation-result-v1",
+                "context_handle": "2" * 64,
+                "invocation_handle": "3" * 64,
+            },
+            "capture-response": {
+                "schema": "tersh-host-capture-response-result-v1",
+                "context_handle": "4" * 64,
+                "response_handle": "5" * 64,
+            },
+        }
+        for operation, fake_result in operation_results.items():
+            with self.subTest(adapter_operation=operation):
+                fake_socket = mock.MagicMock(name=f"{operation}-authenticated-socket")
+                fake_socket.__enter__.return_value = fake_socket
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                argv = [operation, "--host-store-fd", "9"]
+                expected_context_handle = None
+                if operation != "capture-context":
+                    argv.extend(("--context-handle", context_handle))
+                    expected_context_handle = context_handle
+                with (
+                    mock.patch.object(
+                        adapter_module.core,
+                        "open_authenticated_host_store_socket",
+                        return_value=fake_socket,
+                    ) as authenticated_open,
+                    mock.patch.object(
+                        adapter_module.core,
+                        "capture_host_envelope_on_authenticated_socket",
+                        return_value=fake_result,
+                    ) as capture,
+                    mock.patch("sys.stdout", stdout),
+                    mock.patch("sys.stderr", stderr),
+                ):
+                    status = adapter_module.main(argv)
+                self.assertEqual(status, 0)
+                authenticated_open.assert_called_once_with(9)
+                capture.assert_called_once()
+                capture_args = capture.call_args.args
+                capture_kwargs = capture.call_args.kwargs
+                self.assertLessEqual(
+                    len(capture_args),
+                    3,
+                    "adapter passed undeclared positional capture overrides",
+                )
+                self.assertLessEqual(
+                    set(capture_kwargs),
+                    {"sock", "operation", "context_handle", "deadline"},
+                    "adapter passed undeclared keyword capture overrides",
+                )
+                for index, name in enumerate(("sock", "operation", "context_handle")):
+                    if len(capture_args) > index:
+                        self.assertNotIn(
+                            name,
+                            capture_kwargs,
+                            f"adapter passed duplicate capture parameter {name}",
+                        )
+                actual_socket = (
+                    capture_args[0] if len(capture_args) > 0 else capture_kwargs.get("sock")
+                )
+                actual_operation = (
+                    capture_args[1]
+                    if len(capture_args) > 1
+                    else capture_kwargs.get("operation")
+                )
+                actual_context_handle = (
+                    capture_args[2]
+                    if len(capture_args) > 2
+                    else capture_kwargs.get("context_handle")
+                )
+                self.assertIs(actual_socket, fake_socket)
+                self.assertEqual(actual_operation, operation)
+                self.assertEqual(actual_context_handle, expected_context_handle)
+                self.assertTrue(
+                    fake_socket.close.called or fake_socket.__exit__.called,
+                    "adapter must release its authenticated socket",
+                )
+                self.assertEqual(
+                    stdout.getvalue().encode("utf-8"),
+                    fixture_canonical_json(fake_result),
+                )
+                self.assertEqual(stderr.getvalue(), "")
+
+        invalid_argvs = (
+            ("capture-context",),
+            ("capture-context", "--host-store-fd"),
+            (
+                "capture-invocation",
+                "--host-store-fd",
+                "9",
+                "--context-handle",
+                "not-a-handle",
+            ),
+            ("capture-context", "--host-store-fd", "9", "--body", "{}"),
+            (
+                "capture-context",
+                "--host-store-fd",
+                "9",
+                "--transaction-nonce",
+                "b" * 64,
+            ),
+            ("capture-context", "--host-store-fd", "9", "--model", "other"),
+            ("capture-context", "--host-store-fd", "9", "--identity", "caller"),
+            (
+                "capture-context",
+                "--host-store-fd",
+                "9",
+                "--host-store-fd",
+                "10",
+            ),
+            (
+                "capture-invocation",
+                "--host-store-fd",
+                "9",
+                "--context-handle",
+                context_handle,
+                "--context-handle",
+                "b" * 64,
+            ),
+            (
+                "capture-context",
+                "--host-store-fd",
+                "9",
+                "--context-handle",
+                context_handle,
+            ),
+            ("capture-invocation", "--host-store-fd", "9"),
+            ("capture-response", "--host-store-fd", "9"),
+        )
+        for invalid_argv in invalid_argvs:
+            with self.subTest(invalid_argv=invalid_argv):
+                invalid_stdout = io.StringIO()
+                invalid_stderr = io.StringIO()
+                with (
+                    mock.patch.object(
+                        adapter_module.core,
+                        "open_authenticated_host_store_socket",
+                    ) as authenticated_open,
+                    mock.patch.object(
+                        adapter_module.core,
+                        "capture_host_envelope_on_authenticated_socket",
+                    ) as capture,
+                    mock.patch("sys.stdout", invalid_stdout),
+                    mock.patch("sys.stderr", invalid_stderr),
+                ):
+                    invalid_status = adapter_module.main(list(invalid_argv))
+                self.assertNotEqual(invalid_status, 0)
+                authenticated_open.assert_not_called()
+                capture.assert_not_called()
+                self.assertEqual(invalid_stdout.getvalue(), "")
+                self.assertGreater(len(invalid_stderr.getvalue()), 0)
+                self.assertLessEqual(len(invalid_stderr.getvalue()), 8192)
+                self.assertNotIn("Traceback", invalid_stderr.getvalue())
 
         def run_with_fd(fd):
             return subprocess.run(
@@ -1134,6 +1787,380 @@ class ImplementationEvidenceTests(unittest.TestCase):
             callable(capture),
             "new request/commit-first capture transaction seam is required",
         )
+
+    def test_host_transaction_rejects_frame_order_end_trailing_nonce_digest_and_reply_before_commit(self):
+        core = importlib.import_module("scripts.evidence_core")
+        pre_error = core.EvidenceError
+        post_error = core.EvidenceError
+        recv_frame = getattr(core, "recv_host_frame", None)
+        self.assertTrue(callable(recv_frame), "bounded host frame reader is required")
+
+        malformed_frames = (
+            struct.pack(">I", 0),
+            struct.pack(">I", 65537),
+            b"\x00\x00",
+            struct.pack(">I", 8) + b"{}\n",
+            struct.pack(">I", 14) + b'{"a":1,"a":2}\n',
+            struct.pack(">I", 4) + b"\xff\xff\xff\n",
+            struct.pack(">I", 14) + b'{"b":1,"a":2}\n',
+            struct.pack(">I", 10) + b'{"a":NaN}\n',
+        )
+        for index, raw in enumerate(malformed_frames):
+            with self.subTest(raw_frame=index):
+                sender, receiver = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+                try:
+                    sender.sendall(raw)
+                    sender.shutdown(socket.SHUT_WR)
+                    with self.assertRaises(core.EvidenceError):
+                        recv_frame(receiver, time.monotonic() + 0.5)
+                finally:
+                    sender.close()
+                    receiver.close()
+
+        success_store = ScriptedCaptureStore()
+        result, error, transcript_a = self.run_scripted_capture(success_store, "capture-context")
+        self.assertIsNone(error)
+        self.assertEqual(set(result), {"schema", "context_handle"})
+        self.assertEqual(result["schema"], "tersh-host-capture-context-result-v1")
+        self.assertIn(result["context_handle"], success_store.contexts)
+        second_store = ScriptedCaptureStore()
+        second_result, second_error, transcript_b = self.run_scripted_capture(
+            second_store,
+            "capture-context",
+        )
+        self.assertIsNone(second_error)
+        self.assertIn(second_result["context_handle"], second_store.contexts)
+        self.assertNotEqual(
+            transcript_a[0][1]["transaction_nonce"],
+            transcript_b[0][1]["transaction_nonce"],
+            "transaction nonces must be fresh per connection",
+        )
+
+        for scenario in (
+            "wrong-body-nonce",
+            "wrong-body-digest",
+            "bool-body-ordinal",
+            "wrong-body-schema",
+            "wrong-body-operation",
+            "wrong-body-kind",
+            "wrong-body-total",
+            "bool-body-total",
+            "extra-body-key",
+            "body-end-before-body",
+            "missing-body-end",
+            "wrong-body-end-nonce",
+            "wrong-body-end-schema",
+            "wrong-body-end-operation",
+            "wrong-body-end-total",
+            "bool-body-end-total",
+            "wrong-body-end-digests",
+            "extra-body-end-key",
+            "reply-before-commit",
+        ):
+            with self.subTest(precommit=scenario):
+                store = ScriptedCaptureStore()
+                before = copy.deepcopy(store.contexts)
+                result, error, _ = self.run_scripted_capture(
+                    store,
+                    "capture-context",
+                    scenario=scenario,
+                )
+                self.assertIsNone(result)
+                self.assertIsInstance(error, pre_error)
+                self.assertEqual(store.contexts, before)
+
+        for scenario in ("duplicate-body", "reordered-bodies", "extra-body"):
+            with self.subTest(multi_body_precommit=scenario):
+                store = ScriptedCaptureStore()
+                context, error, _ = self.run_scripted_capture(store, "capture-context")
+                self.assertIsNone(error)
+                h0 = context["context_handle"]
+                before = (copy.deepcopy(store.contexts), set(store.invocations))
+                result, error, _ = self.run_scripted_capture(
+                    store,
+                    "capture-invocation",
+                    h0,
+                    scenario=scenario,
+                )
+                self.assertIsNone(result)
+                self.assertIsInstance(error, pre_error)
+                self.assertEqual((store.contexts, store.invocations), before)
+
+        for scenario in (
+            "wrong-reply-nonce",
+            "wrong-reply-digest",
+            "wrong-reply-schema",
+            "wrong-reply-operation",
+            "extra-reply-key",
+            "missing-reply-end",
+            "duplicate-body-end",
+            "duplicate-reply-end",
+            "wrong-reply-end-nonce",
+            "wrong-reply-end-schema",
+            "wrong-reply-end-operation",
+            "wrong-reply-end-digest",
+            "extra-reply-end-key",
+            "trailing",
+            "late-eof",
+        ):
+            with self.subTest(postcommit=scenario):
+                store = ScriptedCaptureStore()
+                result, error, _ = self.run_scripted_capture(
+                    store,
+                    "capture-context",
+                    scenario=scenario,
+                )
+                self.assertIsNone(result)
+                self.assertIsInstance(error, post_error)
+                self.assertEqual(len(store.contexts), 1, "post-COMMIT successor was not atomic")
+
+        for operation in ("capture-context", "capture-invocation", "capture-response"):
+            scenarios = [
+                "wrong-result-schema",
+                "extra-result-key",
+                "bad-result-context-handle",
+            ]
+            if operation != "capture-context":
+                scenarios.append("bad-result-member-handle")
+            for scenario in scenarios:
+                with self.subTest(result_operation=operation, result_attack=scenario):
+                    store = ScriptedCaptureStore()
+                    context_handle = None
+                    if operation != "capture-context":
+                        context_result, context_error, _ = self.run_scripted_capture(
+                            store,
+                            "capture-context",
+                        )
+                        self.assertIsNone(context_error)
+                        context_handle = context_result["context_handle"]
+                    result, error, _ = self.run_scripted_capture(
+                        store,
+                        operation,
+                        context_handle,
+                        scenario=scenario,
+                    )
+                    self.assertIsNone(result)
+                    self.assertIsInstance(error, post_error)
+                    self.assertEqual(
+                        len(store.contexts),
+                        1,
+                        "malformed result did not preserve one atomic private successor",
+                    )
+                    if context_handle is not None:
+                        self.assertNotIn(context_handle, store.contexts)
+                    if operation == "capture-invocation":
+                        self.assertEqual(len(store.invocations), 1)
+                    if operation == "capture-response":
+                        self.assertEqual(len(store.responses), 1)
+
+    def test_context_capability_rotates_and_rejects_replay_cross_generation_or_partial_consume(self):
+        core = importlib.import_module("scripts.evidence_core")
+        pre_error = core.EvidenceError
+        post_error = core.EvidenceError
+        store = ScriptedCaptureStore()
+
+        context_result, error, _ = self.run_scripted_capture(store, "capture-context")
+        self.assertIsNone(error)
+        h0 = context_result["context_handle"]
+        invocation_result, error, _ = self.run_scripted_capture(
+            store,
+            "capture-invocation",
+            h0,
+        )
+        self.assertIsNone(error)
+        self.assertEqual(
+            set(invocation_result),
+            {"schema", "context_handle", "invocation_handle"},
+        )
+        self.assertEqual(
+            invocation_result["schema"],
+            "tersh-host-capture-invocation-result-v1",
+        )
+        h1 = invocation_result["context_handle"]
+        hi = invocation_result["invocation_handle"]
+        self.assertNotIn(h0, store.contexts)
+        self.assertIn(h1, store.contexts)
+        self.assertIn(hi, store.invocations)
+
+        for operation in ("capture-invocation", "capture-response"):
+            with self.subTest(replayed_operation=operation):
+                before = (copy.deepcopy(store.contexts), set(store.invocations), set(store.responses))
+                result, replay_error, _ = self.run_scripted_capture(store, operation, h0)
+                self.assertIsNone(result)
+                self.assertIsInstance(replay_error, pre_error)
+                self.assertEqual(
+                    (store.contexts, store.invocations, store.responses),
+                    before,
+                    "replay or cross-generation failure partially consumed state",
+                )
+
+        response_result, error, _ = self.run_scripted_capture(
+            store,
+            "capture-response",
+            h1,
+        )
+        self.assertIsNone(error)
+        h2 = response_result["context_handle"]
+        hr = response_result["response_handle"]
+        self.assertEqual(
+            response_result["schema"],
+            "tersh-host-capture-response-result-v1",
+        )
+        self.assertNotIn(h1, store.contexts)
+        self.assertIn(h2, store.contexts)
+        self.assertIn(hr, store.responses)
+
+        before_precommit = (copy.deepcopy(store.contexts), set(store.invocations), set(store.responses))
+        result, error, _ = self.run_scripted_capture(
+            store,
+            "capture-response",
+            h2,
+            scenario="wrong-body-digest",
+        )
+        self.assertIsNone(result)
+        self.assertIsInstance(error, pre_error)
+        self.assertEqual((store.contexts, store.invocations, store.responses), before_precommit)
+
+        orphan_context, error, _ = self.run_scripted_capture(store, "capture-context")
+        self.assertIsNone(error)
+        orphan_h0 = orphan_context["context_handle"]
+        contexts_before = set(store.contexts)
+        invocation_count = len(store.invocations)
+        result, error, _ = self.run_scripted_capture(
+            store,
+            "capture-invocation",
+            orphan_h0,
+            scenario="wrong-reply-nonce",
+        )
+        self.assertIsNone(result)
+        self.assertIsInstance(error, post_error)
+        self.assertNotIn(orphan_h0, store.contexts)
+        self.assertEqual(len(store.contexts), len(contexts_before))
+        self.assertEqual(len(store.invocations), invocation_count + 1)
+
+        result, replay_error, _ = self.run_scripted_capture(
+            store,
+            "capture-invocation",
+            orphan_h0,
+        )
+        self.assertIsNone(result)
+        self.assertIsInstance(replay_error, pre_error)
+
+    def test_context_invocation_response_envelope_schemas_are_closed_typed_and_nonce_bound(self):
+        core = importlib.import_module("scripts.evidence_core")
+        pre_error = core.EvidenceError
+        store = ScriptedCaptureStore()
+        context_result, error, _ = self.run_scripted_capture(store, "capture-context")
+        self.assertIsNone(error)
+        h0 = context_result["context_handle"]
+
+        def extra_context_key(bodies):
+            bodies[0][1]["caller_override"] = True
+            return bodies
+
+        def wrong_context_schema(bodies):
+            bodies[0][1]["schema"] = "tersh-host-dispatch-context-v0"
+            return bodies
+
+        def wrong_context_type(bodies):
+            bodies[0][1]["evidence_attempt"] = True
+            return bodies
+
+        def invocation_nonce_mismatch(bodies):
+            bodies[1][1]["context_nonce"] = "e" * 64
+            return bodies
+
+        def wrong_invocation_schema(bodies):
+            bodies[1][1]["schema"] = "tersh-host-spawn-invocation-v0"
+            return bodies
+
+        def wrong_invocation_type(bodies):
+            bodies[1][1]["dispatched_at"] = True
+            return bodies
+
+        def wrong_selected_model(bodies):
+            bodies[1][1]["selected_model"] = "untrusted-model"
+            return bodies
+
+        def extra_invocation_key(bodies):
+            bodies[1][1]["caller_override"] = True
+            return bodies
+
+        def response_task_mismatch(bodies):
+            bodies[1][1]["canonical_task_path"] = "/root/other/reviewer"
+            return bodies
+
+        def response_nonce_mismatch(bodies):
+            bodies[1][1]["context_nonce"] = "e" * 64
+            return bodies
+
+        def wrong_response_schema(bodies):
+            bodies[1][1]["schema"] = "tersh-host-spawn-response-v0"
+            return bodies
+
+        def wrong_response_type(bodies):
+            bodies[1][1]["terminal_status"] = True
+            return bodies
+
+        def response_time_reversed(bodies):
+            bodies[1][1]["ended_at"] = "2026-08-09T23:59:59.000000001Z"
+            return bodies
+
+        def extra_response_key(bodies):
+            bodies[1][1]["caller_override"] = True
+            return bodies
+
+        for operation, mutator in (
+            ("capture-invocation", extra_context_key),
+            ("capture-invocation", wrong_context_schema),
+            ("capture-invocation", wrong_context_type),
+            ("capture-invocation", invocation_nonce_mismatch),
+            ("capture-invocation", wrong_invocation_schema),
+            ("capture-invocation", wrong_invocation_type),
+            ("capture-invocation", wrong_selected_model),
+            ("capture-invocation", extra_invocation_key),
+            ("capture-response", response_task_mismatch),
+            ("capture-response", response_nonce_mismatch),
+            ("capture-response", wrong_response_schema),
+            ("capture-response", wrong_response_type),
+            ("capture-response", response_time_reversed),
+            ("capture-response", extra_response_key),
+        ):
+            with self.subTest(operation=operation, mutator=mutator.__name__):
+                before = copy.deepcopy(store.contexts)
+                result, validation_error, _ = self.run_scripted_capture(
+                    store,
+                    operation,
+                    h0,
+                    body_mutator=mutator,
+                )
+                self.assertIsNone(result)
+                self.assertIsInstance(validation_error, pre_error)
+                self.assertEqual(store.contexts, before)
+
+        invocation_result, error, _ = self.run_scripted_capture(
+            store,
+            "capture-invocation",
+            h0,
+        )
+        self.assertIsNone(error)
+        h1 = invocation_result["context_handle"]
+        response_result, error, _ = self.run_scripted_capture(
+            store,
+            "capture-response",
+            h1,
+        )
+        self.assertIsNone(error)
+        self.assertEqual(
+            set(response_result),
+            {"schema", "context_handle", "response_handle"},
+        )
+        self.assertEqual(
+            response_result["schema"],
+            "tersh-host-capture-response-result-v1",
+        )
+        self.assertIn(response_result["context_handle"], store.contexts)
+        self.assertIn(response_result["response_handle"], store.responses)
 
 
 if __name__ == "__main__":
