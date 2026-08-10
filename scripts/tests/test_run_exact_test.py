@@ -80,6 +80,10 @@ elif mode == "ignored-result":
 elif mode == "malformed-summary":
     print(f"test {name} ... ok")
     print("finished without a libtest summary")
+elif mode == "duration-summary":
+    duration = os.environ.get("FAKE_CARGO_DURATION", "0.00s")
+    print(f"test {name} ... ok")
+    print(f"test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in {duration}")
 elif mode == "wrong-executed-name":
     print(f"test {name}-near ... ok")
     print("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s")
@@ -125,7 +129,7 @@ class ExactRunnerTests(unittest.TestCase):
         self.log = self.root / "argv.jsonl"
 
     def run_runner(
-        self, *extra, mode="ok", name="suite::works", case_payloads=None,
+        self, *extra, mode="ok", name="suite::works", duration="0.00s", case_payloads=None,
         list_case_payloads=None, stderr_case_payloads=None,
         list_stderr_case_payloads=None, list_stderr_lines=None,
         execute_stderr_lines=None, append_cargo_bin=True,
@@ -135,6 +139,7 @@ class ExactRunnerTests(unittest.TestCase):
             FAKE_CARGO_LOG=str(self.log),
             FAKE_CARGO_MODE=mode,
             FAKE_CARGO_NAME=name,
+            FAKE_CARGO_DURATION=duration,
             FAKE_CARGO_CASE_PAYLOADS=json.dumps(case_payloads or []),
             FAKE_CARGO_LIST_CASE_PAYLOADS=json.dumps(list_case_payloads or []),
             FAKE_CARGO_STDERR_CASE_PAYLOADS=json.dumps(stderr_case_payloads or []),
@@ -229,6 +234,13 @@ class ExactRunnerTests(unittest.TestCase):
         )
         self.success_record(with_stderr)
 
+        self.log.unlink(missing_ok=True)
+        integer_duration = self.run_runner(
+            "--test", "fixture", "--name", "suite::works",
+            mode="duration-summary", duration="0s",
+        )
+        self.success_record(integer_duration)
+
     def test_exact_runner_rejects_missing_duplicate_ignored_or_zero_without_explicit_flags(self):
         cases = (
             ("missing", "discovery-count", 1),
@@ -248,6 +260,15 @@ class ExactRunnerTests(unittest.TestCase):
                 self.log.unlink(missing_ok=True)
                 result = self.run_runner("--test", "fixture", "--name", "suite::works", mode=mode)
                 self.assert_rejected(result, code, calls)
+
+        for duration in ("bananas", "", "1ms", "-0.01s", "1e-3s"):
+            with self.subTest(duration=duration):
+                self.log.unlink(missing_ok=True)
+                result = self.run_runner(
+                    "--test", "fixture", "--name", "suite::works",
+                    mode="duration-summary", duration=duration,
+                )
+                self.assert_rejected(result, "execution-summary", 2)
 
     def test_exact_runner_passes_argv_without_a_shell_and_serializes_when_requested(self):
         result = self.run_runner(

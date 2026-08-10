@@ -28,7 +28,7 @@ SUMMARY_RE = re.compile(
     r"(?P<ignored>[0-9]+) ignored; "
     r"(?P<measured>[0-9]+) measured; "
     r"(?P<filtered>[0-9]+) filtered out; "
-    r"finished in .+$"
+    r"finished in [0-9]+(?:\.[0-9]+)?s$"
 )
 TERMINAL_RE = re.compile(r"^test .+ \.\.\. (?:ok|FAILED|ignored)$")
 
