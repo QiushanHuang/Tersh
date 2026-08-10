@@ -1719,6 +1719,37 @@ class ImplementationEvidenceTests(unittest.TestCase):
                 )
                 self.assertEqual(stderr.getvalue(), "")
 
+        failed_socket = mock.MagicMock(name="failed-capture-authenticated-socket")
+        failed_stdout = io.StringIO()
+        failed_stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                adapter_module.core,
+                "open_authenticated_host_store_socket",
+                return_value=failed_socket,
+            ) as failed_open,
+            mock.patch.object(
+                adapter_module.core,
+                "capture_host_envelope_on_authenticated_socket",
+                side_effect=adapter_module.core.EvidenceError(
+                    "simulated capture failure"
+                ),
+            ) as failed_capture,
+            mock.patch("sys.stdout", failed_stdout),
+            mock.patch("sys.stderr", failed_stderr),
+        ):
+            failed_status = adapter_module.main(
+                ["capture-context", "--host-store-fd", "9"]
+            )
+        self.assertNotEqual(failed_status, 0)
+        failed_open.assert_called_once_with(9)
+        failed_capture.assert_called_once()
+        self.assertEqual(failed_socket.close.call_count, 1)
+        self.assertEqual(failed_stdout.getvalue(), "")
+        self.assertGreater(len(failed_stderr.getvalue()), 0)
+        self.assertLessEqual(len(failed_stderr.getvalue().encode("utf-8")), 8192)
+        self.assertNotIn("Traceback", failed_stderr.getvalue())
+
         oversized_fd = "9" * 1000
         invalid_argvs = (
             ("capture-context",),
@@ -1812,6 +1843,25 @@ class ImplementationEvidenceTests(unittest.TestCase):
         self.assertGreater(len(oversized_fd_cli.stderr), 0)
         self.assertLessEqual(len(oversized_fd_cli.stderr), 8192)
         self.assertNotIn(b"Traceback", oversized_fd_cli.stderr)
+
+        multibyte_unknown_cli = subprocess.run(
+            [
+                *isolated_adapter_argv,
+                "capture-context",
+                "--host-store-fd",
+                "9",
+                "--" + "😀" * 5000,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=5,
+        )
+        self.assertNotEqual(multibyte_unknown_cli.returncode, 0)
+        self.assertEqual(multibyte_unknown_cli.stdout, b"")
+        self.assertGreater(len(multibyte_unknown_cli.stderr), 0)
+        self.assertLessEqual(len(multibyte_unknown_cli.stderr), 8192)
+        self.assertNotIn(b"Traceback", multibyte_unknown_cli.stderr)
 
         def run_with_fd(fd):
             return subprocess.run(
