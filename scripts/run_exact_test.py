@@ -88,8 +88,8 @@ def run_child(argv: Sequence[str], phase: str) -> str:
 
 def parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = ContractArgumentParser(prog="run_exact_test.py")
-    parser.add_argument("--test", dest="integration_target")
-    parser.add_argument("--lib", action="store_true")
+    parser.add_argument("--test", dest="integration_targets", action="append", default=[])
+    parser.add_argument("--lib", dest="lib_count", action="count", default=0)
     parser.add_argument("--name", required=True)
     parser.add_argument("--ignored", action="store_true")
     parser.add_argument("--serial", action="store_true")
@@ -98,9 +98,13 @@ def parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--cargo-bin", default="cargo")
     arguments = parser.parse_args(argv)
 
-    selector_count = int(arguments.integration_target is not None) + int(arguments.lib)
+    selector_count = len(arguments.integration_targets) + arguments.lib_count
     if selector_count != 1:
         raise Rejection("selector", "supply exactly one of --test TARGET or --lib")
+    arguments.integration_target = (
+        arguments.integration_targets[0] if arguments.integration_targets else None
+    )
+    arguments.lib = arguments.lib_count == 1
     if arguments.integration_target == "":
         raise Rejection("selector", "--test TARGET must not be empty")
     if arguments.name == "":
@@ -226,6 +230,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         arguments = parse_arguments(argv)
         selector, list_argv, execute_argv = selector_and_commands(arguments)
         list_output = run_child(list_argv, "list")
+        if any(line.startswith(CASE_PREFIX) for line in list_output.splitlines()):
+            raise Rejection(
+                "unexpected-list-case-record",
+                "case records are forbidden during test discovery",
+            )
         require_exact_discovery(list_output, arguments.name)
         execute_output = run_child(execute_argv, "execute")
         require_exact_execution(execute_output, arguments.name)

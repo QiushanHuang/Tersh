@@ -42,6 +42,8 @@ if is_list:
         names = [name + "-near"]
     else:
         names = [name]
+    for payload in json.loads(os.environ.get("FAKE_CARGO_LIST_CASE_PAYLOADS", "[]")):
+        print("tersh-case-count-v1 " + payload)
     for listed_name in names:
         print(f"{listed_name}: test")
     print(f"{len(names)} tests, 0 benchmarks")
@@ -96,13 +98,17 @@ class ExactRunnerTests(unittest.TestCase):
         self.cargo.chmod(self.cargo.stat().st_mode | stat.S_IXUSR)
         self.log = self.root / "argv.jsonl"
 
-    def run_runner(self, *extra, mode="ok", name="suite::works", case_payloads=None):
+    def run_runner(
+        self, *extra, mode="ok", name="suite::works", case_payloads=None,
+        list_case_payloads=None,
+    ):
         env = os.environ.copy()
         env.update(
             FAKE_CARGO_LOG=str(self.log),
             FAKE_CARGO_MODE=mode,
             FAKE_CARGO_NAME=name,
             FAKE_CARGO_CASE_PAYLOADS=json.dumps(case_payloads or []),
+            FAKE_CARGO_LIST_CASE_PAYLOADS=json.dumps(list_case_payloads or []),
             PYTHONDONTWRITEBYTECODE="1",
         )
         return subprocess.run(
@@ -229,10 +235,17 @@ class ExactRunnerTests(unittest.TestCase):
         )
 
     def test_exact_runner_rejects_both_or_neither_test_and_lib_selector(self):
-        neither = self.run_runner("--name", "suite::works")
-        self.assert_rejected(neither, "selector", 0)
-        both = self.run_runner("--test", "fixture", "--lib", "--name", "suite::works")
-        self.assert_rejected(both, "selector", 0)
+        invalid_selectors = (
+            ("--name", "suite::works"),
+            ("--test", "fixture", "--lib", "--name", "suite::works"),
+            ("--test", "fixture-a", "--test", "fixture-b", "--name", "suite::works"),
+            ("--lib", "--lib", "--name", "suite::works"),
+        )
+        for argv in invalid_selectors:
+            with self.subTest(argv=argv):
+                self.log.unlink(missing_ok=True)
+                result = self.run_runner(*argv)
+                self.assert_rejected(result, "selector", 0)
 
     def test_exact_runner_lib_rejects_zero_discovered_or_zero_executed(self):
         cases = (
@@ -308,6 +321,15 @@ class ExactRunnerTests(unittest.TestCase):
                     args += ["--case-matrix", "frozen-v1", "--expect-case", "alpha"]
                 result = self.run_runner(*args, case_payloads=payloads)
                 self.assert_rejected(result, code, 2)
+
+        for declare_matrix in (False, True):
+            with self.subTest(list_marker=True, declare_matrix=declare_matrix):
+                self.log.unlink(missing_ok=True)
+                args = ["--test", "fixture", "--name", "suite::works"]
+                if declare_matrix:
+                    args += ["--case-matrix", "frozen-v1", "--expect-case", "alpha"]
+                result = self.run_runner(*args, list_case_payloads=[valid])
+                self.assert_rejected(result, "unexpected-list-case-record", 1)
 
     def test_exact_runner_rejects_missing_duplicate_extra_or_reordered_case_ids(self):
         expected = ["alpha", "beta"]
