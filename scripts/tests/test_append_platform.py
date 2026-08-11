@@ -2,6 +2,7 @@ import ast
 import copy
 import contextlib
 import hashlib
+import io
 import importlib
 import inspect
 import json
@@ -5753,6 +5754,195 @@ class AppendPlatformProjectionTests(unittest.TestCase):
             after = model.snapshot()
             self.assertEqual(after["receipts"], before["receipts"])
             self.assertEqual(after["authorities"], before["authorities"])
+
+
+class RecordOrchestrationCliTests(unittest.TestCase):
+    CLI_PATH = ROOT / "scripts/implementation_evidence/record_orchestration.py"
+
+    def load_cli(self):
+        self.assertTrue(self.CLI_PATH.is_file(), "record_orchestration.py is required")
+        spec = importlib.util.spec_from_file_location(
+            "task13_record_orchestration",
+            self.CLI_PATH,
+        )
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def run_main(self, module, argv):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            status = module.main(argv)
+        return status, stdout.getvalue(), stderr.getvalue()
+
+    def test_root_internal_recovery_abandon_failure_and_barrier_have_no_nonroot_cli_or_wire_arm(self):
+        module = self.load_cli()
+        for operation in (
+            "recover-dispatch-lineage",
+            "abandon-dispatch-lineage",
+            "fail-responded-dispatch",
+            "fail-agent-report-authority",
+            "close-failed-attempt",
+            "close-superseded-attempt",
+            "repair-projections",
+        ):
+            with self.subTest(operation=operation):
+                status, stdout, _ = self.run_main(module, [operation])
+                self.assertEqual(status, 2)
+                self.assertEqual(stdout, "")
+
+    def test_record_orchestration_append_platform_accepts_only_three_handles_and_host_fd(self):
+        module = self.load_cli()
+        authenticated = mock.Mock()
+        result = {"schema": "tersh-host-record-result-v1", "receipt": {"id": "ok"}}
+        with (
+            mock.patch.object(
+                module.core,
+                "open_authenticated_host_store_socket",
+                return_value=authenticated,
+            ) as open_socket,
+            mock.patch.object(
+                module.core,
+                "append_platform_on_authenticated_socket",
+                return_value=result,
+            ) as append,
+        ):
+            status, stdout, stderr = self.run_main(
+                module,
+                [
+                    "append-platform",
+                    "--context-handle",
+                    "a" * 64,
+                    "--invocation-handle",
+                    "b" * 64,
+                    "--response-handle",
+                    "c" * 64,
+                    "--host-store-fd",
+                    "3",
+                ],
+            )
+        self.assertEqual(status, 0)
+        self.assertEqual(stderr, "")
+        self.assertEqual(stdout.encode(), module.core.canonical_json_bytes(result))
+        open_socket.assert_called_once_with(3)
+        append.assert_called_once_with(authenticated, "a" * 64, "b" * 64, "c" * 64)
+        authenticated.close.assert_called_once_with()
+
+    def test_record_orchestration_never_invokes_git_subprocess_or_reads_authority_env(self):
+        source = self.CLI_PATH.read_text(encoding="utf-8") if self.CLI_PATH.exists() else ""
+        self.assertTrue(source, "record_orchestration.py is required")
+        for forbidden in (
+            "import subprocess",
+            "from subprocess",
+            "git ",
+            "os.environ",
+            "getenv(",
+            "TERSH_",
+        ):
+            self.assertNotIn(forbidden, source)
+
+    def test_record_orchestration_never_opens_or_writes_a_projection_path(self):
+        source = self.CLI_PATH.read_text(encoding="utf-8") if self.CLI_PATH.exists() else ""
+        for forbidden in ("open(", "Path.write_", "os.link", "projection_root"):
+            self.assertNotIn(forbidden, source)
+
+    def test_record_orchestration_isolated_runtime_and_exact_harness_imports(self):
+        module = self.load_cli()
+        source = self.CLI_PATH.read_text(encoding="utf-8")
+        self.assertEqual(module.HARNESS_ROOT, self.CLI_PATH.resolve().parents[2])
+        self.assertEqual(
+            module.CORE_PATH,
+            module.HARNESS_ROOT / "scripts/evidence_core.py",
+        )
+        self.assertIn("sys.flags.isolated == 1", source)
+        self.assertIn("sys.flags.no_site == 1", source)
+        self.assertIn("sys.flags.dont_write_bytecode == 1", source)
+
+    def test_every_rejection_has_empty_stdout_bounded_redacted_stderr(self):
+        module = self.load_cli()
+        invalid_argv = (
+            [],
+            ["append-platform"],
+            ["append-platform", "--host-store-fd", "2"],
+            ["append-platform", "--host-store-fd", "3", "--candidate", "a" * 40],
+        )
+        for argv in invalid_argv:
+            with self.subTest(argv=argv):
+                status, stdout, stderr = self.run_main(module, argv)
+                self.assertEqual(status, 2)
+                self.assertEqual(stdout, "")
+                self.assertLessEqual(len(stderr.encode("utf-8")), module.DIAGNOSTIC_LIMIT + 64)
+
+    def test_diagnostics_never_contain_handle_body_session_authority_path_or_environment_canaries(self):
+        module = self.load_cli()
+        canary = "PRIVATE-AUTHORITY-CANARY"
+        status, stdout, stderr = self.run_main(
+            module,
+            [
+                "append-platform",
+                "--context-handle",
+                canary,
+                "--invocation-handle",
+                "b" * 64,
+                "--response-handle",
+                "c" * 64,
+                "--host-store-fd",
+                "3",
+            ],
+        )
+        self.assertEqual(status, 2)
+        self.assertEqual(stdout, "")
+        self.assertNotIn(canary, stderr)
+
+    def test_frame_and_record_limits_fail_before_allocation_or_state_lookup(self):
+        module = self.load_cli()
+        with mock.patch.object(
+            module.core,
+            "open_authenticated_host_store_socket",
+        ) as open_socket:
+            status, stdout, _ = self.run_main(
+                module,
+                [
+                    "append-platform",
+                    "--context-handle",
+                    "a" * 100000,
+                    "--invocation-handle",
+                    "b" * 64,
+                    "--response-handle",
+                    "c" * 64,
+                    "--host-store-fd",
+                    "99999999999",
+                ],
+            )
+        self.assertEqual(status, 2)
+        self.assertEqual(stdout, "")
+        open_socket.assert_not_called()
+
+    def test_invalid_utf8_duplicate_json_trailing_frames_and_slow_drip_are_bounded(self):
+        module = self.load_cli()
+        duplicate = [
+            "append-platform",
+            "--context-handle",
+            "a" * 64,
+            "--context-handle",
+            "a" * 64,
+            "--invocation-handle",
+            "b" * 64,
+            "--response-handle",
+            "c" * 64,
+            "--host-store-fd",
+            "3",
+        ]
+        status, stdout, stderr = self.run_main(module, duplicate)
+        self.assertEqual(status, 2)
+        self.assertEqual(stdout, "")
+        self.assertIn("only once", stderr)
+        source = self.CLI_PATH.read_text(encoding="utf-8")
+        self.assertNotIn("sys.stdin", source)
+        self.assertNotIn("json.loads", source)
 
 
 if __name__ == "__main__":
