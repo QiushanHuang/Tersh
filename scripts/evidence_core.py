@@ -60,6 +60,7 @@ PROCESS_TERM_GRACE_SECONDS = 1.0
 PROCESS_KILL_GRACE_SECONDS = 1.0
 READER_CLEANUP_SECONDS = 1.0
 MAX_PARENT_FINDING_IDS = 128
+ORCHESTRATION_RECORD_MAX_BYTES = 61440
 _ORCHESTRATION_RECORDER_SESSION_KEYS = {
     "schema", "producer_session_id", "attempt_binding_id",
     "predecessor_attempt_binding_id", "entrypoint", "producer_mode",
@@ -72,6 +73,45 @@ _ORCHESTRATION_RECORDER_SESSION_KEYS = {
     "destination", "parent_finding_ids_sha256",
     "next_receipt_sequence", "previous_receipt_id",
 }
+_ORCHESTRATION_RECORD_KEYS = {
+    "schema", "evidence_id", "evidence_attempt", "run_binding", "role",
+    "wave", "review_attempt", "baseline_commit", "reviewed_commit",
+    "parent_finding_ids", "dispatch_id", "agent_id",
+    "canonical_task_path", "agent_run_id", "model", "reasoning_effort",
+    "dispatched_at", "started_at", "ended_at", "terminal_status",
+    "provenance",
+}
+_PRODUCER_RECEIPT_KEYS = {
+    "schema", "receipt_id", "attempt_binding_id", "producer_session_id",
+    "sequence", "previous_receipt_id", "producer_mode", "entrypoint",
+    "bundle_id", "runtime_profile_id", "policy_entry_id",
+    "policy_entry_sha256", "environment_capability",
+    "projection_root_class", "record_class", "record_schema", "destination",
+    "body_sha256", "byte_count", "dispatch_id", "reported_record_sha256",
+    "created_at",
+}
+_PRODUCER_RECORD_CLASSES = {
+    "attempt-marker", "candidate-marker", "gate", "cumulative-gates",
+    "runner-inventory", "before-repo-runs", "bootstrap", "selected-run",
+    "jobs", "artifact-index", "external-candidate", "orchestration",
+    "review", "implementation-entry", "requirements", "completion-audit",
+    "audit-reservation-failure", "orchestration-failure",
+    "agent-report-failure",
+}
+_ENVIRONMENT_CAPABILITY_KEYS = {
+    "schema", "capability_id", "kind", "attempt_binding_id", "root_a",
+    "root_b", "created_at", "expires_at",
+}
+_OPENED_DIRECTORY_KEYS = {
+    "schema", "path", "device", "inode", "owner_uid", "mode",
+}
+RECORD_SCHEMA_RE = re.compile(
+    r"^tersh-[a-z][a-z0-9]*(?:-[a-z0-9]+)*-v(?:[1-9][0-9]*)$"
+)
+DESTINATION_COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$")
+DESTINATION_ATTEMPT_RE = re.compile(
+    r"^attempt-(?:00[1-9]|0[1-9][0-9]|[1-9][0-9]{2})$"
+)
 
 
 class EvidenceError(Exception):
@@ -1001,6 +1041,375 @@ def validate_orchestration_recorder_session(
     )
 
     return copy.deepcopy(session)
+
+
+def _validated_platform_provenance_from_bodies(
+    context: Any,
+    invocation: Any,
+    response: Any,
+) -> dict[str, Any]:
+    validated_bodies = {
+        "context": _validate_context_body(context),
+        "invocation": _validate_invocation_body(invocation),
+        "response": _validate_response_body(response),
+    }
+    return validate_platform_envelope_provenance(
+        {
+            "mode": "platform-envelope",
+            **{
+                body_kind: {
+                    "body": body,
+                    "sha256": sha256_bytes(canonical_json_bytes(body)),
+                }
+                for body_kind, body in validated_bodies.items()
+            },
+        }
+    )
+
+
+def _validate_platform_candidate_rules(
+    context: dict[str, Any],
+    response: dict[str, Any],
+    recorder_session: dict[str, Any],
+) -> None:
+    candidate = recorder_session["candidate"]
+    baseline = context["baseline_commit"]
+    review_target = context["review_target"]
+    reported_result = response["reported_result_commit"]
+    wave = context["wave"]
+
+    if reported_result is not None and reported_result != candidate:
+        raise EvidenceError(
+            "reported result commit does not match the recorder session candidate"
+        )
+    if wave == "wave-a":
+        if not baseline == review_target == candidate:
+            raise EvidenceError(
+                "Wave A requires baseline, review target, and candidate equality"
+            )
+        return
+    if wave == "wave-b":
+        if context["role"] != "implementation":
+            raise EvidenceError("Wave B requires the implementation role")
+        if review_target != baseline:
+            raise EvidenceError("Wave B review target must equal its baseline")
+        if candidate != baseline and reported_result != candidate:
+            raise EvidenceError(
+                "changed Wave B candidate requires its reported result commit"
+            )
+        return
+    if review_target is None or review_target != candidate:
+        raise EvidenceError(
+            "outside Wave B the review target must equal the session candidate"
+        )
+
+
+def derive_platform_orchestration_record(
+    context: Any,
+    invocation: Any,
+    response: Any,
+    recorder_session: Any,
+) -> dict[str, Any]:
+    """Derive and detach the exact bounded append-platform record."""
+
+    validated_platform_provenance = _validated_platform_provenance_from_bodies(
+        context,
+        invocation,
+        response,
+    )
+    context_body = validated_platform_provenance["context"]["body"]
+    invocation_body = validated_platform_provenance["invocation"]["body"]
+    response_body = validated_platform_provenance["response"]["body"]
+    session = validate_orchestration_recorder_session(
+        recorder_session,
+        context=context_body,
+        invocation=invocation_body,
+        response=response_body,
+    )
+    _validate_platform_candidate_rules(context_body, response_body, session)
+
+    record = {
+        "schema": "tersh-evidence-orchestration-v1",
+        "evidence_id": context_body["evidence_id"],
+        "evidence_attempt": context_body["evidence_attempt"],
+        "run_binding": context_body["run_binding"],
+        "role": context_body["role"],
+        "wave": context_body["wave"],
+        "review_attempt": context_body["review_attempt"],
+        "baseline_commit": context_body["baseline_commit"],
+        "reviewed_commit": session["candidate"],
+        "parent_finding_ids": copy.deepcopy(context_body["parent_finding_ids"]),
+        "dispatch_id": invocation_body["dispatch_id"],
+        "agent_id": response_body["agent_id"],
+        "canonical_task_path": context_body["canonical_task_path"],
+        "agent_run_id": response_body["agent_run_id"],
+        "model": invocation_body["selected_model"],
+        "reasoning_effort": invocation_body["selected_reasoning_effort"],
+        "dispatched_at": invocation_body["dispatched_at"],
+        "started_at": response_body["started_at"],
+        "ended_at": response_body["ended_at"],
+        "terminal_status": response_body["terminal_status"],
+        "provenance": validated_platform_provenance,
+    }
+    record_size = len(canonical_json_bytes(record))
+    if not 1 <= record_size <= ORCHESTRATION_RECORD_MAX_BYTES:
+        raise EvidenceError("orchestration record is outside 1..61440 bytes")
+    return copy.deepcopy(record)
+
+
+def _validate_canonical_relative_destination(value: Any) -> str:
+    if type(value) is not str or not value or "\x00" in value:
+        raise EvidenceError("producer receipt destination must be an exact path")
+    if value.startswith("/") or value.endswith("/") or "\\" in value:
+        raise EvidenceError("producer receipt destination must be canonical and relative")
+    components = value.split("/")
+    if (
+        len(components) < 2
+        or DESTINATION_ATTEMPT_RE.fullmatch(components[0]) is None
+        or any(
+            component in ("", ".", "..")
+            or DESTINATION_COMPONENT_RE.fullmatch(component) is None
+            for component in components
+        )
+    ):
+        raise EvidenceError("invalid producer receipt destination")
+    return value
+
+
+def _validate_opened_directory(value: Any, field: str) -> dict[str, Any]:
+    directory = _require_closed_object(value, _OPENED_DIRECTORY_KEYS, field)
+    _require_literal(
+        directory["schema"],
+        "tersh-host-opened-directory-v1",
+        f"{field} schema",
+    )
+    if type(directory["path"]) is not str:
+        raise EvidenceError(f"{field} path must be an exact string")
+    absolute, _ = parse_output_root(directory["path"])
+    if not absolute:
+        raise EvidenceError(f"{field} path must be canonical and absolute")
+    require_exact_int(directory["device"], f"{field} device", minimum=1)
+    require_exact_int(directory["inode"], f"{field} inode", minimum=1)
+    require_exact_int(directory["owner_uid"], f"{field} owner UID", minimum=1)
+    mode = require_exact_int(directory["mode"], f"{field} mode", minimum=0)
+    if mode != 448:
+        raise EvidenceError(f"{field} mode must be decimal 448")
+    return directory
+
+
+def _validate_environment_capability(value: Any) -> dict[str, Any]:
+    capability = _require_closed_object(
+        value,
+        _ENVIRONMENT_CAPABILITY_KEYS,
+        "producer receipt environment capability",
+    )
+    _require_literal(
+        capability["schema"],
+        "tersh-host-environment-capability-v1",
+        "environment capability schema",
+    )
+    validate_sha256(capability["capability_id"], "environment capability ID")
+    _require_literal(
+        capability["kind"],
+        "distinct-writable-filesystems-v1",
+        "environment capability kind",
+    )
+    validate_sha256(
+        capability["attempt_binding_id"],
+        "environment capability attempt binding ID",
+    )
+    root_a = _validate_opened_directory(capability["root_a"], "environment root A")
+    root_b = _validate_opened_directory(capability["root_b"], "environment root B")
+    created = _parse_rfc3339_nano(
+        capability["created_at"],
+        "environment capability created_at",
+    )
+    expires = _parse_rfc3339_nano(
+        capability["expires_at"],
+        "environment capability expires_at",
+    )
+    if created >= expires:
+        raise EvidenceError("environment capability expiry must follow creation")
+    if root_a["device"] == root_b["device"]:
+        raise EvidenceError("environment capability roots must use distinct devices")
+    if root_a["owner_uid"] != root_b["owner_uid"]:
+        raise EvidenceError("environment capability roots must share one owner UID")
+    if root_a["path"] == root_b["path"]:
+        raise EvidenceError("environment capability roots must be distinct")
+    return copy.deepcopy(capability)
+
+
+def validate_producer_receipt(value: Any) -> dict[str, Any]:
+    """Validate and detach one complete closed Host producer receipt."""
+
+    receipt = _require_closed_object(
+        value,
+        _PRODUCER_RECEIPT_KEYS,
+        "producer receipt",
+    )
+    _require_literal(
+        receipt["schema"],
+        "tersh-host-producer-receipt-v1",
+        "producer receipt schema",
+    )
+    for field, label in (
+        ("receipt_id", "producer receipt ID"),
+        ("attempt_binding_id", "producer receipt attempt binding ID"),
+        ("producer_session_id", "producer receipt session ID"),
+        ("bundle_id", "producer receipt bundle ID"),
+        ("runtime_profile_id", "producer receipt runtime profile ID"),
+        ("policy_entry_sha256", "producer receipt policy entry sha256"),
+        ("body_sha256", "producer receipt body sha256"),
+    ):
+        validate_sha256(receipt[field], label)
+
+    sequence = require_exact_int(
+        receipt["sequence"],
+        "producer receipt sequence",
+        minimum=1,
+    )
+    previous_receipt_id = receipt["previous_receipt_id"]
+    if sequence == 1:
+        if previous_receipt_id is not None:
+            raise EvidenceError("producer receipt sequence one predecessor must be null")
+    elif previous_receipt_id is None:
+        raise EvidenceError("later producer receipt predecessor must be present")
+    else:
+        validate_sha256(previous_receipt_id, "producer receipt predecessor ID")
+
+    producer_mode = _require_enum(
+        receipt["producer_mode"],
+        {"harness", "agent-report"},
+        "producer receipt mode",
+    )
+    validate_gate_name(receipt["entrypoint"])
+    validate_gate_name(receipt["policy_entry_id"])
+    _require_enum(
+        receipt["projection_root_class"],
+        {"local", "external"},
+        "producer receipt projection root class",
+    )
+    record_class = _require_enum(
+        receipt["record_class"],
+        _PRODUCER_RECORD_CLASSES,
+        "producer receipt record class",
+    )
+    _require_match(
+        receipt["record_schema"],
+        "producer receipt record schema",
+        RECORD_SCHEMA_RE,
+    )
+    _validate_canonical_relative_destination(receipt["destination"])
+    require_exact_int(
+        receipt["byte_count"],
+        "producer receipt byte count",
+        minimum=1,
+    )
+    _parse_rfc3339_nano(receipt["created_at"], "producer receipt created_at")
+
+    environment = receipt["environment_capability"]
+    if environment is not None:
+        environment = _validate_environment_capability(environment)
+        if environment["attempt_binding_id"] != receipt["attempt_binding_id"]:
+            raise EvidenceError(
+                "environment capability attempt binding does not match receipt"
+            )
+    if record_class in {"attempt-marker", "candidate-marker"} and environment is not None:
+        raise EvidenceError("marker receipt environment capability must be null")
+
+    if producer_mode == "harness":
+        if receipt["dispatch_id"] is not None:
+            raise EvidenceError("harness producer receipt dispatch ID must be null")
+        if receipt["reported_record_sha256"] is not None:
+            raise EvidenceError(
+                "harness producer receipt reported record sha256 must be null"
+            )
+    else:
+        _require_literal(
+            receipt["entrypoint"],
+            "seal-agent-record",
+            "agent-report producer receipt entrypoint",
+        )
+        validate_sha256(receipt["dispatch_id"], "agent-report dispatch ID")
+        validate_sha256(
+            receipt["reported_record_sha256"],
+            "agent-report reported record sha256",
+        )
+        if environment is not None:
+            raise EvidenceError(
+                "agent-report producer receipt environment capability must be null"
+            )
+
+    return copy.deepcopy(receipt)
+
+
+def _validate_append_platform_producer_receipt(
+    value: Any,
+    *,
+    recorder_session: Any,
+    record: Any,
+) -> dict[str, Any]:
+    receipt = validate_producer_receipt(value)
+    session = _require_closed_object(
+        recorder_session,
+        _ORCHESTRATION_RECORDER_SESSION_KEYS,
+        "append-platform recorder session",
+    )
+    record_body = _require_closed_object(
+        record,
+        _ORCHESTRATION_RECORD_KEYS,
+        "append-platform orchestration record",
+    )
+    _require_literal(
+        record_body["schema"],
+        "tersh-evidence-orchestration-v1",
+        "append-platform orchestration record schema",
+    )
+    if session["record_schema"] != record_body["schema"]:
+        raise EvidenceError("append-platform record schema does not match session")
+
+    session_joins = {
+        "attempt_binding_id": "attempt_binding_id",
+        "producer_session_id": "producer_session_id",
+        "producer_mode": "producer_mode",
+        "entrypoint": "entrypoint",
+        "bundle_id": "bundle_id",
+        "runtime_profile_id": "runtime_profile_id",
+        "policy_entry_id": "policy_entry_id",
+        "policy_entry_sha256": "policy_entry_sha256",
+        "projection_root_class": "projection_root_class",
+        "record_class": "record_class",
+        "record_schema": "record_schema",
+        "destination": "destination",
+    }
+    for receipt_field, session_field in session_joins.items():
+        if receipt[receipt_field] != session[session_field]:
+            raise EvidenceError(
+                f"append-platform receipt {receipt_field} does not match session"
+            )
+    if receipt["sequence"] != session["next_receipt_sequence"]:
+        raise EvidenceError("append-platform receipt sequence does not match session")
+    if receipt["previous_receipt_id"] != session["previous_receipt_id"]:
+        raise EvidenceError(
+            "append-platform receipt predecessor does not match session"
+        )
+
+    frozen_record = canonical_json_bytes(record_body)
+    if not 1 <= len(frozen_record) <= ORCHESTRATION_RECORD_MAX_BYTES:
+        raise EvidenceError("append-platform record is outside 1..61440 bytes")
+    if receipt["body_sha256"] != sha256_bytes(frozen_record):
+        raise EvidenceError("append-platform receipt body sha256 does not match record")
+    if receipt["byte_count"] != len(frozen_record):
+        raise EvidenceError("append-platform receipt byte count does not match record")
+    if receipt["environment_capability"] is not None:
+        raise EvidenceError("append-platform receipt environment capability must be null")
+    if receipt["dispatch_id"] is not None:
+        raise EvidenceError("append-platform receipt dispatch ID must be null")
+    if receipt["reported_record_sha256"] is not None:
+        raise EvidenceError(
+            "append-platform receipt reported record sha256 must be null"
+        )
+    return copy.deepcopy(receipt)
 
 
 def _validate_capture_relationships(

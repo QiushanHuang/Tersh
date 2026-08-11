@@ -157,6 +157,31 @@ SESSION_KEYS = {
     "destination", "parent_finding_ids_sha256",
     "next_receipt_sequence", "previous_receipt_id",
 }
+ORCHESTRATION_RECORD_KEYS = {
+    "schema", "evidence_id", "evidence_attempt", "run_binding", "role",
+    "wave", "review_attempt", "baseline_commit", "reviewed_commit",
+    "parent_finding_ids", "dispatch_id", "agent_id",
+    "canonical_task_path", "agent_run_id", "model", "reasoning_effort",
+    "dispatched_at", "started_at", "ended_at", "terminal_status",
+    "provenance",
+}
+PRODUCER_RECEIPT_KEYS = {
+    "schema", "receipt_id", "attempt_binding_id", "producer_session_id",
+    "sequence", "previous_receipt_id", "producer_mode", "entrypoint",
+    "bundle_id", "runtime_profile_id", "policy_entry_id",
+    "policy_entry_sha256", "environment_capability",
+    "projection_root_class", "record_class", "record_schema", "destination",
+    "body_sha256", "byte_count", "dispatch_id", "reported_record_sha256",
+    "created_at",
+}
+PRODUCER_RECORD_CLASSES = {
+    "attempt-marker", "candidate-marker", "gate", "cumulative-gates",
+    "runner-inventory", "before-repo-runs", "bootstrap", "selected-run",
+    "jobs", "artifact-index", "external-candidate", "orchestration",
+    "review", "implementation-entry", "requirements", "completion-audit",
+    "audit-reservation-failure", "orchestration-failure",
+    "agent-report-failure",
+}
 
 
 def normalized_paragraph(paragraph):
@@ -408,6 +433,39 @@ class AppendPlatformSchemaTests(unittest.TestCase):
             self.assertIs(parameter.default, inspect.Parameter.empty)
         return core, validate
 
+    def orchestration_record_deriver(self):
+        core = importlib.import_module("scripts.evidence_core")
+        derive = getattr(core, "derive_platform_orchestration_record", None)
+        self.assertTrue(
+            callable(derive),
+            "derive_platform_orchestration_record is required",
+        )
+        self.assertEqual(
+            tuple(inspect.signature(derive).parameters),
+            ("context", "invocation", "response", "recorder_session"),
+        )
+        return core, derive
+
+    def producer_receipt_validators(self):
+        core = importlib.import_module("scripts.evidence_core")
+        validate = getattr(core, "validate_producer_receipt", None)
+        self.assertTrue(callable(validate), "validate_producer_receipt is required")
+        self.assertEqual(tuple(inspect.signature(validate).parameters), ("value",))
+        validate_append = getattr(
+            core,
+            "_validate_append_platform_producer_receipt",
+            None,
+        )
+        self.assertTrue(
+            callable(validate_append),
+            "append-platform producer receipt join is required",
+        )
+        self.assertEqual(
+            tuple(inspect.signature(validate_append).parameters),
+            ("value", "recorder_session", "record"),
+        )
+        return core, validate, validate_append
+
     @classmethod
     def append_platform_fixture(
         cls,
@@ -527,6 +585,144 @@ class AppendPlatformSchemaTests(unittest.TestCase):
                 provenance[body_kind]["body"]
             )
         ).hexdigest()
+
+    @classmethod
+    def expected_orchestration_record(cls, core, provenance, session):
+        detached_provenance = {
+            "mode": "platform-envelope",
+            **{
+                body_kind: {
+                    "body": copy.deepcopy(provenance[body_kind]["body"]),
+                    "sha256": provenance[body_kind]["sha256"],
+                }
+                for body_kind in ("context", "invocation", "response")
+            },
+        }
+        validated_platform_provenance = (
+            core.validate_platform_envelope_provenance(detached_provenance)
+        )
+        context = validated_platform_provenance["context"]["body"]
+        invocation = validated_platform_provenance["invocation"]["body"]
+        response = validated_platform_provenance["response"]["body"]
+        return {
+            "schema": "tersh-evidence-orchestration-v1",
+            "evidence_id": context["evidence_id"],
+            "evidence_attempt": context["evidence_attempt"],
+            "run_binding": context["run_binding"],
+            "role": context["role"],
+            "wave": context["wave"],
+            "review_attempt": context["review_attempt"],
+            "baseline_commit": context["baseline_commit"],
+            "reviewed_commit": session["candidate"],
+            "parent_finding_ids": copy.deepcopy(context["parent_finding_ids"]),
+            "dispatch_id": invocation["dispatch_id"],
+            "agent_id": response["agent_id"],
+            "canonical_task_path": context["canonical_task_path"],
+            "agent_run_id": response["agent_run_id"],
+            "model": invocation["selected_model"],
+            "reasoning_effort": invocation["selected_reasoning_effort"],
+            "dispatched_at": invocation["dispatched_at"],
+            "started_at": response["started_at"],
+            "ended_at": response["ended_at"],
+            "terminal_status": response["terminal_status"],
+            "provenance": validated_platform_provenance,
+        }
+
+    @classmethod
+    def candidate_rule_fixture(
+        cls,
+        *,
+        wave,
+        candidate,
+        reported_result_commit,
+        role="safety",
+        review_target=None,
+    ):
+        relation = "equal" if candidate == "a" * 40 else "descendant"
+        provenance, session = cls.append_platform_fixture(
+            candidate=candidate,
+            candidate_relation=relation,
+        )
+        context = provenance["context"]["body"]
+        response = provenance["response"]["body"]
+        context["wave"] = wave
+        context["role"] = role
+        context["review_target"] = (
+            candidate if review_target is None else review_target
+        )
+        response["reported_result_commit"] = reported_result_commit
+        session["destination"] = (
+            f"attempt-{context['evidence_attempt']}/candidate-{candidate}/"
+            f"orchestration/{role}.{wave}.{context['review_attempt']}.json"
+        )
+        cls.rehash_platform_arm(provenance, "context")
+        cls.rehash_platform_arm(provenance, "response")
+        return provenance, session
+
+    @classmethod
+    def producer_receipt_fixture(
+        cls,
+        session,
+        record,
+        *,
+        producer_mode="harness",
+        environment_capability=None,
+    ):
+        agent_report = producer_mode == "agent-report"
+        body = cls.canonical_fixture_body_bytes(record)
+        return {
+            "schema": "tersh-host-producer-receipt-v1",
+            "receipt_id": "0" * 64,
+            "attempt_binding_id": session["attempt_binding_id"],
+            "producer_session_id": session["producer_session_id"],
+            "sequence": session["next_receipt_sequence"],
+            "previous_receipt_id": session["previous_receipt_id"],
+            "producer_mode": producer_mode,
+            "entrypoint": (
+                "seal-agent-record" if agent_report else session["entrypoint"]
+            ),
+            "bundle_id": session["bundle_id"],
+            "runtime_profile_id": session["runtime_profile_id"],
+            "policy_entry_id": session["policy_entry_id"],
+            "policy_entry_sha256": session["policy_entry_sha256"],
+            "environment_capability": copy.deepcopy(environment_capability),
+            "projection_root_class": session["projection_root_class"],
+            "record_class": session["record_class"],
+            "record_schema": session["record_schema"],
+            "destination": session["destination"],
+            "body_sha256": hashlib.sha256(body).hexdigest(),
+            "byte_count": len(body),
+            "dispatch_id": "d" * 64 if agent_report else None,
+            "reported_record_sha256": "e" * 64 if agent_report else None,
+            "created_at": "2026-08-10T00:00:04.000000001Z",
+        }
+
+    @staticmethod
+    def environment_capability(attempt_binding_id):
+        return {
+            "schema": "tersh-host-environment-capability-v1",
+            "capability_id": "f" * 64,
+            "kind": "distinct-writable-filesystems-v1",
+            "attempt_binding_id": attempt_binding_id,
+            "root_a": {
+                "schema": "tersh-host-opened-directory-v1",
+                "path": "/var/tmp/tersh-root-a",
+                "device": 11,
+                "inode": 101,
+                "owner_uid": 501,
+                "mode": 448,
+            },
+            "root_b": {
+                "schema": "tersh-host-opened-directory-v1",
+                "path": "/private/tmp/tersh-root-b",
+                "device": 12,
+                "inode": 102,
+                "owner_uid": 501,
+                "mode": 448,
+            },
+            "created_at": "2026-08-10T00:00:00.000000001Z",
+            "expires_at": "2026-08-10T00:05:00.000000001Z",
+        }
 
     @staticmethod
     def validate_recorder_session(validate, session, provenance):
@@ -2844,6 +3040,387 @@ class AppendPlatformSchemaTests(unittest.TestCase):
                 opaque_session,
                 "syntactic Host assertions must not trigger origin or ancestry lookup",
             )
+
+    def test_orchestration_record_schema_has_one_authoritative_source_per_field(self):
+        core, derive = self.orchestration_record_deriver()
+        provenance, session = self.append_platform_fixture()
+        expected = self.expected_orchestration_record(
+            core,
+            provenance,
+            session,
+        )
+        inputs_before = copy.deepcopy((provenance, session))
+
+        actual = derive(
+            provenance["context"]["body"],
+            provenance["invocation"]["body"],
+            provenance["response"]["body"],
+            session,
+        )
+
+        self.assertEqual(set(actual), ORCHESTRATION_RECORD_KEYS)
+        self.assertEqual(actual, expected)
+        self.assertEqual((provenance, session), inputs_before)
+        self.assertIsNot(actual["parent_finding_ids"], provenance["context"]["body"]["parent_finding_ids"])
+        for body_kind in ("context", "invocation", "response"):
+            self.assertIsNot(
+                actual["provenance"][body_kind]["body"],
+                provenance[body_kind]["body"],
+            )
+        actual["parent_finding_ids"].append("impl-01-F002")
+        actual["provenance"]["context"]["body"]["parent_finding_ids"].clear()
+        self.assertEqual((provenance, session), inputs_before)
+
+    def test_orchestration_record_rejects_extra_missing_mixed_or_overbound_fields(self):
+        core, derive = self.orchestration_record_deriver()
+        provenance, session = self.append_platform_fixture()
+        expected = self.expected_orchestration_record(core, provenance, session)
+        self.assertEqual(
+            derive(
+                provenance["context"]["body"],
+                provenance["invocation"]["body"],
+                provenance["response"]["body"],
+                session,
+            ),
+            expected,
+        )
+
+        invalid_inputs = []
+        extra_context = copy.deepcopy(provenance)
+        extra_context["context"]["body"]["candidate"] = session["candidate"]
+        invalid_inputs.append(("extra-context-field", extra_context, session))
+        missing_response = copy.deepcopy(provenance)
+        del missing_response["response"]["body"]["agent_id"]
+        invalid_inputs.append(("missing-response-field", missing_response, session))
+        mixed_dispatch = copy.deepcopy(provenance)
+        mixed_dispatch["response"]["body"]["dispatch_id"] = "0" * 64
+        invalid_inputs.append(("mixed-dispatch-lineage", mixed_dispatch, session))
+        overbound_parent_set = copy.deepcopy(provenance)
+        overbound_parent_set["context"]["body"]["parent_finding_ids"] = [
+            f"impl-01-F{sequence:03d}" for sequence in range(1, 130)
+        ]
+        invalid_inputs.append(("overbound-parent-set", overbound_parent_set, session))
+        for case_id, invalid, invalid_session in invalid_inputs:
+            with self.subTest(case_id=case_id):
+                before = copy.deepcopy((invalid, invalid_session))
+                with self.assert_exact_evidence_error(core.EvidenceError):
+                    derive(
+                        invalid["context"]["body"],
+                        invalid["invocation"]["body"],
+                        invalid["response"]["body"],
+                        invalid_session,
+                    )
+                self.assertEqual((invalid, invalid_session), before)
+
+        original_canonical = core.canonical_json_bytes
+
+        def overbound_record_bytes(value):
+            if (
+                type(value) is dict
+                and value.get("schema") == "tersh-evidence-orchestration-v1"
+            ):
+                return b"x" * 61441
+            return original_canonical(value)
+
+        with mock.patch.object(
+            core,
+            "canonical_json_bytes",
+            side_effect=overbound_record_bytes,
+        ):
+            with self.assert_exact_evidence_error(core.EvidenceError):
+                derive(
+                    provenance["context"]["body"],
+                    provenance["invocation"]["body"],
+                    provenance["response"]["body"],
+                    session,
+                )
+
+    def test_append_platform_candidate_rules_cover_wave_a_wave_b_changed_and_unchanged(self):
+        core, derive = self.orchestration_record_deriver()
+        baseline = "a" * 40
+        candidate = "b" * 40
+        valid_cases = (
+            (
+                "wave-a",
+                self.candidate_rule_fixture(
+                    wave="wave-a",
+                    candidate=baseline,
+                    reported_result_commit=None,
+                ),
+            ),
+            (
+                "wave-b-changed",
+                self.candidate_rule_fixture(
+                    wave="wave-b",
+                    role="implementation",
+                    candidate=candidate,
+                    review_target=baseline,
+                    reported_result_commit=candidate,
+                ),
+            ),
+            (
+                "wave-b-unchanged-null",
+                self.candidate_rule_fixture(
+                    wave="wave-b",
+                    role="implementation",
+                    candidate=baseline,
+                    review_target=baseline,
+                    reported_result_commit=None,
+                ),
+            ),
+            (
+                "wave-b-unchanged-reported",
+                self.candidate_rule_fixture(
+                    wave="wave-b",
+                    role="implementation",
+                    candidate=baseline,
+                    review_target=baseline,
+                    reported_result_commit=baseline,
+                ),
+            ),
+            (
+                "wave-c-descendant-tag",
+                self.candidate_rule_fixture(
+                    wave="wave-c",
+                    candidate=candidate,
+                    reported_result_commit=candidate,
+                ),
+            ),
+        )
+        tripwire = AssertionError("pure record derivation attempted Git or filesystem I/O")
+        with (
+            mock.patch.object(core.subprocess, "Popen", side_effect=tripwire),
+            mock.patch.object(core.subprocess, "run", side_effect=tripwire),
+            mock.patch.object(core.os, "system", side_effect=tripwire),
+            mock.patch.object(core.os, "open", side_effect=tripwire),
+            mock.patch.object(core.socket, "socket", side_effect=tripwire),
+        ):
+            for case_id, (case_provenance, case_session) in valid_cases:
+                with self.subTest(case_id=case_id):
+                    record = derive(
+                        case_provenance["context"]["body"],
+                        case_provenance["invocation"]["body"],
+                        case_provenance["response"]["body"],
+                        case_session,
+                    )
+                    self.assertEqual(record["reviewed_commit"], case_session["candidate"])
+
+        invalid_cases = []
+        wave_a_changed = self.candidate_rule_fixture(
+            wave="wave-a",
+            candidate=candidate,
+            reported_result_commit=candidate,
+        )
+        invalid_cases.append(("wave-a-changed", wave_a_changed))
+        wave_b_wrong_role = self.candidate_rule_fixture(
+            wave="wave-b",
+            role="safety",
+            candidate=candidate,
+            review_target=baseline,
+            reported_result_commit=candidate,
+        )
+        invalid_cases.append(("wave-b-wrong-role", wave_b_wrong_role))
+        wave_b_changed_null = self.candidate_rule_fixture(
+            wave="wave-b",
+            role="implementation",
+            candidate=candidate,
+            review_target=baseline,
+            reported_result_commit=None,
+        )
+        invalid_cases.append(("wave-b-changed-null", wave_b_changed_null))
+        wave_b_wrong_review_target = self.candidate_rule_fixture(
+            wave="wave-b",
+            role="implementation",
+            candidate=candidate,
+            review_target=candidate,
+            reported_result_commit=candidate,
+        )
+        invalid_cases.append(("wave-b-review-target-not-baseline", wave_b_wrong_review_target))
+        wave_c_null_target = self.candidate_rule_fixture(
+            wave="wave-c",
+            candidate=candidate,
+            review_target=candidate,
+            reported_result_commit=candidate,
+        )
+        wave_c_null_target[0]["context"]["body"]["review_target"] = None
+        self.rehash_platform_arm(wave_c_null_target[0], "context")
+        invalid_cases.append(("outside-wave-b-null-review-target", wave_c_null_target))
+        for case_id, (case_provenance, case_session) in invalid_cases:
+            with self.subTest(case_id=case_id):
+                before = copy.deepcopy((case_provenance, case_session))
+                with self.assert_exact_evidence_error(core.EvidenceError):
+                    derive(
+                        case_provenance["context"]["body"],
+                        case_provenance["invocation"]["body"],
+                        case_provenance["response"]["body"],
+                        case_session,
+                    )
+                self.assertEqual((case_provenance, case_session), before)
+
+    def test_producer_receipt_schema_is_closed_typed_and_detached(self):
+        core, validate, validate_append = self.producer_receipt_validators()
+        provenance, session = self.append_platform_fixture()
+        record = self.expected_orchestration_record(core, provenance, session)
+        receipt = self.producer_receipt_fixture(session, record)
+        receipt_before = copy.deepcopy(receipt)
+
+        validated = validate(receipt)
+
+        self.assertEqual(set(validated), PRODUCER_RECEIPT_KEYS)
+        self.assertEqual(validated, receipt_before)
+        self.assertIsNot(validated, receipt)
+        self.assertEqual(
+            validate_append(
+                receipt,
+                recorder_session=session,
+                record=record,
+            ),
+            receipt_before,
+            "null harness dispatch must not be compared to captured dispatch",
+        )
+        self.assertEqual(receipt, receipt_before)
+
+        for record_class in sorted(PRODUCER_RECORD_CLASSES):
+            with self.subTest(record_class=record_class):
+                alternate = copy.deepcopy(receipt)
+                alternate["record_class"] = record_class
+                self.assertEqual(validate(alternate), alternate)
+
+        capability = self.environment_capability(session["attempt_binding_id"])
+        environment_receipt = self.producer_receipt_fixture(
+            session,
+            record,
+            environment_capability=capability,
+        )
+        detached_environment = validate(environment_receipt)
+        self.assertEqual(detached_environment, environment_receipt)
+        self.assertIsNot(
+            detached_environment["environment_capability"],
+            environment_receipt["environment_capability"],
+        )
+        self.assertIsNot(
+            detached_environment["environment_capability"]["root_a"],
+            environment_receipt["environment_capability"]["root_a"],
+        )
+        detached_environment["environment_capability"]["root_a"]["path"] = "/mutated"
+        self.assertEqual(environment_receipt["environment_capability"], capability)
+
+        agent_receipt = self.producer_receipt_fixture(
+            session,
+            record,
+            producer_mode="agent-report",
+        )
+        self.assertEqual(validate(agent_receipt), agent_receipt)
+
+        structural_cases = []
+        extra = copy.deepcopy(receipt)
+        extra["projection_path"] = "/tmp/untrusted"
+        structural_cases.append(("extra-field", extra))
+        for field in sorted(PRODUCER_RECEIPT_KEYS):
+            missing = copy.deepcopy(receipt)
+            del missing[field]
+            structural_cases.append((f"missing-{field}", missing))
+        for case_id, invalid in structural_cases:
+            with self.subTest(case_id=case_id):
+                before = copy.deepcopy(invalid)
+                with self.assert_exact_evidence_error(core.EvidenceError):
+                    validate(invalid)
+                self.assertEqual(invalid, before)
+
+        typed_cases = (
+            ("sequence-bool", "sequence", True),
+            ("sequence-zero", "sequence", 0),
+            ("byte-count-bool", "byte_count", True),
+            ("byte-count-zero", "byte_count", 0),
+            ("policy-entry", "policy_entry_id", "Record_Orchestration"),
+            ("record-class", "record_class", "orchestrate"),
+            ("record-schema", "record_schema", "orchestration"),
+            ("destination-absolute", "destination", "/attempt-002/a.json"),
+            ("destination-traversal", "destination", "attempt-002/../a.json"),
+            ("destination-wrong-prefix", "destination", "candidate-b/a.json"),
+            ("created-at", "created_at", "2026-08-10T00:00:04Z"),
+        )
+        for case_id, field, value in typed_cases:
+            with self.subTest(case_id=case_id):
+                invalid = copy.deepcopy(receipt)
+                invalid[field] = value
+                with self.assert_exact_evidence_error(core.EvidenceError):
+                    validate(invalid)
+
+        for case_id, field, value in (
+            ("harness-dispatch", "dispatch_id", "d" * 64),
+            ("harness-reported-record", "reported_record_sha256", "e" * 64),
+            ("agent-missing-dispatch", "dispatch_id", None),
+            ("agent-missing-reported-record", "reported_record_sha256", None),
+            ("agent-wrong-entrypoint", "entrypoint", "record-orchestration"),
+        ):
+            with self.subTest(case_id=case_id):
+                invalid = copy.deepcopy(
+                    receipt if case_id.startswith("harness") else agent_receipt
+                )
+                invalid[field] = value
+                with self.assert_exact_evidence_error(core.EvidenceError):
+                    validate(invalid)
+
+        invalid_capabilities = []
+        capability_extra = copy.deepcopy(environment_receipt)
+        capability_extra["environment_capability"]["root_path"] = "/tmp"
+        invalid_capabilities.append(("capability-extra", capability_extra))
+        root_extra = copy.deepcopy(environment_receipt)
+        root_extra["environment_capability"]["root_a"]["writable"] = True
+        invalid_capabilities.append(("root-extra", root_extra))
+        same_device = copy.deepcopy(environment_receipt)
+        same_device["environment_capability"]["root_b"]["device"] = 11
+        invalid_capabilities.append(("same-device", same_device))
+        wrong_owner = copy.deepcopy(environment_receipt)
+        wrong_owner["environment_capability"]["root_b"]["owner_uid"] = 502
+        invalid_capabilities.append(("owner-mismatch", wrong_owner))
+        wrong_mode = copy.deepcopy(environment_receipt)
+        wrong_mode["environment_capability"]["root_a"]["mode"] = 0o755
+        invalid_capabilities.append(("wrong-mode", wrong_mode))
+        relative_root = copy.deepcopy(environment_receipt)
+        relative_root["environment_capability"]["root_a"]["path"] = "tmp/root-a"
+        invalid_capabilities.append(("relative-root", relative_root))
+        expired = copy.deepcopy(environment_receipt)
+        expired["environment_capability"]["expires_at"] = expired[
+            "environment_capability"
+        ]["created_at"]
+        invalid_capabilities.append(("nonfuture-expiry", expired))
+        for case_id, invalid in invalid_capabilities:
+            with self.subTest(case_id=case_id):
+                with self.assert_exact_evidence_error(core.EvidenceError):
+                    validate(invalid)
+
+        join_drifts = (
+            ("attempt-binding", "attempt_binding_id", "a" * 64),
+            ("producer-session", "producer_session_id", "a" * 64),
+            ("sequence", "sequence", receipt["sequence"] + 1),
+            ("previous-receipt", "previous_receipt_id", "a" * 64),
+            ("entrypoint", "entrypoint", "alternate-entrypoint"),
+            ("bundle", "bundle_id", "a" * 64),
+            ("runtime", "runtime_profile_id", "a" * 64),
+            ("policy-entry", "policy_entry_id", "alternate-policy"),
+            ("policy-digest", "policy_entry_sha256", "a" * 64),
+            ("projection-class", "projection_root_class", "external"),
+            ("record-class", "record_class", "review"),
+            ("record-schema", "record_schema", "tersh-evidence-review-v1"),
+            ("destination", "destination", "attempt-002/alternate.json"),
+            ("body-digest", "body_sha256", "a" * 64),
+            ("byte-count", "byte_count", receipt["byte_count"] + 1),
+            ("environment", "environment_capability", capability),
+            ("detached-dispatch", "dispatch_id", "d" * 64),
+            ("detached-reported-record", "reported_record_sha256", "e" * 64),
+        )
+        for case_id, field, value in join_drifts:
+            with self.subTest(case_id=f"append-join-{case_id}"):
+                invalid = copy.deepcopy(receipt)
+                invalid[field] = copy.deepcopy(value)
+                with self.assert_exact_evidence_error(core.EvidenceError):
+                    validate_append(
+                        invalid,
+                        recorder_session=session,
+                        record=record,
+                    )
 
 
 if __name__ == "__main__":
