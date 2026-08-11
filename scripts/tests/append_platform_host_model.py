@@ -302,6 +302,7 @@ class AppendPlatformHostModel:
             "receipts": [],
             "authorities": {},
             "failure_observations": {},
+            "unresolved_findings": {},
             "next_id": 1,
             "next_connection_generation": 1,
         }
@@ -527,6 +528,8 @@ class AppendPlatformHostModel:
         current = self._state["attempts"].get(binding_id)
         if current is not None and current["binding"] != binding:
             raise core.EvidenceError("attempt binding is immutable")
+        if current is not None and current["state"] != "ACTIVE":
+            raise core.EvidenceError("attempt no longer accepts lineage registration")
         session_id = session.get("producer_session_id")
         core.validate_sha256(session_id, "producer session ID")
         existing_session = self._state["sessions"].get(session_id)
@@ -611,6 +614,45 @@ class AppendPlatformHostModel:
         with self._ledger_lock:
             shadow = copy.deepcopy(self._state)
             shadow["failure_observations"][context_nonce] = reason
+            self._state = shadow
+
+    def set_unresolved_findings(
+        self,
+        attempt_binding_id: str,
+        finding_ids: list[str],
+    ) -> None:
+        core.validate_sha256(attempt_binding_id, "attempt binding ID")
+        if type(finding_ids) is not list or not finding_ids:
+            raise core.EvidenceError("unresolved findings must be a nonempty list")
+        if any(
+            type(finding_id) is not str
+            or core.FINDING_ID_RE.fullmatch(finding_id) is None
+            for finding_id in finding_ids
+        ):
+            raise core.EvidenceError("unresolved finding ID is invalid")
+        ordered = sorted(set(finding_ids))
+        if ordered != finding_ids:
+            raise core.EvidenceError("unresolved findings must be sorted and unique")
+        with self._ledger_lock:
+            if attempt_binding_id not in self._state["attempts"]:
+                raise core.EvidenceError("attempt binding is unknown")
+            shadow = copy.deepcopy(self._state)
+            shadow["unresolved_findings"][attempt_binding_id] = ordered
+            self._state = shadow
+
+    def force_live_capability_for_test(self, lineage_id: str, handle_id: str) -> None:
+        with self._ledger_lock:
+            if lineage_id not in self._state["lineages"] or handle_id not in self._state["handles"]:
+                raise core.EvidenceError("test capability target is unknown")
+            shadow = copy.deepcopy(self._state)
+            shadow["handles"][handle_id]["lineage_id"] = lineage_id
+            shadow["handles"][handle_id]["live"] = True
+            self._state = shadow
+
+    def clear_live_capability_for_test(self, handle_id: str) -> None:
+        with self._ledger_lock:
+            shadow = copy.deepcopy(self._state)
+            shadow["handles"][handle_id]["live"] = False
             self._state = shadow
 
     @staticmethod
@@ -1081,7 +1123,7 @@ class AppendPlatformHostModel:
         handles = lease["handles"]
         attempt_binding_id = session_body["attempt_binding_id"]
         attempt = self._state["attempts"].get(attempt_binding_id)
-        if attempt is None or attempt["state"] != "ACTIVE":
+        if attempt is None or attempt["state"] not in {"ACTIVE", "CLOSING_FAILED"}:
             raise core.EvidenceError("append attempt is not active")
         expected_chain = {
             "next_receipt_sequence": session_body["next_receipt_sequence"],
@@ -1703,9 +1745,12 @@ class AppendPlatformHostModel:
             if handle_id is not None:
                 shadow["handles"][handle_id]["live"] = False
                 updated[f"{kind}_handle"] = None
+        for session_id in updated["registered_session_ids"]:
+            shadow["sessions"][session_id]["live"] = False
+            shadow["sessions"][session_id]["active_lease_id"] = None
         updated["state"] = "ABANDONED"
         updated["terminal_state"] = "abandoned"
-        shadow["attempts"][updated["attempt_binding_id"]]["state"] = "CLOSING_FAILED"
+        self._enter_closing_failed(shadow, updated["attempt_binding_id"])
         result = {
             "schema": "tersh-host-abandon-dispatch-lineage-result-v1",
             "context_nonce": value["context_nonce"],
@@ -1723,6 +1768,22 @@ class AppendPlatformHostModel:
         if fault_at == post_fault:
             raise core.EvidenceError("injected abandon lost result")
         return copy.deepcopy(result)
+
+    @staticmethod
+    def _enter_closing_failed(
+        shadow: dict[str, Any],
+        attempt_binding_id: str,
+    ) -> None:
+        attempt = shadow["attempts"][attempt_binding_id]
+        if attempt["state"] == "ACTIVE":
+            attempt["state"] = "CLOSING_FAILED"
+            attempt["frozen_lineage_ids"] = sorted(
+                lineage_id
+                for lineage_id, lineage in shadow["lineages"].items()
+                if lineage["attempt_binding_id"] == attempt_binding_id
+            )
+        elif attempt["state"] != "CLOSING_FAILED":
+            raise core.EvidenceError("terminal attempt cannot accept a failure")
 
     def _append_failure_record(
         self,
@@ -1879,6 +1940,9 @@ class AppendPlatformHostModel:
         shadow_lineage = shadow["lineages"][lineage["lineage_id"]]
         for handle in handles.values():
             shadow["handles"][handle]["live"] = False
+        for registered_session_id in shadow_lineage["registered_session_ids"]:
+            shadow["sessions"][registered_session_id]["live"] = False
+            shadow["sessions"][registered_session_id]["active_lease_id"] = None
         receipt = self._append_failure_record(
             shadow,
             lineage=shadow_lineage,
@@ -1892,7 +1956,7 @@ class AppendPlatformHostModel:
         )
         shadow_lineage["state"] = "DISPATCH_FAILED"
         shadow_lineage["terminal_state"] = "failed"
-        shadow["attempts"][lineage["attempt_binding_id"]]["state"] = "CLOSING_FAILED"
+        self._enter_closing_failed(shadow, lineage["attempt_binding_id"])
         result = {
             "schema": "tersh-host-fail-responded-dispatch-result-v1",
             "context_nonce": context_nonce,
@@ -1997,7 +2061,7 @@ class AppendPlatformHostModel:
         )
         shadow_lineage["state"] = "REPORT_FAILED"
         shadow_lineage["terminal_state"] = "report-failed"
-        shadow["attempts"][lineage["attempt_binding_id"]]["state"] = "CLOSING_FAILED"
+        self._enter_closing_failed(shadow, lineage["attempt_binding_id"])
         result = {
             "schema": "tersh-host-fail-agent-report-authority-result-v1",
             "context_nonce": context_nonce,
@@ -2034,9 +2098,214 @@ class AppendPlatformHostModel:
             del shadow["authorities"][invocation["dispatch_id"]]
             shadow_lineage = shadow["lineages"][lineage["lineage_id"]]
             shadow_lineage["state"] = "REVIEW_SEALED"
-            shadow_lineage["terminal_state"] = "sealed"
+            shadow_lineage["terminal_state"] = "review-sealed"
             self._state = shadow
             return {"state": "sealed", "context_nonce": context_nonce}
+
+    def _terminal_lineage_rows(
+        self,
+        state: dict[str, Any],
+        attempt_binding_id: str,
+    ) -> list[dict[str, Any]]:
+        attempt = state["attempts"][attempt_binding_id]
+        lineage_ids = attempt.get("frozen_lineage_ids")
+        if lineage_ids is None:
+            lineage_ids = sorted(
+                lineage_id
+                for lineage_id, lineage in state["lineages"].items()
+                if lineage["attempt_binding_id"] == attempt_binding_id
+            )
+        if not lineage_ids:
+            raise core.EvidenceError("attempt has no registered lineage")
+        rows = []
+        terminal_names = {
+            "ABANDONED": "abandoned",
+            "DISPATCH_FAILED": "dispatch-failed",
+            "REPORT_FAILED": "report-failed",
+            "REVIEW_SEALED": "review-sealed",
+        }
+        for lineage_id in lineage_ids:
+            lineage = state["lineages"].get(lineage_id)
+            if lineage is None or lineage["attempt_binding_id"] != attempt_binding_id:
+                raise core.EvidenceError("frozen lineage registry drifted")
+            terminal_state = terminal_names.get(lineage["state"])
+            if (
+                terminal_state is None
+                and lineage["state"] == "APPENDED_PLATFORM"
+                and lineage["terminal_state"] == "appended-no-report"
+            ):
+                terminal_state = "appended-no-report"
+            if terminal_state is None:
+                raise core.EvidenceError("registered lineage is not terminal")
+            if any(
+                handle["lineage_id"] == lineage_id and handle["live"]
+                for handle in state["handles"].values()
+            ):
+                raise core.EvidenceError("terminal lineage retains a live handle")
+            if any(
+                session["lineage_id"] == lineage_id and session["live"]
+                for session in state["sessions"].values()
+            ):
+                raise core.EvidenceError("terminal lineage retains a live session")
+            if any(
+                lease["lineage_id"] == lineage_id and lease["valid"]
+                for lease in state["leases"].values()
+            ):
+                raise core.EvidenceError("terminal lineage retains a live lease")
+            receipt_id = None
+            if terminal_state != "abandoned":
+                matching_records = [
+                    record
+                    for record in state["records"]
+                    if record["lineage_id"] == lineage_id
+                    and record.get("receipt_id") is not None
+                ]
+                if not matching_records:
+                    raise core.EvidenceError("terminal lineage lacks its receipt")
+                receipt_id = matching_records[-1]["receipt_id"]
+            rows.append(
+                {
+                    "schema": "tersh-host-terminal-lineage-state-v1",
+                    "lineage_id": lineage_id,
+                    "context_nonce": lineage["context_nonce"],
+                    "transition_index": lineage["transition_index"],
+                    "terminal_state": terminal_state,
+                    "terminal_receipt_id": receipt_id,
+                }
+            )
+        if any(
+            authority["attempt_binding_id"] == attempt_binding_id
+            for authority in state["authorities"].values()
+        ):
+            raise core.EvidenceError("attempt retains a pending report authority")
+        return rows
+
+    def _close_failed_attempt(self, request: Any) -> dict[str, Any]:
+        value = _require_closed_object(
+            request,
+            {"schema", "attempt_binding_id"},
+            "close failed attempt request",
+        )
+        _require_literal(
+            value["schema"],
+            "tersh-host-close-failed-attempt-request-v1",
+            "close failed attempt schema",
+        )
+        attempt_id = core.validate_sha256(
+            value["attempt_binding_id"], "attempt binding ID"
+        )
+        replay_key = f"close-failed:{attempt_id}"
+        existing = self._state["replays"].get(replay_key)
+        if existing is not None:
+            return copy.deepcopy(existing["result"])
+        attempt = self._state["attempts"].get(attempt_id)
+        if attempt is None or attempt["state"] != "CLOSING_FAILED":
+            raise core.EvidenceError("attempt is not closing failed")
+        rows = self._terminal_lineage_rows(self._state, attempt_id)
+        digest = self._body_sha256(rows)
+        result = {
+            "schema": "tersh-host-close-failed-attempt-result-v1",
+            "attempt_binding_id": attempt_id,
+            "state": "terminal-failed",
+            "terminal_lineage_count": len(rows),
+            "ordered_lineage_states_sha256": digest,
+        }
+        shadow = copy.deepcopy(self._state)
+        shadow_attempt = shadow["attempts"][attempt_id]
+        shadow_attempt.update(
+            {
+                "state": "TERMINAL_FAILED",
+                "frozen_lineage_ids": [row["lineage_id"] for row in rows],
+                "terminal_lineage_rows": copy.deepcopy(rows),
+                "ordered_lineage_states_sha256": digest,
+            }
+        )
+        shadow["replays"][replay_key] = {
+            "kind": "close-failed",
+            "result": copy.deepcopy(result),
+        }
+        self._state = shadow
+        return copy.deepcopy(result)
+
+    def _close_superseded_attempt(self, request: Any) -> dict[str, Any]:
+        value = _require_closed_object(
+            request,
+            {"schema", "attempt_binding_id"},
+            "close superseded attempt request",
+        )
+        _require_literal(
+            value["schema"],
+            "tersh-host-close-superseded-attempt-request-v1",
+            "close superseded attempt schema",
+        )
+        attempt_id = core.validate_sha256(
+            value["attempt_binding_id"], "attempt binding ID"
+        )
+        replay_key = f"close-superseded:{attempt_id}"
+        existing = self._state["replays"].get(replay_key)
+        if existing is not None:
+            return copy.deepcopy(existing["result"])
+        attempt = self._state["attempts"].get(attempt_id)
+        if attempt is None or attempt["state"] != "ACTIVE":
+            raise core.EvidenceError("only an active attempt may be superseded")
+        findings = self._state["unresolved_findings"].get(attempt_id)
+        if not findings:
+            raise core.EvidenceError("supersede requires Host-receipted findings")
+        rows = self._terminal_lineage_rows(self._state, attempt_id)
+        lineage_digest = self._body_sha256(rows)
+        finding_digest = self._body_sha256(findings)
+        result = {
+            "schema": "tersh-host-close-superseded-attempt-result-v1",
+            "attempt_binding_id": attempt_id,
+            "state": "terminal-superseded",
+            "superseding_finding_count": len(findings),
+            "ordered_superseding_finding_ids_sha256": finding_digest,
+            "terminal_lineage_count": len(rows),
+            "ordered_lineage_states_sha256": lineage_digest,
+        }
+        shadow = copy.deepcopy(self._state)
+        shadow["attempts"][attempt_id].update(
+            {
+                "state": "TERMINAL_SUPERSEDED",
+                "frozen_lineage_ids": [row["lineage_id"] for row in rows],
+                "terminal_lineage_rows": copy.deepcopy(rows),
+                "ordered_lineage_states_sha256": lineage_digest,
+                "ordered_superseding_finding_ids_sha256": finding_digest,
+            }
+        )
+        shadow["replays"][replay_key] = {
+            "kind": "close-superseded",
+            "result": copy.deepcopy(result),
+        }
+        self._state = shadow
+        return copy.deepcopy(result)
+
+    def _open_successor_attempt(self, request: Any) -> dict[str, Any]:
+        value = _require_closed_object(
+            request,
+            {"schema", "predecessor_attempt_binding_id"},
+            "open successor request",
+        )
+        _require_literal(
+            value["schema"],
+            "tersh-host-open-successor-attempt-request-v1",
+            "open successor schema",
+        )
+        predecessor_id = core.validate_sha256(
+            value["predecessor_attempt_binding_id"],
+            "predecessor attempt binding ID",
+        )
+        predecessor = self._state["attempts"].get(predecessor_id)
+        if predecessor is None or predecessor["state"] not in {
+            "TERMINAL_FAILED",
+            "TERMINAL_SUPERSEDED",
+        }:
+            raise core.EvidenceError("predecessor is not terminal for a successor")
+        return {
+            "schema": "tersh-host-open-successor-attempt-result-v1",
+            "predecessor_attempt_binding_id": predecessor_id,
+            "state": "ready",
+        }
 
     def enumerate_attempt(self, attempt_binding_id: str) -> dict[str, Any]:
         attempt = self._state["attempts"].get(attempt_binding_id)
@@ -2066,6 +2335,12 @@ class AppendPlatformHostModel:
                     request,
                     fault_at=fault_at,
                 )
+            if operation == "close-failed-attempt":
+                return self._close_failed_attempt(request)
+            if operation == "close-superseded-attempt":
+                return self._close_superseded_attempt(request)
+            if operation == "open-successor-attempt":
+                return self._open_successor_attempt(request)
             if operation == "enumerate-attempt":
                 if type(request) is not dict or set(request) != {"attempt_binding_id"}:
                     raise core.EvidenceError("enumerate-attempt request must be exact")

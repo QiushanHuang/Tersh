@@ -5365,5 +5365,257 @@ class AppendPlatformFailureTests(unittest.TestCase):
                 self.assertEqual(after, before)
 
 
+class AppendPlatformBarrierTests(unittest.TestCase):
+    def invoke(self, model, operation, request):
+        return model.invoke_root_internal(
+            operation,
+            request,
+            principal=model.ROOT_SUPERVISOR_PRINCIPAL,
+        )
+
+    @staticmethod
+    def close_failed_request(fixture):
+        return {
+            "schema": "tersh-host-close-failed-attempt-request-v1",
+            "attempt_binding_id": fixture["session"]["attempt_binding_id"],
+        }
+
+    @staticmethod
+    def close_superseded_request(fixture):
+        return {
+            "schema": "tersh-host-close-superseded-attempt-request-v1",
+            "attempt_binding_id": fixture["session"]["attempt_binding_id"],
+        }
+
+    def abandoned_model(self):
+        helper = AppendPlatformRecoveryTests(methodName="runTest")
+        _, model, fixture, _ = helper.lineage_at("invoked")
+        helper.invoke(
+            model,
+            "abandon-dispatch-lineage",
+            helper.abandon_request(fixture, "invoked", 1),
+        )
+        return model, fixture
+
+    def dispatch_failed_model(self):
+        helper = AppendPlatformFailureTests(methodName="runTest")
+        _, model, fixture, _ = helper.responded_model()
+        reason = "candidate-object-missing"
+        model.set_failure_observation(fixture["context"]["context_nonce"], reason)
+        helper.invoke(
+            model,
+            "fail-responded-dispatch",
+            helper.dispatch_request(fixture, reason),
+        )
+        return model, fixture
+
+    def authority_failed_model(self):
+        helper = AppendPlatformFailureTests(methodName="runTest")
+        _, model, fixture, _ = helper.authority_model()
+        reason = "draft-missing"
+        model.set_failure_observation(fixture["context"]["context_nonce"], reason)
+        helper.invoke(
+            model,
+            "fail-agent-report-authority",
+            helper.authority_request(fixture, reason),
+        )
+        return model, fixture
+
+    def supersedable_model(self):
+        helper = AppendPlatformAtomicityTests(methodName="runTest")
+        _, _, model, fixture, _, _, connection, lease = helper.ready_model(
+            reported_record_sha256=None
+        )
+        model.append_platform(
+            lease,
+            connection=connection,
+            transaction_nonce="7" * 64,
+        )
+        model.set_unresolved_findings(
+            fixture["session"]["attempt_binding_id"],
+            [f"{fixture['context']['evidence_id']}-F001"],
+        )
+        return model, fixture
+
+    def test_root_internal_operations_reject_caller_selected_receipt_authority_finding_or_terminal_sets(self):
+        core = importlib.import_module("scripts.evidence_core")
+        model, fixture = self.abandoned_model()
+        for field in (
+            "receipt_id",
+            "authority_id",
+            "finding_ids",
+            "terminal_lineages",
+        ):
+            invalid = self.close_failed_request(fixture)
+            invalid[field] = [] if field.endswith("s") else "a" * 64
+            before = model.snapshot()
+            with self.assertRaises(core.EvidenceError):
+                self.invoke(model, "close-failed-attempt", invalid)
+            self.assertEqual(model.snapshot(), before)
+
+    def test_binding_retaining_abandon_closes_marker_only_attempt_before_next_attempt(self):
+        model, fixture = self.abandoned_model()
+        result = self.invoke(
+            model, "close-failed-attempt", self.close_failed_request(fixture)
+        )
+        self.assertEqual(result["state"], "terminal-failed")
+        self.assertEqual(result["terminal_lineage_count"], 1)
+        self.assertEqual(
+            model.snapshot()["attempts"][fixture["session"]["attempt_binding_id"]]["state"],
+            "TERMINAL_FAILED",
+        )
+
+    def test_irrecoverable_responded_dispatch_atomically_records_failure_and_allows_next_attempt(self):
+        model, fixture = self.dispatch_failed_model()
+        result = self.invoke(
+            model, "close-failed-attempt", self.close_failed_request(fixture)
+        )
+        self.assertEqual(result["state"], "terminal-failed")
+        self.assertEqual(result["terminal_lineage_count"], 1)
+
+    def test_unsealable_report_authority_atomically_records_callback_failure_and_drains_barrier(self):
+        model, fixture = self.authority_failed_model()
+        result = self.invoke(
+            model, "close-failed-attempt", self.close_failed_request(fixture)
+        )
+        self.assertEqual(result["state"], "terminal-failed")
+        self.assertEqual(len(model.snapshot()["authorities"]), 0)
+
+    def test_failed_lineage_drains_siblings_before_attempt_barrier_or_next_attempt(self):
+        core = importlib.import_module("scripts.evidence_core")
+        model, fixture = self.abandoned_model()
+        # Reintroducing any live capability keeps the global barrier closed.
+        lineage = next(iter(model.snapshot()["lineages"].values()))
+        handle = next(iter(model.snapshot()["handles"]))
+        model.force_live_capability_for_test(lineage["lineage_id"], handle)
+        with self.assertRaises(core.EvidenceError):
+            self.invoke(
+                model, "close-failed-attempt", self.close_failed_request(fixture)
+            )
+        model.clear_live_capability_for_test(handle)
+        self.assertEqual(
+            self.invoke(
+                model, "close-failed-attempt", self.close_failed_request(fixture)
+            )["state"],
+            "terminal-failed",
+        )
+
+    def test_terminal_lineage_array_rejects_omitted_duplicate_reordered_live_or_pending_rows(self):
+        core = importlib.import_module("scripts.evidence_core")
+        model, fixture = self.authority_failed_model()
+        result = self.invoke(
+            model, "close-failed-attempt", self.close_failed_request(fixture)
+        )
+        self.assertRegex(result["ordered_lineage_states_sha256"], r"^[0-9a-f]{64}$")
+        replay = self.invoke(
+            model, "close-failed-attempt", self.close_failed_request(fixture)
+        )
+        self.assertEqual(replay, result)
+        invalid = self.close_failed_request(fixture)
+        invalid["terminal_lineages"] = []
+        with self.assertRaises(core.EvidenceError):
+            self.invoke(model, "close-failed-attempt", invalid)
+
+    def test_closing_failed_freezes_lineage_registration_and_supersede_requires_active(self):
+        core = importlib.import_module("scripts.evidence_core")
+        model, fixture = self.abandoned_model()
+        new_session = copy.deepcopy(fixture["session"])
+        new_session["producer_session_id"] = "8" * 64
+        before = model.snapshot()
+        with self.assertRaises(core.EvidenceError):
+            model.open_attempt({"context": fixture["context"], "session": new_session})
+        self.assertEqual(model.snapshot(), before)
+        with self.assertRaises(core.EvidenceError):
+            self.invoke(
+                model,
+                "close-superseded-attempt",
+                self.close_superseded_request(fixture),
+            )
+
+    def test_receipted_findings_supersede_drained_attempt_before_successor_opens(self):
+        model, fixture = self.supersedable_model()
+        result = self.invoke(
+            model,
+            "close-superseded-attempt",
+            self.close_superseded_request(fixture),
+        )
+        self.assertEqual(result["state"], "terminal-superseded")
+        self.assertEqual(result["superseding_finding_count"], 1)
+        self.assertEqual(
+            model.snapshot()["attempts"][fixture["session"]["attempt_binding_id"]]["state"],
+            "TERMINAL_SUPERSEDED",
+        )
+
+    def test_supersede_vs_late_append_race_freezes_one_complete_predecessor_history(self):
+        core = importlib.import_module("scripts.evidence_core")
+        helper = AppendPlatformAtomicityTests(methodName="runTest")
+        _, _, model, fixture, _, _, connection, lease = helper.ready_model(
+            reported_record_sha256=None
+        )
+        model.set_unresolved_findings(
+            fixture["session"]["attempt_binding_id"],
+            [f"{fixture['context']['evidence_id']}-F001"],
+        )
+        barrier = threading.Barrier(2)
+        outcomes = []
+
+        def append():
+            barrier.wait(timeout=2)
+            try:
+                outcomes.append(
+                    model.append_platform(
+                        lease,
+                        connection=connection,
+                        transaction_nonce="6" * 64,
+                    )
+                )
+            except core.EvidenceError as error:
+                outcomes.append(error)
+
+        def supersede():
+            barrier.wait(timeout=2)
+            try:
+                outcomes.append(
+                    self.invoke(
+                        model,
+                        "close-superseded-attempt",
+                        self.close_superseded_request(fixture),
+                    )
+                )
+            except core.EvidenceError as error:
+                outcomes.append(error)
+
+        threads = (threading.Thread(target=append), threading.Thread(target=supersede))
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=3)
+            self.assertFalse(thread.is_alive())
+        self.assertGreaterEqual(sum(type(value) is dict for value in outcomes), 1)
+        snapshot = model.snapshot()
+        self.assertIn(
+            snapshot["attempts"][fixture["session"]["attempt_binding_id"]]["state"],
+            {"ACTIVE", "TERMINAL_SUPERSEDED"},
+        )
+
+    def test_fail_supersede_sibling_append_and_open_race_has_one_serializable_winner(self):
+        core = importlib.import_module("scripts.evidence_core")
+        model, fixture = self.dispatch_failed_model()
+        with self.assertRaises(core.EvidenceError):
+            self.invoke(
+                model,
+                "open-successor-attempt",
+                {
+                    "schema": "tersh-host-open-successor-attempt-request-v1",
+                    "predecessor_attempt_binding_id": fixture["session"]["attempt_binding_id"],
+                },
+            )
+        self.invoke(model, "close-failed-attempt", self.close_failed_request(fixture))
+        self.assertEqual(
+            model.snapshot()["attempts"][fixture["session"]["attempt_binding_id"]]["state"],
+            "TERMINAL_FAILED",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
