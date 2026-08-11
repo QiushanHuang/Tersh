@@ -1467,6 +1467,247 @@ class AppendPlatformHostModel:
                     )
                 raise
 
+    @staticmethod
+    def _transition_state_name(lineage_state: str) -> str:
+        names = {
+            "CREATED": "created",
+            "INVOKED": "invoked",
+            "RESPONDED_PLATFORM": "responded-platform",
+        }
+        state = names.get(lineage_state)
+        if state is None:
+            raise core.EvidenceError("dispatch lineage is not recoverable")
+        return state
+
+    def _resolve_private_lineage(self, context_nonce: str) -> dict[str, Any]:
+        matches = [
+            row
+            for row in self._state["lineages"].values()
+            if row["context_nonce"] == context_nonce
+        ]
+        if len(matches) != 1:
+            raise core.EvidenceError("context nonce does not resolve one private lineage")
+        return matches[0]
+
+    @staticmethod
+    def _validate_lineage_transition_request(
+        request: Any,
+        *,
+        operation: str,
+    ) -> dict[str, Any]:
+        schemas = {
+            "recover-dispatch-lineage": (
+                "tersh-host-recover-dispatch-lineage-request-v1",
+                {"created", "invoked", "responded-platform"},
+            ),
+            "abandon-dispatch-lineage": (
+                "tersh-host-abandon-dispatch-lineage-request-v1",
+                {"created", "invoked"},
+            ),
+        }
+        schema, states = schemas[operation]
+        expected_keys = {
+            "schema",
+            "context_nonce",
+            "expected_state",
+            "transition_index",
+            "recovery_generation",
+            "reason",
+        }
+        value = _require_closed_object(request, expected_keys, f"{operation} request")
+        _require_literal(value["schema"], schema, f"{operation} schema")
+        context_nonce = core.validate_sha256(value["context_nonce"], "context nonce")
+        expected_state = _require_enum(value["expected_state"], states, "expected state")
+        transition_index = core.require_exact_int(
+            value["transition_index"], "transition index", minimum=0
+        )
+        recovery_generation = core.require_exact_int(
+            value["recovery_generation"], "recovery generation", minimum=0
+        )
+        _require_literal(
+            value["reason"],
+            "capture-reply-unrecoverable",
+            "lineage transition reason",
+        )
+        expected_transition = {
+            "created": 0,
+            "invoked": 1,
+            "responded-platform": 2,
+        }[expected_state]
+        if transition_index != expected_transition:
+            raise core.EvidenceError("transition index does not match expected state")
+        return {
+            "schema": schema,
+            "context_nonce": context_nonce,
+            "expected_state": expected_state,
+            "transition_index": transition_index,
+            "recovery_generation": recovery_generation,
+            "reason": value["reason"],
+        }
+
+    def _recover_dispatch_lineage(
+        self,
+        request: Any,
+        *,
+        fault_at: str | None,
+    ) -> dict[str, Any]:
+        value = self._validate_lineage_transition_request(
+            request, operation="recover-dispatch-lineage"
+        )
+        lineage = self._resolve_private_lineage(value["context_nonce"])
+        replay_key = (
+            f"recover:{lineage['lineage_id']}:"
+            f"{value['transition_index']}:{value['recovery_generation']}"
+        )
+        request_sha256 = self._body_sha256(value)
+        existing = self._state["replays"].get(replay_key)
+        if existing is not None:
+            if existing.get("request_sha256") != request_sha256 or existing.get("used"):
+                raise core.EvidenceError("recovery replay conflicts")
+            return copy.deepcopy(existing["result"])
+
+        current_state = self._transition_state_name(lineage["state"])
+        if (
+            current_state != value["expected_state"]
+            or lineage["transition_index"] != value["transition_index"]
+            or lineage["recovery_generation"] != value["recovery_generation"]
+        ):
+            raise core.EvidenceError("recovery CAS state or generation changed")
+
+        pre_faults = {
+            "recover.after-old-tuple-invalidate",
+            "recover.after-new-tuple-insert",
+            "recover.after-replay-row",
+            "recover.before-commit",
+        }
+        post_fault = "recover.after-commit-before-result"
+        if fault_at is not None and fault_at not in pre_faults | {post_fault}:
+            raise core.EvidenceError("unknown recovery fault point")
+
+        shadow = copy.deepcopy(self._state)
+        updated = shadow["lineages"][lineage["lineage_id"]]
+        kinds = ("context", "invocation", "response")
+        required_count = value["transition_index"] + 1
+        replacement_handles: dict[str, str | None] = {}
+        for ordinal, kind in enumerate(kinds):
+            old_handle = updated[f"{kind}_handle"]
+            required = ordinal < required_count
+            if required:
+                if old_handle is None or not shadow["handles"][old_handle]["live"]:
+                    raise core.EvidenceError("recovery tuple is incomplete or stale")
+                shadow["handles"][old_handle]["live"] = False
+                new_handle = self._new_id(shadow, f"recovered-{kind}")
+                new_row = copy.deepcopy(shadow["handles"][old_handle])
+                new_row.update(
+                    {
+                        "transition_index": value["transition_index"],
+                        "live": True,
+                    }
+                )
+                shadow["handles"][new_handle] = new_row
+                replacement_handles[kind] = new_handle
+            else:
+                if old_handle is not None:
+                    raise core.EvidenceError("recovery tuple leaks an inapplicable handle")
+                replacement_handles[kind] = None
+        updated.update(
+            {
+                "recovery_generation": value["recovery_generation"] + 1,
+                "context_handle": replacement_handles["context"],
+                "invocation_handle": replacement_handles["invocation"],
+                "response_handle": replacement_handles["response"],
+            }
+        )
+        result = {
+            "schema": "tersh-host-recover-dispatch-lineage-result-v1",
+            "context_nonce": value["context_nonce"],
+            "state": value["expected_state"],
+            "transition_index": value["transition_index"],
+            "recovery_generation": value["recovery_generation"] + 1,
+            "context_handle": replacement_handles["context"],
+            "invocation_handle": replacement_handles["invocation"],
+            "response_handle": replacement_handles["response"],
+        }
+        shadow["replays"][replay_key] = {
+            "kind": "recovery",
+            "lineage_id": lineage["lineage_id"],
+            "request_sha256": request_sha256,
+            "result": copy.deepcopy(result),
+            "used": False,
+        }
+        if fault_at in pre_faults:
+            raise core.EvidenceError(f"injected recovery fault at {fault_at}")
+        self._state = shadow
+        if fault_at == post_fault:
+            raise core.EvidenceError("injected recovery lost result")
+        return copy.deepcopy(result)
+
+    def _abandon_dispatch_lineage(
+        self,
+        request: Any,
+        *,
+        fault_at: str | None,
+    ) -> dict[str, Any]:
+        value = self._validate_lineage_transition_request(
+            request, operation="abandon-dispatch-lineage"
+        )
+        lineage = self._resolve_private_lineage(value["context_nonce"])
+        replay_key = (
+            f"abandon:{lineage['lineage_id']}:"
+            f"{value['transition_index']}:{value['recovery_generation']}"
+        )
+        request_sha256 = self._body_sha256(value)
+        existing = self._state["replays"].get(replay_key)
+        if existing is not None:
+            if existing.get("request_sha256") != request_sha256:
+                raise core.EvidenceError("abandon replay conflicts")
+            return copy.deepcopy(existing["result"])
+        current_state = self._transition_state_name(lineage["state"])
+        if (
+            current_state != value["expected_state"]
+            or lineage["transition_index"] != value["transition_index"]
+            or lineage["recovery_generation"] != value["recovery_generation"]
+        ):
+            raise core.EvidenceError("abandon CAS state or generation changed")
+
+        pre_faults = {
+            "abandon.after-handle-invalidate",
+            "abandon.after-terminal-row",
+            "abandon.after-attempt-state",
+            "abandon.after-replay-row",
+            "abandon.before-commit",
+        }
+        post_fault = "abandon.after-commit-before-result"
+        if fault_at is not None and fault_at not in pre_faults | {post_fault}:
+            raise core.EvidenceError("unknown abandon fault point")
+        shadow = copy.deepcopy(self._state)
+        updated = shadow["lineages"][lineage["lineage_id"]]
+        for kind in ("context", "invocation", "response"):
+            handle_id = updated[f"{kind}_handle"]
+            if handle_id is not None:
+                shadow["handles"][handle_id]["live"] = False
+                updated[f"{kind}_handle"] = None
+        updated["state"] = "ABANDONED"
+        updated["terminal_state"] = "abandoned"
+        shadow["attempts"][updated["attempt_binding_id"]]["state"] = "CLOSING_FAILED"
+        result = {
+            "schema": "tersh-host-abandon-dispatch-lineage-result-v1",
+            "context_nonce": value["context_nonce"],
+            "state": "abandoned",
+        }
+        shadow["replays"][replay_key] = {
+            "kind": "abandon",
+            "lineage_id": lineage["lineage_id"],
+            "request_sha256": request_sha256,
+            "result": copy.deepcopy(result),
+        }
+        if fault_at in pre_faults:
+            raise core.EvidenceError(f"injected abandon fault at {fault_at}")
+        self._state = shadow
+        if fault_at == post_fault:
+            raise core.EvidenceError("injected abandon lost result")
+        return copy.deepcopy(result)
+
     def enumerate_attempt(self, attempt_binding_id: str) -> dict[str, Any]:
         attempt = self._state["attempts"].get(attempt_binding_id)
         if attempt is None:
@@ -1483,8 +1724,13 @@ class AppendPlatformHostModel:
     ) -> dict[str, Any]:
         if principal != self.ROOT_SUPERVISOR_PRINCIPAL:
             raise core.EvidenceError("root supervisor authentication failed")
-        if operation != "enumerate-attempt":
+        with self._ledger_lock:
+            if operation == "recover-dispatch-lineage":
+                return self._recover_dispatch_lineage(request, fault_at=fault_at)
+            if operation == "abandon-dispatch-lineage":
+                return self._abandon_dispatch_lineage(request, fault_at=fault_at)
+            if operation == "enumerate-attempt":
+                if type(request) is not dict or set(request) != {"attempt_binding_id"}:
+                    raise core.EvidenceError("enumerate-attempt request must be exact")
+                return self.enumerate_attempt(request["attempt_binding_id"])
             raise core.EvidenceError("unsupported root-internal operation")
-        if type(request) is not dict or set(request) != {"attempt_binding_id"}:
-            raise core.EvidenceError("enumerate-attempt request must be exact")
-        return self.enumerate_attempt(request["attempt_binding_id"])

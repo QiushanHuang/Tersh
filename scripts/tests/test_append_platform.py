@@ -4213,7 +4213,7 @@ class AppendPlatformWireTests(unittest.TestCase):
                             "operation": "append-platform",
                             "body_kind": body_kind,
                             "ordinal": ordinal,
-                            "total": limit,
+                            "total": 5,
                             "body": body,
                             "body_sha256": digest,
                         },
@@ -4859,6 +4859,276 @@ class AppendPlatformAtomicityTests(unittest.TestCase):
                         transaction_nonce=f"{index + 33:064x}",
                     )
                 self.assertEqual(model.snapshot(), committed)
+
+
+class AppendPlatformRecoveryTests(unittest.TestCase):
+    RECOVER_FAULTS = (
+        "recover.after-old-tuple-invalidate",
+        "recover.after-new-tuple-insert",
+        "recover.after-replay-row",
+        "recover.before-commit",
+    )
+    ABANDON_FAULTS = (
+        "abandon.after-handle-invalidate",
+        "abandon.after-terminal-row",
+        "abandon.after-attempt-state",
+        "abandon.after-replay-row",
+        "abandon.before-commit",
+    )
+
+    def lineage_at(self, state):
+        host_module = importlib.import_module(
+            "scripts.tests.append_platform_host_model"
+        )
+        core = importlib.import_module("scripts.evidence_core")
+        model = host_module.AppendPlatformHostModel()
+        fixture = AppendPlatformStateTests.fixture()
+        helpers = AppendPlatformStateTests(methodName="runTest")
+        helpers.install_facts(model, fixture)
+        model.open_attempt({"context": fixture["context"], "session": fixture["session"]})
+        result = model.seed_lineage(context=fixture["context"])
+        if state in {"invoked", "responded-platform"}:
+            result = model.capture_invocation(
+                result["context_handle"], fixture["invocation"], lose_reply=True
+            )
+        if state == "responded-platform":
+            result = model.capture_response(
+                result["context_handle"], fixture["response"], lose_reply=True
+            )
+        return core, model, fixture, result
+
+    @staticmethod
+    def recover_request(fixture, state, transition, generation=0):
+        return {
+            "schema": "tersh-host-recover-dispatch-lineage-request-v1",
+            "context_nonce": fixture["context"]["context_nonce"],
+            "expected_state": state,
+            "transition_index": transition,
+            "recovery_generation": generation,
+            "reason": "capture-reply-unrecoverable",
+        }
+
+    @staticmethod
+    def abandon_request(fixture, state, transition, generation=0):
+        return {
+            "schema": "tersh-host-abandon-dispatch-lineage-request-v1",
+            "context_nonce": fixture["context"]["context_nonce"],
+            "expected_state": state,
+            "transition_index": transition,
+            "recovery_generation": generation,
+            "reason": "capture-reply-unrecoverable",
+        }
+
+    def invoke(self, model, operation, request, **kwargs):
+        return model.invoke_root_internal(
+            operation,
+            request,
+            principal=model.ROOT_SUPERVISOR_PRINCIPAL,
+            **kwargs,
+        )
+
+    def test_capture_reply_orphan_recovery_rotates_private_handles_and_preserves_response(self):
+        _, model, fixture, old = self.lineage_at("responded-platform")
+        old_bodies = {
+            kind: copy.deepcopy(model.snapshot()["handles"][old[f"{kind}_handle"]]["body"])
+            for kind in ("context", "invocation", "response")
+        }
+        result = self.invoke(
+            model,
+            "recover-dispatch-lineage",
+            self.recover_request(fixture, "responded-platform", 2),
+        )
+        self.assertEqual(
+            set(result),
+            {
+                "schema",
+                "context_nonce",
+                "state",
+                "transition_index",
+                "recovery_generation",
+                "context_handle",
+                "invocation_handle",
+                "response_handle",
+            },
+        )
+        self.assertEqual(result["recovery_generation"], 1)
+        snapshot = model.snapshot()
+        for kind in ("context", "invocation", "response"):
+            self.assertNotEqual(result[f"{kind}_handle"], old[f"{kind}_handle"])
+            self.assertFalse(snapshot["handles"][old[f"{kind}_handle"]]["live"])
+            self.assertEqual(
+                snapshot["handles"][result[f"{kind}_handle"]]["body"],
+                old_bodies[kind],
+            )
+
+    def test_recovery_generation_allows_invoked_then_responded_lost_reply_recovery(self):
+        _, model, fixture, _ = self.lineage_at("invoked")
+        invoked = self.invoke(
+            model,
+            "recover-dispatch-lineage",
+            self.recover_request(fixture, "invoked", 1),
+        )
+        responded = model.capture_response(
+            invoked["context_handle"], fixture["response"], lose_reply=True
+        )
+        recovered = self.invoke(
+            model,
+            "recover-dispatch-lineage",
+            self.recover_request(fixture, "responded-platform", 2, generation=1),
+        )
+        self.assertEqual(recovered["recovery_generation"], 2)
+        self.assertNotEqual(recovered["response_handle"], responded["response_handle"])
+
+    def test_recovery_result_state_generation_and_nullable_handles_are_exact(self):
+        cases = (
+            ("created", 0, (True, False, False)),
+            ("invoked", 1, (True, True, False)),
+            ("responded-platform", 2, (True, True, True)),
+        )
+        for state, transition, applicable in cases:
+            with self.subTest(state=state):
+                _, model, fixture, _ = self.lineage_at(state)
+                result = self.invoke(
+                    model,
+                    "recover-dispatch-lineage",
+                    self.recover_request(fixture, state, transition),
+                )
+                self.assertEqual(result["state"], state)
+                self.assertEqual(result["transition_index"], transition)
+                self.assertEqual(result["recovery_generation"], 1)
+                for kind, required in zip(
+                    ("context", "invocation", "response"), applicable
+                ):
+                    self.assertIs(type(result[f"{kind}_handle"]), str if required else type(None))
+                nonnull = [
+                    result[f"{kind}_handle"]
+                    for kind in ("context", "invocation", "response")
+                    if result[f"{kind}_handle"] is not None
+                ]
+                self.assertEqual(len(nonnull), len(set(nonnull)))
+
+    def test_capture_orphan_abandon_rejects_responded_state_and_never_reuses_persisted_attempt(self):
+        core, responded_model, responded_fixture, _ = self.lineage_at(
+            "responded-platform"
+        )
+        before = responded_model.snapshot()
+        with self.assertRaises(core.EvidenceError):
+            self.invoke(
+                responded_model,
+                "abandon-dispatch-lineage",
+                self.abandon_request(
+                    responded_fixture, "responded-platform", 2
+                ),
+            )
+        self.assertEqual(responded_model.snapshot(), before)
+
+        _, model, fixture, _ = self.lineage_at("created")
+        result = self.invoke(
+            model,
+            "abandon-dispatch-lineage",
+            self.abandon_request(fixture, "created", 0),
+        )
+        self.assertEqual(result["state"], "abandoned")
+        attempt = model.snapshot()["attempts"][fixture["session"]["attempt_binding_id"]]
+        self.assertEqual(attempt["state"], "CLOSING_FAILED")
+
+    def test_recover_and_abandon_closed_schemas_and_atomic_fault_matrix(self):
+        for fault_id in self.RECOVER_FAULTS:
+            with self.subTest(fault_id=fault_id):
+                core, model, fixture, _ = self.lineage_at("created")
+                before = model.snapshot()
+                with self.assertRaises(core.EvidenceError):
+                    self.invoke(
+                        model,
+                        "recover-dispatch-lineage",
+                        self.recover_request(fixture, "created", 0),
+                        fault_at=fault_id,
+                    )
+                self.assertEqual(model.snapshot(), before)
+        for fault_id in self.ABANDON_FAULTS:
+            with self.subTest(fault_id=fault_id):
+                core, model, fixture, _ = self.lineage_at("invoked")
+                before = model.snapshot()
+                with self.assertRaises(core.EvidenceError):
+                    self.invoke(
+                        model,
+                        "abandon-dispatch-lineage",
+                        self.abandon_request(fixture, "invoked", 1),
+                        fault_at=fault_id,
+                    )
+                self.assertEqual(model.snapshot(), before)
+
+        core, model, fixture, _ = self.lineage_at("created")
+        invalid = self.recover_request(fixture, "created", 0)
+        invalid["lineage_id"] = "caller-selector"
+        before = model.snapshot()
+        with self.assertRaises(core.EvidenceError):
+            self.invoke(model, "recover-dispatch-lineage", invalid)
+        self.assertEqual(model.snapshot(), before)
+
+        core, model, fixture, _ = self.lineage_at("created")
+        request = self.recover_request(fixture, "created", 0)
+        with self.assertRaises(core.EvidenceError):
+            self.invoke(
+                model,
+                "recover-dispatch-lineage",
+                request,
+                fault_at="recover.after-commit-before-result",
+            )
+        self.assertEqual(self.invoke(model, "recover-dispatch-lineage", request)["recovery_generation"], 1)
+
+    def test_recover_abandon_capture_and_append_race_has_exactly_one_durable_winner(self):
+        core, model, fixture, _ = self.lineage_at("created")
+        barrier = threading.Barrier(2)
+        outcomes = []
+
+        def run(operation, request):
+            barrier.wait(timeout=2)
+            try:
+                outcomes.append(self.invoke(model, operation, request))
+            except core.EvidenceError as error:
+                outcomes.append(error)
+
+        threads = (
+            threading.Thread(
+                target=run,
+                args=(
+                    "recover-dispatch-lineage",
+                    self.recover_request(fixture, "created", 0),
+                ),
+            ),
+            threading.Thread(
+                target=run,
+                args=(
+                    "abandon-dispatch-lineage",
+                    self.abandon_request(fixture, "created", 0),
+                ),
+            ),
+        )
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=3)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(sum(type(value) is dict for value in outcomes), 1)
+        self.assertEqual(sum(type(value) is core.EvidenceError for value in outcomes), 1)
+
+    def test_binding_retaining_abandon_enters_closing_failed_without_reusing_binding(self):
+        _, model, fixture, old = self.lineage_at("invoked")
+        result = self.invoke(
+            model,
+            "abandon-dispatch-lineage",
+            self.abandon_request(fixture, "invoked", 1),
+        )
+        self.assertEqual(result["state"], "abandoned")
+        snapshot = model.snapshot()
+        lineage = snapshot["lineages"][old["lineage_id"]]
+        self.assertEqual(lineage["state"], "ABANDONED")
+        self.assertTrue(all(not snapshot["handles"][handle]["live"] for handle in (
+            old["context_handle"], old["invocation_handle"]
+        )))
+        attempt = snapshot["attempts"][fixture["session"]["attempt_binding_id"]]
+        self.assertEqual(attempt["state"], "CLOSING_FAILED")
 
 
 if __name__ == "__main__":
