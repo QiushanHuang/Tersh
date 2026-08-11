@@ -1,4 +1,6 @@
+import copy
 import hashlib
+import importlib
 import pathlib
 import re
 import unittest
@@ -324,6 +326,237 @@ class AppendPlatformContractTests(unittest.TestCase):
                 )
                 with self.assertRaisesRegex(AssertionError, "exactly one"):
                     self.assert_plan_contract(path, duplicate_authority)
+
+
+class AppendPlatformSchemaTests(unittest.TestCase):
+    @staticmethod
+    def context_v2(parent_finding_ids, *, evidence_id="impl-01"):
+        return {
+            "schema": "tersh-host-dispatch-context-v2",
+            "context_nonce": "c" * 64,
+            "harness_bundle_revision": "7" * 40,
+            "harness_bundle_sha256": "8" * 64,
+            "evidence_id": evidence_id,
+            "evidence_attempt": "002",
+            "role": "safety",
+            "wave": "wave-c",
+            "review_attempt": "001",
+            "run_binding": "run-local",
+            "baseline_commit": "a" * 40,
+            "review_target": "b" * 40,
+            "parent_finding_ids": list(parent_finding_ids),
+            "canonical_task_path": "/root/safety/reviewer",
+            "worktree_handle": "fixture-worktree",
+            "requested_model": "gpt-5.6-sol",
+            "requested_reasoning_effort": "xhigh",
+            "created_at": "2026-08-10T00:00:00.000000001Z",
+        }
+
+    def context_v2_validator(self):
+        core = importlib.import_module("scripts.evidence_core")
+        validate = getattr(core, "validate_dispatch_context_v2", None)
+        self.assertTrue(
+            callable(validate),
+            "validate_dispatch_context_v2 is required for context v2",
+        )
+        return core, validate
+
+    def test_context_v2_binds_bounded_existing_parent_finding_ids(self):
+        _, validate = self.context_v2_validator()
+        positive_matrix = (
+            ("zero-parents", []),
+            ("one-parent", ["impl-01-F999"]),
+            (
+                "hardening-family-parent",
+                ["hardening-07-F999"],
+                "hardening-07",
+            ),
+            (
+                "128-parents",
+                [f"impl-01-F{sequence:03d}" for sequence in range(1, 129)],
+            ),
+            (
+                "sparse-parents",
+                ["impl-01-F001", "impl-01-F003", "impl-01-F999"],
+            ),
+        )
+
+        for positive_case in positive_matrix:
+            case_id, parent_finding_ids, *evidence_ids = positive_case
+            evidence_id = evidence_ids[0] if evidence_ids else "impl-01"
+            with self.subTest(case_id=case_id):
+                body = self.context_v2(
+                    parent_finding_ids,
+                    evidence_id=evidence_id,
+                )
+                before = copy.deepcopy(body)
+                nested_before = copy.deepcopy(body["parent_finding_ids"])
+                nested_identity = body["parent_finding_ids"]
+
+                validated = validate(body)
+
+                self.assertEqual(body, before, "validation mutated its input object")
+                self.assertIs(body["parent_finding_ids"], nested_identity)
+                self.assertEqual(body["parent_finding_ids"], nested_before)
+                self.assertIs(type(validated), dict)
+                self.assertEqual(validated, before)
+                self.assertIsNot(validated, body)
+                self.assertEqual(
+                    validated["schema"],
+                    "tersh-host-dispatch-context-v2",
+                )
+                self.assertIs(type(validated["parent_finding_ids"]), list)
+                self.assertIsNot(
+                    validated["parent_finding_ids"],
+                    body["parent_finding_ids"],
+                )
+
+    def test_context_v2_structurally_rejects_legacy_alias_duplicate_reordered_or_cross_evidence_parents(
+        self,
+    ):
+        core, validate = self.context_v2_validator()
+
+        class HostileParentList(list):
+            def __deepcopy__(self, memo):
+                raise AssertionError("invalid list subclass was deep-copied")
+
+        class HostileFindingId(str):
+            def __deepcopy__(self, memo):
+                raise AssertionError("invalid string subclass was deep-copied")
+
+        class HostileContextKey(str):
+            def __deepcopy__(self, memo):
+                raise TypeError("invalid string-subclass key was deep-copied")
+
+        class HostileContextValue(str):
+            def __repr__(self):
+                raise TypeError("invalid string-subclass value was represented")
+
+            def __deepcopy__(self, memo):
+                raise TypeError("invalid string-subclass value was deep-copied")
+
+        def context_v1(body):
+            body["schema"] = "tersh-host-dispatch-context-v1"
+            del body["parent_finding_ids"]
+
+        def v1_plus_optional_parents(body):
+            body["schema"] = "tersh-host-dispatch-context-v1"
+
+        def missing_parents(body):
+            del body["parent_finding_ids"]
+
+        def set_parents(value):
+            def mutate(body):
+                body["parent_finding_ids"] = value
+
+            return mutate
+
+        def replace_context_key(original, replacement):
+            def mutate(body):
+                value = body.pop(original)
+                body[replacement] = value
+
+            return mutate
+
+        def set_context_field(field, value):
+            def mutate(body):
+                body[field] = value
+
+            return mutate
+
+        negative_matrix = (
+            ("context-v1", context_v1),
+            ("v1-plus-optional-parents", v1_plus_optional_parents),
+            ("missing-parents", missing_parents),
+            (
+                "hostile-string-subclass-key",
+                replace_context_key("schema", HostileContextKey("schema")),
+            ),
+            ("mixed-integer-key", replace_context_key("schema", 0)),
+            (
+                "hostile-evidence-id-subclass",
+                set_context_field(
+                    "evidence_id",
+                    HostileContextValue("impl-01"),
+                ),
+            ),
+            (
+                "hostile-role-subclass",
+                set_context_field("role", HostileContextValue("safety")),
+            ),
+            ("null-parents", set_parents(None)),
+            ("bool-parents", set_parents(True)),
+            (
+                "list-subclass",
+                set_parents(HostileParentList(["impl-01-F001"])),
+            ),
+            (
+                "129-parents",
+                set_parents(
+                    [f"impl-01-F{sequence:03d}" for sequence in range(1, 130)]
+                ),
+            ),
+            ("non-string-member", set_parents([1])),
+            ("bool-member", set_parents([True])),
+            (
+                "string-subclass-member",
+                set_parents([HostileFindingId("impl-01-F001")]),
+            ),
+            ("finding-000", set_parents(["impl-01-F000"])),
+            ("finding-outside-001..999", set_parents(["impl-01-F1000"])),
+            (
+                "unicode-fullwidth-digits",
+                set_parents(["impl-01-F００１"]),
+            ),
+            ("wrong-evidence-prefix", set_parents(["hardening-01-F001"])),
+            ("wrong-evidence-number", set_parents(["impl-02-F001"])),
+            (
+                "duplicate",
+                set_parents(["impl-01-F001", "impl-01-F001"]),
+            ),
+            (
+                "descending",
+                set_parents(["impl-01-F002", "impl-01-F001"]),
+            ),
+            (
+                "same-sequence-alias",
+                set_parents(["impl-01-F01"]),
+            ),
+            (
+                "same-sequence-alias-F0001",
+                set_parents(["impl-01-F0001"]),
+            ),
+        )
+
+        for case_id, mutate in negative_matrix:
+            with self.subTest(case_id=case_id):
+                body = self.context_v2([])
+                mutate(body)
+                before = dict(body)
+                keys_before = tuple(body.keys())
+                values_before = tuple(body.values())
+                nested_identity = body.get("parent_finding_ids")
+                nested_before = (
+                    list(nested_identity)
+                    if isinstance(nested_identity, list)
+                    else nested_identity
+                )
+
+                with self.assertRaises(core.EvidenceError):
+                    validate(body)
+
+                self.assertEqual(body, before, "rejection mutated its input object")
+                self.assertEqual(tuple(body.keys()), keys_before)
+                for actual_key, original_key in zip(body, keys_before):
+                    self.assertIs(actual_key, original_key)
+                for actual_value, original_value in zip(
+                    body.values(),
+                    values_before,
+                ):
+                    self.assertIs(actual_value, original_value)
+                if isinstance(nested_identity, list):
+                    self.assertIs(body["parent_finding_ids"], nested_identity)
+                    self.assertEqual(list(body["parent_finding_ids"]), nested_before)
 
 
 if __name__ == "__main__":

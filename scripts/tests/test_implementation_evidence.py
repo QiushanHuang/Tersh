@@ -274,7 +274,7 @@ class ImplementationEvidenceTests(unittest.TestCase):
         harness_bundle_revision = "7" * 40
         harness_bundle_sha256 = "8" * 64
         context = {
-            "schema": "tersh-host-dispatch-context-v1",
+            "schema": "tersh-host-dispatch-context-v2",
             "context_nonce": context_nonce,
             "harness_bundle_revision": harness_bundle_revision,
             "harness_bundle_sha256": harness_bundle_sha256,
@@ -286,6 +286,7 @@ class ImplementationEvidenceTests(unittest.TestCase):
             "run_binding": "run-local",
             "baseline_commit": self.candidate_a,
             "review_target": self.candidate_b,
+            "parent_finding_ids": [],
             "canonical_task_path": "/root/safety/reviewer",
             "worktree_handle": "fixture-worktree",
             "requested_model": "gpt-5.6-sol",
@@ -2282,8 +2283,13 @@ class ImplementationEvidenceTests(unittest.TestCase):
             bodies[0][1]["caller_override"] = True
             return bodies
 
-        def wrong_context_schema(bodies):
-            bodies[0][1]["schema"] = "tersh-host-dispatch-context-v0"
+        def legacy_context_v1(bodies):
+            bodies[0][1]["schema"] = "tersh-host-dispatch-context-v1"
+            del bodies[0][1]["parent_finding_ids"]
+            return bodies
+
+        def legacy_context_v1_with_optional_parents(bodies):
+            bodies[0][1]["schema"] = "tersh-host-dispatch-context-v1"
             return bodies
 
         def wrong_context_type(bodies):
@@ -2336,7 +2342,8 @@ class ImplementationEvidenceTests(unittest.TestCase):
 
         for operation, mutator in (
             ("capture-invocation", extra_context_key),
-            ("capture-invocation", wrong_context_schema),
+            ("capture-invocation", legacy_context_v1),
+            ("capture-invocation", legacy_context_v1_with_optional_parents),
             ("capture-invocation", wrong_context_type),
             ("capture-invocation", invocation_nonce_mismatch),
             ("capture-invocation", wrong_invocation_schema),
@@ -2418,6 +2425,11 @@ class ImplementationEvidenceTests(unittest.TestCase):
                     validated[kind]["body"],
                     provenance[kind]["body"],
                 )
+                if kind == "context":
+                    self.assertIsNot(
+                        validated[kind]["body"]["parent_finding_ids"],
+                        provenance[kind]["body"]["parent_finding_ids"],
+                    )
                 self.assertEqual(
                     validated[kind]["sha256"],
                     hashlib.sha256(
@@ -2482,6 +2494,9 @@ class ImplementationEvidenceTests(unittest.TestCase):
                             )
 
         validated["context"]["body"]["role"] = "product"
+        validated["context"]["body"]["parent_finding_ids"].append(
+            "impl-01-F001"
+        )
         validated["invocation"]["body"]["dispatch_id"] = "e" * 64
         validated["response"]["body"]["agent_id"] = "changed-agent"
         self.assertEqual(
@@ -2558,10 +2573,17 @@ class ImplementationEvidenceTests(unittest.TestCase):
             provenance["context"]["body"]["extra"] = None
             return rehash(provenance, "context")
 
-        def context_wrong_schema(provenance):
+        def context_legacy_v1(provenance):
             provenance["context"]["body"][
                 "schema"
-            ] = "tersh-host-dispatch-context-v0"
+            ] = "tersh-host-dispatch-context-v1"
+            del provenance["context"]["body"]["parent_finding_ids"]
+            return rehash(provenance, "context")
+
+        def context_v1_with_optional_parents(provenance):
+            provenance["context"]["body"][
+                "schema"
+            ] = "tersh-host-dispatch-context-v1"
             return rehash(provenance, "context")
 
         def context_wrong_role(provenance):
@@ -2686,7 +2708,8 @@ class ImplementationEvidenceTests(unittest.TestCase):
             invocation_digest_drift,
             response_digest_drift,
             context_body_extra,
-            context_wrong_schema,
+            context_legacy_v1,
+            context_v1_with_optional_parents,
             context_wrong_role,
             context_bool_evidence_attempt,
             invocation_wrong_schema,

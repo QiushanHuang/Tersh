@@ -30,6 +30,10 @@ from typing import Any, Iterable, Sequence
 
 
 EVIDENCE_ID_RE = re.compile(r"^(?:impl|hardening)-0[1-7]$")
+FINDING_ID_RE = re.compile(
+    r"^(?P<evidence>(?:impl|hardening)-0[1-7])-F"
+    r"(?P<sequence>(?:00[1-9]|0[1-9][0-9]|[1-9][0-9]{2}))$"
+)
 ATTEMPT_RE = re.compile(r"^(?:00[1-9]|0[1-9][0-9]|[1-9][0-9]{2})$")
 CANDIDATE_RE = re.compile(r"^[0-9a-f]{40}$")
 GATE_RE = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
@@ -55,6 +59,7 @@ HOST_TRANSACTION_TIMEOUT_SECONDS = 5.0
 PROCESS_TERM_GRACE_SECONDS = 1.0
 PROCESS_KILL_GRACE_SECONDS = 1.0
 READER_CLEANUP_SECONDS = 1.0
+MAX_PARENT_FINDING_IDS = 128
 
 
 class EvidenceError(Exception):
@@ -317,7 +322,9 @@ def require_exact_int(value: Any, field: str, *, minimum: int | None = None) -> 
 
 
 def _require_match(value: Any, field: str, pattern: re.Pattern[str]) -> str:
-    if type(value) is not str or pattern.fullmatch(value) is None:
+    if type(value) is not str:
+        raise EvidenceError(f"{field} must be an exact string")
+    if pattern.fullmatch(value) is None:
         raise EvidenceError(f"invalid {field}: {value!r}")
     return value
 
@@ -530,10 +537,17 @@ def _require_closed_object(
     keys: set[str],
     field: str,
 ) -> dict[str, Any]:
-    if type(value) is not dict or set(value) != keys:
-        actual = sorted(value) if type(value) is dict else type(value).__name__
+    if type(value) is not dict:
         raise EvidenceError(
-            f"{field} is not a closed object: expected={sorted(keys)!r} actual={actual!r}"
+            f"{field} is not a closed object: expected={sorted(keys)!r} "
+            f"actual={type(value).__name__!r}"
+        )
+    if any(type(key) is not str for key in value):
+        raise EvidenceError(f"{field} contains a non-exact-string key")
+    if set(value) != keys:
+        raise EvidenceError(
+            f"{field} is not a closed object: expected={sorted(keys)!r} "
+            f"actual={sorted(value)!r}"
         )
     return value
 
@@ -545,7 +559,9 @@ def _require_literal(value: Any, expected: str, field: str) -> str:
 
 
 def _require_enum(value: Any, allowed: set[str], field: str) -> str:
-    if type(value) is not str or value not in allowed:
+    if type(value) is not str:
+        raise EvidenceError(f"{field} must be an exact string")
+    if value not in allowed:
         raise EvidenceError(f"invalid {field}: {value!r}")
     return value
 
@@ -572,20 +588,53 @@ def _parse_rfc3339_nano(value: Any, field: str) -> tuple[datetime, int]:
     return whole, int(match.group("fraction").ljust(9, "0"))
 
 
+def _validate_parent_finding_ids(value: Any, evidence_id: str) -> list[str]:
+    if type(value) is not list:
+        raise EvidenceError("parent finding IDs must be an exact JSON array")
+    if len(value) > MAX_PARENT_FINDING_IDS:
+        raise EvidenceError("parent finding IDs exceed the maximum of 128")
+
+    parents: list[str] = []
+    previous_sequence = 0
+    for index, parent in enumerate(value):
+        if type(parent) is not str:
+            raise EvidenceError(f"parent finding ID {index} must be an exact string")
+        match = FINDING_ID_RE.fullmatch(parent)
+        if match is None:
+            raise EvidenceError(f"invalid parent finding ID at index {index}")
+        if match.group("evidence") != evidence_id:
+            raise EvidenceError(
+                f"parent finding ID {index} does not match context evidence ID"
+            )
+        sequence = int(match.group("sequence"))
+        if sequence <= previous_sequence:
+            raise EvidenceError(
+                "parent finding IDs must be strictly increasing by sequence"
+            )
+        parents.append(parent)
+        previous_sequence = sequence
+    return parents
+
+
 def _validate_context_body(value: Any) -> dict[str, Any]:
     keys = {
         "schema", "context_nonce", "harness_bundle_revision",
         "harness_bundle_sha256", "evidence_id", "evidence_attempt", "role",
         "wave", "review_attempt", "run_binding", "baseline_commit",
-        "review_target", "canonical_task_path", "worktree_handle",
-        "requested_model", "requested_reasoning_effort", "created_at",
+        "review_target", "parent_finding_ids", "canonical_task_path",
+        "worktree_handle", "requested_model", "requested_reasoning_effort",
+        "created_at",
     }
     body = _require_closed_object(value, keys, "context body")
-    _require_literal(body["schema"], "tersh-host-dispatch-context-v1", "context schema")
+    _require_literal(body["schema"], "tersh-host-dispatch-context-v2", "context schema")
     validate_sha256(body["context_nonce"], "context nonce")
     validate_candidate(body["harness_bundle_revision"])
     validate_sha256(body["harness_bundle_sha256"], "harness bundle sha256")
     validate_evidence_id(body["evidence_id"])
+    parent_finding_ids = _validate_parent_finding_ids(
+        body["parent_finding_ids"],
+        body["evidence_id"],
+    )
     validate_attempt(body["evidence_attempt"])
     _require_enum(
         body["role"],
@@ -606,7 +655,15 @@ def _validate_context_body(value: Any) -> dict[str, Any]:
     _require_literal(body["requested_model"], "gpt-5.6-sol", "requested model")
     _require_literal(body["requested_reasoning_effort"], "xhigh", "requested effort")
     _parse_rfc3339_nano(body["created_at"], "context created_at")
-    return body
+    validated = dict(body)
+    validated["parent_finding_ids"] = parent_finding_ids
+    return validated
+
+
+def validate_dispatch_context_v2(value: Any) -> dict[str, Any]:
+    """Validate and detach context v2 structure, not Host parent origin."""
+
+    return copy.deepcopy(_validate_context_body(value))
 
 
 def _validate_invocation_body(value: Any) -> dict[str, Any]:
