@@ -80,6 +80,28 @@ This matters when your working environment is:
 - Hidden file toggle
 - `tersh --cluster` / `tersh --c` multi-server health dashboard for local, jump, and remote hosts
 
+## v1.1.1 Release Highlights
+
+Tersh v1.1.1 strengthens the everyday file workflow without expanding Tersh
+into a general remote-control product.
+
+- Added selectable btop, aurora, high-contrast, and no-color themes, plus ASCII,
+  rounded, and thick border styles.
+- Added context-aware shortcut recommendations and compact layouts for narrow
+  terminals, phones, and tablets.
+- Added explicit `replace` / `skip` handling when a copy target already exists.
+- Added direct file startup: `tersh <file>` opens the parent directory, focuses
+  the file, and enters preview.
+- Reduced idle work with dirty-driven rendering, a bounded preview LRU cache,
+  cached filter/sort keys, and in-memory filtering.
+- Hardened delayed copy, cut, rename, trash, delete, edit, and preview operations
+  against files being replaced after the user selected them.
+- Hardened cluster inventory and probes with stricter SSH input validation,
+  bounded output, known-host enforcement, timeout cleanup, and generation-safe
+  refresh results.
+- Added repository-side exact-test and evidence validation tooling so internal
+  release results are harder to confuse, duplicate, or silently lose.
+
 ## v1.1.0 Release Highlights
 
 Tersh v1.1.0 is a small product-quality release focused on a denser, btop-inspired terminal interface and safer day-to-day remote file work.
@@ -443,6 +465,25 @@ MIT
 - 可用 `TERSH_THEME`、`TERSH_BORDER` 和 `TERSH_FOOTER` 适配高对比、无色、Unicode 美化或移动端紧凑终端
 - 隐藏文件开关
 - `tersh --cluster` / `tersh --c` 多服务器健康状态面板，可查看本机、跳板机和远端服务器
+
+## v1.1.1 更新重点
+
+Tersh v1.1.1 在不扩大产品边界的前提下，重点提升日常文件操作的安全性、
+终端响应速度和远程服务器检查的可解释性。
+
+- 新增 btop、aurora、高对比和无色主题，以及 ASCII、圆角和粗线边框。
+- 新增根据当前文件、目录、选区和复制/剪切状态自动变化的快捷键提示，
+  并优化手机、平板和窄屏终端布局。
+- 复制遇到已有目标时，新增明确的 `replace` / `skip` 冲突处理。
+- 支持直接执行 `tersh <文件>`，自动进入所在目录、定位文件并打开预览。
+- 通过按需重绘、有限容量的多文件预览缓存、筛选/排序缓存和内存筛选，
+  降低空闲和浏览时的开销。
+- 复制、剪切、重命名、回收站、删除、编辑和预览会在执行前重新确认
+  文件身份，防止用户确认后目标被其他程序替换。
+- 收紧服务器清单和 SSH 检查：限制输出、清理超时进程、要求已知主机密钥，
+  并阻止旧检查结果覆盖新状态。
+- 新增仓库侧精确测试和结果记录校验，降低内部测试空跑、结果混用、重复写入
+  或失败历史丢失的风险。
 
 ## v1.1.0 更新重点
 

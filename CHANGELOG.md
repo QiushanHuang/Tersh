@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+No unreleased changes.
+
+## v1.1.1 - 2026-08-11
+
+Tersh v1.1.1 is a trust-and-usability release focused on safer file operations,
+lighter terminal rendering, clearer cluster diagnostics, and a consistent
+theme system for local, mobile, and SSH terminal workflows.
+
 ### Added
 
 - Added copy-conflict handling for existing targets, with explicit `replace` or `skip` confirmation before overwriting.
