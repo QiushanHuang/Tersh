@@ -91,6 +91,21 @@ fn trash_rejects_canonical_work_root() {
 }
 
 #[test]
+fn delete_and_trash_reject_work_root_ancestors() {
+    let parent = tempfile::tempdir().unwrap();
+    let work_root = parent.path().join("workspace");
+    std::fs::create_dir(&work_root).unwrap();
+    let parent_path = parent.path().canonicalize().unwrap();
+
+    let delete_err = permanent_delete(&parent_path, &work_root).unwrap_err();
+    let trash_err = trash_path(&parent_path, &work_root).unwrap_err();
+
+    assert!(delete_err.to_string().contains("active work root"));
+    assert!(trash_err.to_string().contains("active work root"));
+    assert!(work_root.exists());
+}
+
+#[test]
 fn delete_rejects_root_and_relative_paths() {
     let dir = tempfile::tempdir().unwrap();
 
@@ -233,6 +248,22 @@ fn rename_refuses_to_overwrite_existing_target() {
     assert!(err.to_string().contains("already exists"));
     assert!(source.exists());
     assert_eq!(std::fs::read_to_string(target).unwrap(), "target");
+}
+
+#[test]
+fn replace_refuses_to_remove_existing_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source.txt");
+    let target = dir.path().join("target-dir");
+    std::fs::write(&source, "source").unwrap();
+    std::fs::create_dir(&target).unwrap();
+    std::fs::write(target.join("kept.txt"), "kept").unwrap();
+
+    let err = copy_path(&source, &target, true).unwrap_err();
+
+    assert!(err.to_string().contains("replace directory"));
+    assert!(target.join("kept.txt").exists());
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), "source");
 }
 
 #[test]

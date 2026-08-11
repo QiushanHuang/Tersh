@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+No unreleased changes.
+
+## v1.1.1 - 2026-08-11
+
+Tersh v1.1.1 is a trust-and-usability release focused on safer file operations,
+lighter terminal rendering, clearer cluster diagnostics, and a consistent
+theme system for local, mobile, and SSH terminal workflows.
+
 ### Added
 
 - Added copy-conflict handling for existing targets, with explicit `replace` or `skip` confirmation before overwriting.
@@ -18,10 +26,14 @@
 
 ### Changed
 
+- Changed crate metadata to version `1.1.1`, declared Rust 1.88 as the current source MSRV, and updated install guidance to use the current git source with `--locked`.
 - Changed workbench and cluster event loops to dirty-driven rendering, reducing idle redraws while still repainting on input, resize, refresh, and probe updates.
 - Changed workbench and cluster chrome to share themed status chips, footer highlighting, selected-row styling, and warning/error emphasis.
 - Changed workbench and cluster rendering to use semantic panel-title, key/value, inactive, copy, cut, and search-match colors for stronger visual hierarchy without changing layout density.
 - Changed cluster resource bars to style filled and empty segments separately, making high-load metrics stand out while keeping ASCII bar characters for lightweight remote terminals.
+- Changed the TUI theme layer to use shared semantic `Tone` / `ChipTone` primitives for panel chrome, footer styling, key-value rows, and resource bars.
+- Changed workbench and cluster panels to distinguish active and inactive chrome, making the current work surface easier to scan without adding layout weight.
+- Changed compact workbench status to show the full copy/cut buffer label instead of a generic copy count.
 - Changed file preview caching from a single entry to a bounded LRU cache for faster adjacent-file navigation without retaining stale same-path previews.
 - Changed directory entries to cache lowercase names, reducing repeated allocation during filtering and sorting.
 - Changed file rows to show cursor, selection, and copy/cut buffer state in a fixed row marker so the active operation target is easier to scan.
@@ -32,6 +44,10 @@
 
 ### Fixed
 
+- Fixed stale-path hazards by storing and rechecking file identities for delayed copy, cut, rename, trash, and delete operations.
+- Fixed replace-copy behavior so existing directories are not recursively removed and existing file targets are preserved until the replacement is ready.
+- Fixed cluster probe execution so stdout and stderr are read through bounded pipes, SSH probes disable forwarding/local commands, and shell wrappers avoid login-shell startup files.
+- Fixed binary previews for files whose first control bytes appear after the initial detection window, and escaped typed destructive-confirmation text before rendering.
 - Fixed parallel test instability in probe temporary-file cleanup checks by isolating the probe-output tests from each other.
 - Hardened file operation race windows with source identity rechecks, no-follow regular-file opens, safer trash/delete target checks, no-clobber copy targets, and no-replace rename APIs where supported.
 - Fixed copy failure cleanup so failed regular-file and recursive-directory copies do not leave partial targets behind.

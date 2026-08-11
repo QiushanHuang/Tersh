@@ -74,7 +74,7 @@ fn version_reports_minor_release() {
     assert!(output.status.success());
 
     let stdout = String::from_utf8(output.stdout).expect("version output is utf-8");
-    assert!(stdout.contains("tersh 1.1.0"));
+    assert!(stdout.contains("tersh 1.1.1"));
 }
 
 #[test]

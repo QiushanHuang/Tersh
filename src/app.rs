@@ -126,6 +126,9 @@ pub struct App {
     sort_reverse: bool,
     preview_cache: VecDeque<CachedPreview>,
     pending_file_operation: Option<PendingFileOperation>,
+    pending_rename: Option<BufferedPath>,
+    pending_direct_targets: Option<Vec<BufferedPath>>,
+    pending_destructive_targets: Option<Vec<BufferedPath>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -142,7 +145,7 @@ enum TransferKind {
 #[derive(Debug, Clone)]
 struct TransferBuffer {
     kind: TransferKind,
-    paths: Vec<PathBuf>,
+    paths: Vec<BufferedPath>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,11 +157,85 @@ enum FileOperationSource {
 #[derive(Debug, Clone)]
 struct PendingFileOperation {
     kind: TransferKind,
-    paths: Vec<PathBuf>,
+    paths: Vec<BufferedPath>,
     destination: PathBuf,
     source: FileOperationSource,
     label: &'static str,
     allow_replace: bool,
+    approved_conflicts: Vec<BufferedPath>,
+}
+
+#[derive(Debug, Clone)]
+struct BufferedPath {
+    path: PathBuf,
+    identity: PathIdentity,
+}
+
+impl BufferedPath {
+    fn new(path: PathBuf) -> Result<Self> {
+        let identity = capture_path_identity(&path)?;
+        Ok(Self { path, identity })
+    }
+
+    fn from_entry(entry: &FileEntry) -> Self {
+        Self {
+            path: entry.path.clone(),
+            identity: PathIdentity::from_entry(entry),
+        }
+    }
+
+    fn ensure_current(&self) -> Result<()> {
+        ensure_path_identity(&self.path, &self.identity)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PathIdentity {
+    synthetic: bool,
+    is_dir: bool,
+    is_file: bool,
+    is_symlink: bool,
+    len: u64,
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+}
+
+impl PathIdentity {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+
+        Self {
+            synthetic: false,
+            is_dir: metadata.is_dir(),
+            is_file: metadata.is_file(),
+            is_symlink: metadata.file_type().is_symlink(),
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            dev: metadata.dev(),
+            #[cfg(unix)]
+            ino: metadata.ino(),
+        }
+    }
+
+    fn from_entry(entry: &FileEntry) -> Self {
+        Self {
+            synthetic: true,
+            is_dir: entry.kind == FileKind::Directory,
+            is_file: entry.kind == FileKind::File,
+            is_symlink: entry.kind == FileKind::Symlink,
+            len: entry.size,
+            modified: entry.modified,
+            #[cfg(unix)]
+            dev: 0,
+            #[cfg(unix)]
+            ino: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -256,6 +333,9 @@ impl App {
             sort_reverse: false,
             preview_cache: VecDeque::new(),
             pending_file_operation: None,
+            pending_rename: None,
+            pending_direct_targets: None,
+            pending_destructive_targets: None,
         };
         app.reload();
         if let Some(name) = initial.focus_name {
@@ -331,6 +411,9 @@ impl App {
             sort_reverse: false,
             preview_cache: VecDeque::new(),
             pending_file_operation: None,
+            pending_rename: None,
+            pending_direct_targets: None,
+            pending_destructive_targets: None,
         }
     }
 
@@ -356,12 +439,10 @@ impl App {
             }
             Command::OpenHelp => self.mode = Mode::Help,
             Command::Trash => {
-                self.mode = Mode::ConfirmTrash;
-                self.input.clear();
+                self.begin_destructive_confirmation(Mode::ConfirmTrash);
             }
             Command::PermanentDelete => {
-                self.mode = Mode::ConfirmDelete;
-                self.input.clear();
+                self.begin_destructive_confirmation(Mode::ConfirmDelete);
             }
             _ => {}
         }
@@ -440,34 +521,49 @@ impl App {
             Command::CopyRelativePath => self.copy_focused_relative_path(),
             Command::CopyAbsolutePath => self.copy_focused_absolute_path(),
             Command::CopyTo => {
+                self.pending_direct_targets = Some(self.capture_operation_targets("copy"));
                 self.mode = Mode::CopyTo;
                 self.input.clear();
+                self.pending_rename = None;
+                self.pending_destructive_targets = None;
             }
             Command::MoveTo => {
+                self.pending_direct_targets = Some(self.capture_operation_targets("move"));
                 self.mode = Mode::MoveTo;
                 self.input.clear();
+                self.pending_rename = None;
+                self.pending_destructive_targets = None;
             }
             Command::PreviewSearchNext => self.preview_search_next(),
             Command::PreviewSearchPrev => self.preview_search_prev(),
             Command::CycleSort => self.cycle_sort(),
             Command::ReverseSort => self.reverse_sort(),
             Command::Rename => {
-                if let Some(entry) = self.focused() {
-                    if let Some(name) = entry.raw_name.to_str() {
-                        self.input = name.to_string();
-                        self.mode = Mode::Rename;
-                    } else {
-                        self.log("rename unsupported for non-UTF-8 file name");
+                if let Some((path, name)) = self.focused().and_then(|entry| {
+                    entry
+                        .raw_name
+                        .to_str()
+                        .map(|name| (entry.path.clone(), name.to_string()))
+                }) {
+                    match BufferedPath::new(path) {
+                        Ok(buffered) => {
+                            self.pending_rename = Some(buffered);
+                            self.pending_direct_targets = None;
+                            self.pending_destructive_targets = None;
+                            self.input = name;
+                            self.mode = Mode::Rename;
+                        }
+                        Err(err) => self.log(format!("rename skipped: {err}")),
                     }
+                } else if self.focused().is_some() {
+                    self.log("rename unsupported for non-UTF-8 file name");
                 }
             }
             Command::Trash => {
-                self.mode = Mode::ConfirmTrash;
-                self.input.clear();
+                self.begin_destructive_confirmation(Mode::ConfirmTrash);
             }
             Command::PermanentDelete => {
-                self.mode = Mode::ConfirmDelete;
-                self.input.clear();
+                self.begin_destructive_confirmation(Mode::ConfirmDelete);
             }
             Command::Refresh => self.reload(),
             Command::OpenHelp | Command::Cancel | Command::Quit | Command::ForceQuit => {
@@ -660,7 +756,7 @@ impl App {
         let Some(buffer) = &self.transfer_buffer else {
             return " ";
         };
-        if !buffer.paths.iter().any(|candidate| candidate == path) {
+        if !buffer.paths.iter().any(|candidate| candidate.path == path) {
             return " ";
         }
         match buffer.kind {
@@ -749,11 +845,11 @@ impl App {
     }
 
     pub fn operation_target_count(&self) -> usize {
-        self.operation_targets().len()
+        self.operation_target_paths_for_display().len()
     }
 
     pub fn operation_target_first(&self) -> Option<PathBuf> {
-        self.operation_targets().into_iter().next()
+        self.operation_target_paths_for_display().into_iter().next()
     }
 
     pub fn operation_target_source(&self) -> &'static str {
@@ -765,7 +861,7 @@ impl App {
     }
 
     pub fn operation_target_labels(&self, limit: usize) -> Vec<String> {
-        self.operation_targets()
+        self.operation_target_paths_for_display()
             .into_iter()
             .take(limit)
             .map(|path| crate::fs_core::display_path(&path))
@@ -1011,8 +1107,19 @@ impl App {
             return;
         }
         let path = entry.path.clone();
+        let identity = match capture_path_identity(&path) {
+            Ok(identity) => identity,
+            Err(err) => {
+                self.log(format!("can only edit regular files: {err}"));
+                return;
+            }
+        };
         if let Err(err) = validate_editor_target(&path) {
             self.log(format!("can only edit regular files: {err}"));
+            return;
+        }
+        if let Err(err) = ensure_path_identity(&path, &identity) {
+            self.log(format!("edit failed: {err}"));
             return;
         }
         match self.launch_editor(&path) {
@@ -1164,8 +1271,21 @@ impl App {
         }
     }
 
+    fn begin_destructive_confirmation(&mut self, mode: Mode) {
+        let action = match mode {
+            Mode::ConfirmTrash => "trash",
+            Mode::ConfirmDelete => "delete",
+            _ => "operation",
+        };
+        self.pending_destructive_targets = Some(self.capture_operation_targets(action));
+        self.pending_rename = None;
+        self.pending_direct_targets = None;
+        self.mode = mode;
+        self.input.clear();
+    }
+
     fn copy_selection(&mut self) {
-        let paths = self.operation_targets();
+        let paths = self.capture_operation_targets("copy");
         let len = paths.len();
         self.transfer_buffer = Some(TransferBuffer {
             kind: TransferKind::Copy,
@@ -1175,7 +1295,7 @@ impl App {
     }
 
     fn cut_selection(&mut self) {
-        let paths = self.operation_targets();
+        let paths = self.capture_operation_targets("cut");
         let len = paths.len();
         self.transfer_buffer = Some(TransferBuffer {
             kind: TransferKind::Cut,
@@ -1196,6 +1316,7 @@ impl App {
             source: FileOperationSource::TransferBuffer,
             label: "pasted",
             allow_replace: buffer.kind == TransferKind::Copy,
+            approved_conflicts: Vec::new(),
         };
         self.start_file_operation(operation);
     }
@@ -1205,6 +1326,7 @@ impl App {
             Ok(path) => path,
             Err(err) => {
                 self.log(format!("destination rejected: {err}"));
+                self.pending_direct_targets = None;
                 self.mode = Mode::Normal;
                 self.input.clear();
                 return;
@@ -1217,11 +1339,14 @@ impl App {
         };
         let operation = PendingFileOperation {
             kind,
-            paths: self.operation_targets(),
+            paths: self.pending_direct_targets.take().unwrap_or_else(|| {
+                self.capture_operation_targets(if move_items { "move" } else { "copy" })
+            }),
             destination,
             source: FileOperationSource::Direct,
             label: if move_items { "moved" } else { "copied" },
             allow_replace: !move_items,
+            approved_conflicts: Vec::new(),
         };
         self.start_file_operation(operation);
     }
@@ -1233,6 +1358,17 @@ impl App {
                 self.execute_file_operation(operation, false, true);
                 return;
             }
+            let mut operation = operation;
+            operation.approved_conflicts = conflicts
+                .iter()
+                .filter_map(|target| match BufferedPath::new(target.clone()) {
+                    Ok(buffered) => Some(buffered),
+                    Err(err) => {
+                        self.log(format!("{} skipped: {err}", operation.label));
+                        None
+                    }
+                })
+                .collect();
             self.log(format!("{} conflict(s)", conflicts.len()));
             self.pending_file_operation = Some(operation);
             self.mode = Mode::Conflict;
@@ -1280,7 +1416,7 @@ impl App {
         let mut skipped = 0;
         let mut failed_cut_paths = Vec::new();
         for source in &operation.paths {
-            let target = match destination_for_paste(source, &operation.destination) {
+            let target = match destination_for_paste(&source.path, &operation.destination) {
                 Ok(target) => target,
                 Err(err) => {
                     self.log(format!("{} skipped: {err}", operation.label));
@@ -1296,9 +1432,31 @@ impl App {
                 }
                 continue;
             }
+            if let Err(err) = source.ensure_current() {
+                self.log(format!("{} skipped: {err}", operation.label));
+                continue;
+            }
+            if replace_existing && target_exists(&target) {
+                let Some(conflict) = operation
+                    .approved_conflicts
+                    .iter()
+                    .find(|conflict| conflict.path == target)
+                else {
+                    self.log(format!(
+                        "{} skipped: target changed during operation: {}",
+                        operation.label,
+                        crate::fs_core::display_path(&target)
+                    ));
+                    continue;
+                };
+                if let Err(err) = conflict.ensure_current() {
+                    self.log(format!("{} skipped: {err}", operation.label));
+                    continue;
+                }
+            }
             let result = match operation.kind {
-                TransferKind::Copy => copy_path(source, &target, replace_existing),
-                TransferKind::Cut => rename_path(source, &target),
+                TransferKind::Copy => copy_path(&source.path, &target, replace_existing),
+                TransferKind::Cut => rename_path(&source.path, &target),
             };
             match result {
                 Ok(()) => completed += 1,
@@ -1337,7 +1495,7 @@ impl App {
         operation
             .paths
             .iter()
-            .filter_map(|source| destination_for_paste(source, &operation.destination).ok())
+            .filter_map(|source| destination_for_paste(&source.path, &operation.destination).ok())
             .filter(|target| target_exists(target))
             .collect()
     }
@@ -1376,7 +1534,10 @@ impl App {
     }
 
     fn submit_rename(&mut self) {
-        let Some(entry) = self.focused() else {
+        let Some(source) = self.pending_rename.take().or_else(|| {
+            self.focused()
+                .and_then(|entry| BufferedPath::new(entry.path.clone()).ok())
+        }) else {
             self.mode = Mode::Normal;
             return;
         };
@@ -1388,7 +1549,10 @@ impl App {
             return;
         }
         let target = self.cwd.join(new_name);
-        match rename_path(&entry.path, &target) {
+        match source
+            .ensure_current()
+            .and_then(|()| rename_path(&source.path, &target))
+        {
             Ok(()) => self.log("renamed item"),
             Err(err) => self.log(format!("rename failed: {err}")),
         }
@@ -1416,10 +1580,16 @@ impl App {
     }
 
     fn submit_trash(&mut self) {
-        let targets = self.operation_targets();
+        let targets = self
+            .pending_destructive_targets
+            .take()
+            .unwrap_or_else(|| self.capture_operation_targets("trash"));
         let mut moved = 0;
         for target in targets {
-            match trash_path(&target, &self.work_root) {
+            match target
+                .ensure_current()
+                .and_then(|()| trash_path(&target.path, &self.work_root))
+            {
                 Ok(_) => moved += 1,
                 Err(err) => self.log(format!("trash failed: {err}")),
             }
@@ -1432,10 +1602,16 @@ impl App {
     }
 
     fn submit_delete(&mut self) {
-        let targets = self.operation_targets();
+        let targets = self
+            .pending_destructive_targets
+            .take()
+            .unwrap_or_else(|| self.capture_operation_targets("delete"));
         let mut deleted = 0;
         for target in targets {
-            match permanent_delete(&target, &self.work_root) {
+            match target
+                .ensure_current()
+                .and_then(|()| permanent_delete(&target.path, &self.work_root))
+            {
                 Ok(_) => deleted += 1,
                 Err(err) => self.log(format!("delete failed: {err}")),
             }
@@ -1472,6 +1648,9 @@ impl App {
     fn cancel(&mut self) {
         self.pending_g = false;
         self.pending_y = false;
+        self.pending_rename = None;
+        self.pending_destructive_targets = None;
+        self.pending_file_operation = None;
         match self.mode {
             Mode::Normal => {
                 self.selected.clear();
@@ -1496,6 +1675,39 @@ impl App {
                 .map(|entry| vec![entry.path.clone()])
                 .unwrap_or_default()
         }
+    }
+
+    fn operation_target_paths_for_display(&self) -> Vec<PathBuf> {
+        if matches!(self.mode, Mode::ConfirmTrash | Mode::ConfirmDelete)
+            && let Some(targets) = &self.pending_destructive_targets
+        {
+            return targets.iter().map(|target| target.path.clone()).collect();
+        }
+        self.operation_targets()
+    }
+
+    fn capture_operation_targets(&mut self, action: &str) -> Vec<BufferedPath> {
+        let mut buffered = Vec::new();
+        for path in self.operation_targets() {
+            match BufferedPath::new(path.clone()) {
+                Ok(target) => buffered.push(target),
+                Err(err) => {
+                    if let Some(entry) = self.entry_for_path(&path) {
+                        buffered.push(BufferedPath::from_entry(entry));
+                    } else {
+                        self.log(format!("{action} skipped: {err}"));
+                    }
+                }
+            }
+        }
+        buffered
+    }
+
+    fn entry_for_path(&self, path: &Path) -> Option<&FileEntry> {
+        self.entries
+            .iter()
+            .chain(self.all_entries.iter())
+            .find(|entry| entry.path == path)
     }
 
     fn focused(&self) -> Option<&FileEntry> {
@@ -1708,6 +1920,23 @@ fn target_exists(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok()
 }
 
+fn capture_path_identity(path: &Path) -> Result<PathIdentity> {
+    fs::symlink_metadata(path)
+        .map(|metadata| PathIdentity::from_metadata(&metadata))
+        .with_context(|| format!("failed to inspect {}", crate::fs_core::display_path(path)))
+}
+
+fn ensure_path_identity(path: &Path, expected: &PathIdentity) -> Result<()> {
+    let actual = capture_path_identity(path)?;
+    if &actual != expected {
+        anyhow::bail!(
+            "path changed during operation: {}",
+            crate::fs_core::display_path(path)
+        );
+    }
+    Ok(())
+}
+
 fn preview_cache_bytes(preview: &Preview) -> usize {
     preview.path.as_os_str().len() + preview.lines.iter().map(|line| line.len()).sum::<usize>()
 }
@@ -1773,7 +2002,7 @@ fn open_editor_target_no_follow(path: &Path) -> Result<fs::File> {
 
     fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
         .with_context(|| format!("failed to open {}", crate::fs_core::display_path(path)))
 }
@@ -1805,10 +2034,9 @@ fn expand_path(input: &str) -> PathBuf {
     if let Some((user, rest)) = input.split_once('/')
         && user.starts_with('~')
         && user.len() > 1
+        && let Some(home) = expand_user_home(user)
     {
-        if let Some(home) = expand_user_home(user) {
-            return home.join(rest);
-        }
+        return home.join(rest);
     }
     if input.starts_with('~')
         && input.len() > 1

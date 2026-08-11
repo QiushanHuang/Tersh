@@ -117,6 +117,14 @@ fn ssh_probe_args_are_non_interactive_and_use_configured_proxy_jump() {
     assert!(args.windows(2).any(|pair| pair == ["-o", "BatchMode=yes"]));
     assert!(
         args.windows(2)
+            .any(|pair| pair == ["-o", "ClearAllForwardings=yes"])
+    );
+    assert!(
+        args.windows(2)
+            .any(|pair| pair == ["-o", "PermitLocalCommand=no"])
+    );
+    assert!(
+        args.windows(2)
             .any(|pair| pair == ["-o", "ConnectTimeout=3"])
     );
     assert!(
@@ -198,10 +206,32 @@ fn host_workbench_command_opens_local_or_remote_tersh() {
     );
     assert!(args.iter().any(|arg| arg == "star@10.13.7.138"));
     assert!(args.last().unwrap().contains("command -v tersh"));
+    assert!(args.last().unwrap().contains("$HOME/.cargo/bin"));
+    assert!(args.last().unwrap().contains("/usr/local/cuda/bin"));
     assert!(args.last().unwrap().contains("tersh is not installed"));
     assert!(args.last().unwrap().contains("exec tersh"));
     assert!(args.last().unwrap().contains("/srv/star"));
+    assert!(!args.last().unwrap().contains("sh -lc"));
     assert!(!args.windows(2).any(|pair| pair == ["-o", "BatchMode=yes"]));
+}
+
+#[test]
+fn local_workbench_command_separates_workdir_from_flags() {
+    let inventory = ClusterInventory::from_json(
+        r#"{
+          "main_machine": {
+            "alias": "local",
+            "tailscale_ip": "127.0.0.1",
+            "workdir": "-looks-like-flag"
+          }
+        }"#,
+    )
+    .unwrap();
+    let local = inventory.hosts().first().unwrap();
+
+    let command = host_workbench_command(local, "/tmp/current-tersh");
+
+    assert_eq!(command.args(), ["--", "-looks-like-flag"]);
 }
 
 #[test]
@@ -965,6 +995,35 @@ fn cluster_render_resource_bars_keep_none_gpu_neutral_and_parse_free_memory() {
         .collect::<String>();
     assert!(buffer.contains("Memory: [######----]  58% used  42% free"));
     assert!(buffer.contains("GPU: [----------]  --  none"));
+}
+
+#[test]
+fn cluster_render_parses_nvidia_smi_nounits_gpu_utilization() {
+    let inventory = ClusterInventory::from_json(DIRECT_JSON).unwrap();
+    let mut app = ClusterApp::new(inventory.hosts().to_vec());
+    app.apply_snapshot(HostSnapshot::online(
+        "direct-box",
+        ProbeReport::parse(
+            "hostname=direct\nload=0.12 0.20 0.30\nmemory=512/1024 MB (50%)\nstorage=8G/20G 40% used\ntasks=72 processes\ngpu=A100, 11, 2048, 40960\n",
+        ),
+        42,
+    ));
+
+    let backend = TestBackend::new(120, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| cluster_ui::draw(frame, &app))
+        .unwrap();
+
+    let buffer = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(buffer.contains("GPU"));
+    assert!(buffer.contains("11%"));
 }
 
 #[test]

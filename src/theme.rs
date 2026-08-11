@@ -2,7 +2,7 @@ use ratatui::{
     style::{Color, Modifier, Style},
     symbols::border,
     text::{Line, Span},
-    widgets::Block,
+    widgets::{Block, Borders, Paragraph},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +34,40 @@ pub struct Palette {
     pub search_match: Color,
     pub selected_bg: Color,
     pub selected_fg: Color,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tone {
+    Text,
+    Muted,
+    Key,
+    Value,
+    Path,
+    Title,
+    Separator,
+    Ok,
+    Warn,
+    Danger,
+    Accent,
+    AccentAlt,
+    Active,
+    Inactive,
+    Copy,
+    Cut,
+    SearchMatch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChipTone {
+    Ok,
+    Warn,
+    Danger,
+    Accent,
+    AccentAlt,
+    Muted,
+    Path,
+    Copy,
+    Cut,
 }
 
 const ASCII_BORDER: border::Set = border::Set {
@@ -179,6 +213,37 @@ impl Theme {
         }
     }
 
+    pub fn color(self, tone: Tone) -> Color {
+        let palette = self.palette();
+        match tone {
+            Tone::Text => palette.text,
+            Tone::Muted => palette.muted,
+            Tone::Key => palette.key,
+            Tone::Value => palette.value,
+            Tone::Path => palette.path,
+            Tone::Title => palette.panel_title,
+            Tone::Separator => palette.separator,
+            Tone::Ok => palette.ok,
+            Tone::Warn => palette.warn,
+            Tone::Danger => palette.danger,
+            Tone::Accent => palette.accent,
+            Tone::AccentAlt => palette.accent_alt,
+            Tone::Active => palette.active,
+            Tone::Inactive => palette.inactive,
+            Tone::Copy => palette.copy,
+            Tone::Cut => palette.cut,
+            Tone::SearchMatch => palette.search_match,
+        }
+    }
+
+    pub fn style(self, tone: Tone) -> Style {
+        self.fg(self.color(tone))
+    }
+
+    pub fn bold(self, tone: Tone) -> Style {
+        self.style(tone).add_modifier(Modifier::BOLD)
+    }
+
     pub fn fg_bold(self, color: Color) -> Style {
         self.fg(color).add_modifier(Modifier::BOLD)
     }
@@ -188,6 +253,11 @@ impl Theme {
             Self::Mono => Style::default().add_modifier(Modifier::BOLD),
             _ => Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD),
         }
+    }
+
+    pub fn chip_tone(self, tone: ChipTone) -> Style {
+        let palette = self.palette();
+        self.chip(palette.text, self.color(tone.tone()))
     }
 
     pub fn selected(self) -> Style {
@@ -213,15 +283,43 @@ impl Theme {
     }
 }
 
+impl ChipTone {
+    fn tone(self) -> Tone {
+        match self {
+            Self::Ok => Tone::Ok,
+            Self::Warn => Tone::Warn,
+            Self::Danger => Tone::Danger,
+            Self::Accent => Tone::Accent,
+            Self::AccentAlt => Tone::AccentAlt,
+            Self::Muted => Tone::Muted,
+            Self::Path => Tone::Path,
+            Self::Copy => Tone::Copy,
+            Self::Cut => Tone::Cut,
+        }
+    }
+}
+
 pub fn base_block() -> Block<'static> {
     Block::default().border_set(border_set())
 }
 
 pub fn panel_title(theme: Theme, title: impl Into<String>) -> Line<'static> {
-    Line::from(Span::styled(
-        title.into(),
-        theme.fg_bold(theme.palette().panel_title),
-    ))
+    panel_title_with_tone(theme, title, Tone::Title)
+}
+
+pub fn panel_title_with_tone(theme: Theme, title: impl Into<String>, tone: Tone) -> Line<'static> {
+    Line::from(Span::styled(title.into(), theme.bold(tone)))
+}
+
+pub fn panel_block(theme: Theme, title: impl Into<String>, tone: Tone) -> Block<'static> {
+    base_block()
+        .title(panel_title_with_tone(theme, title, tone))
+        .borders(Borders::ALL)
+        .border_style(theme.style(tone))
+}
+
+pub fn modal_block(theme: Theme, title: impl Into<String>, tone: Tone) -> Block<'static> {
+    panel_block(theme, title, tone)
 }
 
 pub fn border_set() -> border::Set {
@@ -248,37 +346,79 @@ pub fn footer_compact(width: u16, threshold: u16) -> bool {
     }
 }
 
+pub fn section_line(theme: Theme, label: &'static str) -> Line<'static> {
+    Line::from(Span::styled(label, theme.bold(Tone::Title)))
+}
+
+pub fn kv_line(theme: Theme, key: &'static str, value: impl Into<String>) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{key}: "), theme.style(Tone::Key)),
+        Span::styled(value.into(), theme.style(Tone::Value)),
+    ])
+}
+
 pub fn footer_line(theme: Theme, text: &str) -> Line<'static> {
-    let palette = theme.palette();
     let mut spans = Vec::new();
     for (index, raw_segment) in text.split('|').enumerate() {
         if index > 0 {
-            spans.push(Span::styled(" | ", theme.fg(palette.separator)));
+            spans.push(Span::styled(" | ", theme.style(Tone::Separator)));
         }
         let segment = raw_segment.trim().to_string();
         let lower = segment.to_ascii_lowercase();
         let style = if index == 0 {
-            theme.chip(palette.text, palette.accent)
+            theme.chip_tone(ChipTone::Accent)
         } else if lower.contains("^c")
             || lower.contains("delete")
             || lower.contains("danger")
             || lower.contains("force")
         {
-            theme.fg_bold(palette.danger)
+            theme.bold(Tone::Danger)
         } else if lower.contains("^g")
             || lower.contains("esc")
             || lower.contains("cancel")
             || lower.contains("back")
         {
-            theme.fg(palette.warn)
+            theme.style(Tone::Warn)
         } else if lower.starts_with("next:") {
-            theme.fg_bold(palette.ok)
+            theme.bold(Tone::Ok)
         } else {
-            theme.fg(palette.muted)
+            theme.style(Tone::Muted)
         };
         spans.push(Span::styled(segment, style));
     }
     Line::from(spans)
+}
+
+pub fn footer_paragraph(theme: Theme, text: &str) -> Paragraph<'static> {
+    Paragraph::new(footer_line(theme, text)).block(base_block().borders(Borders::TOP))
+}
+
+pub fn resource_bar(theme: Theme, percent: Option<u16>, width: usize) -> Vec<Span<'static>> {
+    let filled = percent
+        .map(|value| ((clamp_percent(value) as usize * width) + 50) / 100)
+        .unwrap_or(0)
+        .min(width);
+    let empty = width.saturating_sub(filled);
+    let filled_tone = percent.map(metric_tone).unwrap_or(Tone::Muted);
+
+    vec![
+        Span::raw("["),
+        Span::styled("#".repeat(filled), theme.style(filled_tone)),
+        Span::styled("-".repeat(empty), theme.style(Tone::Inactive)),
+        Span::raw("]"),
+    ]
+}
+
+fn metric_tone(percent: u16) -> Tone {
+    match clamp_percent(percent) {
+        0..=69 => Tone::Ok,
+        70..=89 => Tone::Warn,
+        _ => Tone::Danger,
+    }
+}
+
+fn clamp_percent(value: u16) -> u16 {
+    value.min(100)
 }
 
 pub fn chip(label: &str, value: impl std::fmt::Display, style: Style) -> Span<'static> {
