@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import os
+import pathlib
 import socket
+import tempfile
 import threading
 import time
 from typing import Any
@@ -303,6 +306,7 @@ class AppendPlatformHostModel:
             "authorities": {},
             "failure_observations": {},
             "unresolved_findings": {},
+            "projection_policy": None,
             "next_id": 1,
             "next_connection_generation": 1,
         }
@@ -638,6 +642,51 @@ class AppendPlatformHostModel:
                 raise core.EvidenceError("attempt binding is unknown")
             shadow = copy.deepcopy(self._state)
             shadow["unresolved_findings"][attempt_binding_id] = ordered
+            self._state = shadow
+
+    @staticmethod
+    def _directory_identity(path: pathlib.Path) -> dict[str, Any]:
+        stat_result = path.stat(follow_symlinks=False)
+        if not path.is_dir() or path.is_symlink():
+            raise core.EvidenceError("projection capability must name a real directory")
+        return {
+            "path": str(path),
+            "device": stat_result.st_dev,
+            "inode": stat_result.st_ino,
+            "mode": stat_result.st_mode & 0o7777,
+            "owner_uid": stat_result.st_uid,
+        }
+
+    def install_projection_policy(
+        self,
+        *,
+        formal_root: os.PathLike[str] | str,
+        staging_root: os.PathLike[str] | str,
+        candidate_root: os.PathLike[str] | str,
+    ) -> None:
+        formal = pathlib.Path(formal_root).resolve(strict=True)
+        staging = pathlib.Path(staging_root).resolve(strict=True)
+        candidate = pathlib.Path(candidate_root).resolve(strict=True)
+        if formal == candidate or candidate in formal.parents:
+            raise core.EvidenceError("formal projection root is inside candidate tree")
+        if formal == staging:
+            raise core.EvidenceError("formal and staging capabilities must be disjoint")
+        formal_identity = self._directory_identity(formal)
+        staging_identity = self._directory_identity(staging)
+        candidate_identity = self._directory_identity(candidate)
+        if formal_identity["device"] != staging_identity["device"]:
+            raise core.EvidenceError("projection staging must share the formal filesystem")
+        if formal_identity["mode"] & 0o022 or staging_identity["mode"] & 0o022:
+            raise core.EvidenceError("projection capabilities must not be group/world writable")
+        with self._ledger_lock:
+            if self._state["projection_policy"] is not None:
+                raise core.EvidenceError("projection policy is immutable")
+            shadow = copy.deepcopy(self._state)
+            shadow["projection_policy"] = {
+                "formal_root": formal_identity,
+                "staging_root": staging_identity,
+                "candidate_root": candidate_identity,
+            }
             self._state = shadow
 
     def force_live_capability_for_test(self, lineage_id: str, handle_id: str) -> None:
@@ -2307,6 +2356,173 @@ class AppendPlatformHostModel:
             "state": "ready",
         }
 
+    def _validate_projection_policy_identity(self) -> tuple[pathlib.Path, pathlib.Path]:
+        policy = self._state["projection_policy"]
+        if policy is None:
+            raise core.EvidenceError("projection policy is not installed")
+        formal = pathlib.Path(policy["formal_root"]["path"])
+        staging = pathlib.Path(policy["staging_root"]["path"])
+        if self._directory_identity(formal) != policy["formal_root"]:
+            raise core.EvidenceError("formal projection capability identity drifted")
+        if self._directory_identity(staging) != policy["staging_root"]:
+            raise core.EvidenceError("staging projection capability identity drifted")
+        return formal, staging
+
+    @staticmethod
+    def _projection_destination_leaf(
+        formal_root: pathlib.Path,
+        destination: str,
+    ) -> pathlib.Path:
+        relative = pathlib.PurePosixPath(destination)
+        if relative.is_absolute() or not relative.parts or any(
+            part in {"", ".", ".."} for part in relative.parts
+        ):
+            raise core.EvidenceError("projection destination is not canonical relative")
+        leaf = formal_root.joinpath(*relative.parts)
+        parent = formal_root
+        for part in relative.parts[:-1]:
+            parent = parent / part
+            if parent.exists():
+                if parent.is_symlink() or not parent.is_dir():
+                    raise core.EvidenceError("projection parent collides with non-directory")
+            else:
+                parent.mkdir(mode=0o700)
+        return leaf
+
+    def _publish_projection_leaf(
+        self,
+        *,
+        formal_root: pathlib.Path,
+        staging_root: pathlib.Path,
+        destination: str,
+        body_bytes: bytes,
+        fault_at: str | None,
+    ) -> str:
+        leaf = self._projection_destination_leaf(formal_root, destination)
+        if leaf.exists() or leaf.is_symlink():
+            if leaf.is_symlink() or not leaf.is_file():
+                raise core.EvidenceError("projection leaf collision is not repairable")
+            if leaf.read_bytes() != body_bytes:
+                raise core.EvidenceError("projection mismatch is not repairable")
+            return "existing"
+        if fault_at == "projection.before-staging-create":
+            raise core.EvidenceError("injected projection fault before staging")
+        descriptor, staging_name = tempfile.mkstemp(
+            prefix="projection-",
+            dir=staging_root,
+        )
+        staging_path = pathlib.Path(staging_name)
+        try:
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "wb", closefd=True) as stream:
+                descriptor = -1
+                stream.write(body_bytes)
+                stream.flush()
+                os.fsync(stream.fileno())
+            if fault_at == "projection.after-staging-fsync":
+                raise core.EvidenceError("injected projection fault after staging")
+            if fault_at == "projection.before-final-link":
+                raise core.EvidenceError("injected projection fault before final link")
+            try:
+                os.link(staging_path, leaf)
+            except FileExistsError:
+                if leaf.is_symlink() or not leaf.is_file() or leaf.read_bytes() != body_bytes:
+                    raise core.EvidenceError("projection link collision is not repairable")
+            if fault_at == "projection.after-final-link-before-directory-fsync":
+                raise core.EvidenceError("injected projection fault after final link")
+            directory_fd = os.open(leaf.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+            if fault_at == "projection.after-fsync":
+                raise core.EvidenceError("injected projection fault after fsync")
+            return "published"
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            try:
+                staging_path.unlink()
+            except FileNotFoundError:
+                pass
+
+    def _repair_projections(
+        self,
+        request: Any,
+        *,
+        fault_at: str | None,
+    ) -> dict[str, Any]:
+        value = _require_closed_object(
+            request,
+            {"schema", "attempt_binding_id"},
+            "repair projections request",
+        )
+        _require_literal(
+            value["schema"],
+            "tersh-host-repair-projections-request-v1",
+            "repair projections schema",
+        )
+        attempt_id = core.validate_sha256(
+            value["attempt_binding_id"], "attempt binding ID"
+        )
+        if attempt_id not in self._state["attempts"]:
+            raise core.EvidenceError("projection attempt is unknown")
+        allowed_faults = {
+            "projection.before-staging-create",
+            "projection.after-staging-fsync",
+            "projection.before-final-link",
+            "projection.after-final-link-before-directory-fsync",
+            "projection.after-fsync",
+            "projection.before-reply",
+        }
+        if fault_at is not None and fault_at not in allowed_faults:
+            raise core.EvidenceError("unknown projection fault point")
+        formal, staging = self._validate_projection_policy_identity()
+        selected = [
+            receipt
+            for receipt in self._state["receipts"]
+            if receipt["attempt_binding_id"] == attempt_id
+        ]
+        if not selected:
+            raise core.EvidenceError("projection attempt has no receipt-backed record")
+        published = 0
+        repaired = 0
+        for receipt in selected:
+            records = [
+                record
+                for record in self._state["records"]
+                if record.get("receipt_id") == receipt["receipt_id"]
+            ]
+            if len(records) != 1:
+                raise core.EvidenceError("projection receipt does not join one Host blob")
+            record = records[0]
+            body_bytes = record.get("body_bytes")
+            if type(body_bytes) is not bytes:
+                body_bytes = core.canonical_json_bytes(record["body"])
+            leaf = self._projection_destination_leaf(formal, receipt["destination"])
+            was_missing = not leaf.exists() and not leaf.is_symlink()
+            outcome = self._publish_projection_leaf(
+                formal_root=formal,
+                staging_root=staging,
+                destination=receipt["destination"],
+                body_bytes=body_bytes,
+                fault_at=fault_at,
+            )
+            if outcome == "published":
+                published += 1
+                if was_missing:
+                    repaired += 1
+        result = {
+            "schema": "tersh-host-repair-projections-result-v1",
+            "attempt_binding_id": attempt_id,
+            "selected": len(selected),
+            "published": published,
+            "repaired": repaired,
+        }
+        if fault_at == "projection.before-reply":
+            raise core.EvidenceError("injected projection lost reply")
+        return result
+
     def enumerate_attempt(self, attempt_binding_id: str) -> dict[str, Any]:
         attempt = self._state["attempts"].get(attempt_binding_id)
         if attempt is None:
@@ -2341,6 +2557,8 @@ class AppendPlatformHostModel:
                 return self._close_superseded_attempt(request)
             if operation == "open-successor-attempt":
                 return self._open_successor_attempt(request)
+            if operation == "repair-projections":
+                return self._repair_projections(request, fault_at=fault_at)
             if operation == "enumerate-attempt":
                 if type(request) is not dict or set(request) != {"attempt_binding_id"}:
                     raise core.EvidenceError("enumerate-attempt request must be exact")

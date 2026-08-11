@@ -9,6 +9,7 @@ import pathlib
 import re
 import socket
 import struct
+import tempfile
 import threading
 import time
 import unittest
@@ -5615,6 +5616,143 @@ class AppendPlatformBarrierTests(unittest.TestCase):
             model.snapshot()["attempts"][fixture["session"]["attempt_binding_id"]]["state"],
             "TERMINAL_FAILED",
         )
+
+
+class AppendPlatformProjectionTests(unittest.TestCase):
+    FAULTS = (
+        "projection.before-staging-create",
+        "projection.after-staging-fsync",
+        "projection.before-final-link",
+        "projection.after-final-link-before-directory-fsync",
+        "projection.after-fsync",
+        "projection.before-reply",
+    )
+
+    def prepared(self, root, *, reported_record_sha256="e" * 64):
+        helper = AppendPlatformAtomicityTests(methodName="runTest")
+        core, _, model, fixture, _, _, connection, lease = helper.ready_model(
+            reported_record_sha256=reported_record_sha256
+        )
+        root_path = pathlib.Path(root)
+        candidate = root_path / "candidate"
+        formal = root_path / "formal"
+        staging = root_path / "staging"
+        for path in (candidate, formal, staging):
+            path.mkdir()
+        formal.chmod(0o700)
+        staging.chmod(0o700)
+        model.install_projection_policy(
+            formal_root=formal,
+            staging_root=staging,
+            candidate_root=candidate,
+        )
+        model.append_platform(
+            lease,
+            connection=connection,
+            transaction_nonce="5" * 64,
+        )
+        return core, model, fixture, formal, staging
+
+    @staticmethod
+    def repair_request(fixture):
+        return {
+            "schema": "tersh-host-repair-projections-request-v1",
+            "attempt_binding_id": fixture["session"]["attempt_binding_id"],
+        }
+
+    def repair(self, model, fixture, *, fault_at=None):
+        return model.invoke_root_internal(
+            "repair-projections",
+            self.repair_request(fixture),
+            principal=model.ROOT_SUPERVISOR_PRINCIPAL,
+            fault_at=fault_at,
+        )
+
+    def test_append_platform_prelinearization_retry_and_postlinearization_lost_reply_repair(self):
+        with tempfile.TemporaryDirectory() as root:
+            _, model, fixture, formal, _ = self.prepared(root)
+            self.assertEqual(list(formal.rglob("*.json")), [])
+            result = self.repair(model, fixture)
+            self.assertEqual(result["published"], 1)
+            leaves = list(formal.rglob("*.json"))
+            self.assertEqual(len(leaves), 1)
+            leaves[0].unlink()
+            repaired = self.repair(model, fixture)
+            self.assertEqual(repaired["repaired"], 1)
+            self.assertEqual(len(list(formal.rglob("*.json"))), 1)
+
+    def test_host_projects_exact_committed_blob_and_repairs_only_a_missing_projection(self):
+        with tempfile.TemporaryDirectory() as root:
+            _, model, fixture, formal, _ = self.prepared(root)
+            self.repair(model, fixture)
+            snapshot = model.snapshot()
+            record = snapshot["records"][0]
+            leaf = formal / snapshot["receipts"][0]["destination"]
+            self.assertEqual(leaf.read_bytes(), record["body_bytes"])
+            leaf.unlink()
+            self.repair(model, fixture)
+            self.assertEqual(leaf.read_bytes(), record["body_bytes"])
+
+    def test_formal_projection_root_has_no_candidate_writable_ancestor_or_collision_race(self):
+        host_module = importlib.import_module(
+            "scripts.tests.append_platform_host_model"
+        )
+        core = importlib.import_module("scripts.evidence_core")
+        with tempfile.TemporaryDirectory() as root:
+            root_path = pathlib.Path(root)
+            candidate = root_path / "candidate"
+            candidate.mkdir()
+            nested = candidate / "formal"
+            nested.mkdir()
+            staging = root_path / "staging"
+            staging.mkdir()
+            model = host_module.AppendPlatformHostModel()
+            with self.assertRaises(core.EvidenceError):
+                model.install_projection_policy(
+                    formal_root=nested,
+                    staging_root=staging,
+                    candidate_root=candidate,
+                )
+
+            formal = root_path / "formal"
+            formal.mkdir()
+            model.install_projection_policy(
+                formal_root=formal,
+                staging_root=staging,
+                candidate_root=candidate,
+            )
+            policy = model.snapshot()["projection_policy"]
+            self.assertEqual(policy["formal_root"]["path"], str(formal.resolve()))
+            self.assertNotEqual(policy["formal_root"]["inode"], policy["staging_root"]["inode"])
+
+    def test_projection_fault_matrix_yields_only_absent_or_exact_committed_leaf(self):
+        for fault_id in self.FAULTS:
+            with self.subTest(fault_id=fault_id), tempfile.TemporaryDirectory() as root:
+                core, model, fixture, formal, _ = self.prepared(root)
+                try:
+                    self.repair(model, fixture, fault_at=fault_id)
+                except core.EvidenceError:
+                    pass
+                snapshot = model.snapshot()
+                leaf = formal / snapshot["receipts"][0]["destination"]
+                if leaf.exists():
+                    self.assertEqual(leaf.read_bytes(), snapshot["records"][0]["body_bytes"])
+                self.assertFalse(any(path.name.startswith(".tmp-") for path in formal.rglob("*")))
+
+    def test_repair_never_replaces_mismatch_or_appends_receipt_or_authority(self):
+        with tempfile.TemporaryDirectory() as root:
+            core, model, fixture, formal, _ = self.prepared(root)
+            self.repair(model, fixture)
+            snapshot = model.snapshot()
+            leaf = formal / snapshot["receipts"][0]["destination"]
+            leaf.write_bytes(b"mismatch\n")
+            before = model.snapshot()
+            with self.assertRaises(core.EvidenceError):
+                self.repair(model, fixture)
+            self.assertEqual(leaf.read_bytes(), b"mismatch\n")
+            after = model.snapshot()
+            self.assertEqual(after["receipts"], before["receipts"])
+            self.assertEqual(after["authorities"], before["authorities"])
 
 
 if __name__ == "__main__":
