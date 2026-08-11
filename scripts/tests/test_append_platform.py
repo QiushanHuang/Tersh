@@ -3423,5 +3423,632 @@ class AppendPlatformSchemaTests(unittest.TestCase):
                     )
 
 
+class _AppendStateConnection:
+    def __init__(
+        self,
+        fd,
+        kernel_identity,
+        producer_session_id,
+        *,
+        peer_principal="uid-0-root-supervisor",
+    ):
+        self._fd = fd
+        self.kernel_identity = kernel_identity
+        self.producer_session_id = producer_session_id
+        self.peer_principal = peer_principal
+
+    def fileno(self):
+        return self._fd
+
+
+class AppendPlatformStateTests(unittest.TestCase):
+    @contextlib.contextmanager
+    def assert_evidence_error(self, error_class, message=None):
+        with self.assertRaises(error_class) as raised:
+            yield
+        self.assertIs(type(raised.exception), error_class)
+        if message is not None:
+            self.assertIn(message, str(raised.exception))
+
+    def host_state_model(self):
+        host_model = importlib.import_module(
+            "scripts.tests.append_platform_host_model"
+        )
+        model_class = getattr(host_model, "AppendPlatformHostModel", None)
+        self.assertTrue(callable(model_class), "AppendPlatformHostModel is required")
+        fixture_clock = getattr(host_model, "FixtureClock", None)
+        self.assertTrue(callable(fixture_clock), "FixtureClock is required")
+        clock = fixture_clock()
+        model = model_class(clock=clock)
+        for method_name in (
+            "open_attempt",
+            "register_raw_commit",
+            "register_worktree_observation",
+            "register_attempt_predecessor",
+            "seed_lineage",
+            "capture_invocation",
+            "capture_response",
+            "bind_append_connection",
+            "append_platform",
+            "build_host_orchestration_record",
+            "invoke_root_internal",
+            "snapshot",
+        ):
+            self.assertTrue(
+                callable(getattr(model, method_name, None)),
+                f"AppendPlatformHostModel.{method_name} is required",
+            )
+        return host_model, importlib.import_module("scripts.evidence_core"), clock, model
+
+    @classmethod
+    def fixture(
+        cls,
+        *,
+        wave="wave-c",
+        role="safety",
+        baseline="a" * 40,
+        candidate="b" * 40,
+        reported_result_commit="b" * 40,
+        review_target=None,
+        evidence_attempt="002",
+        nonce_digit="c",
+        dispatch_digit="d",
+        binding_digit="2",
+        session_digit="1",
+        predecessor_binding="3" * 64,
+    ):
+        provenance, session = AppendPlatformSchemaTests.append_platform_fixture(
+            evidence_attempt=evidence_attempt,
+            candidate=candidate,
+            candidate_relation=("equal" if candidate == baseline else "descendant"),
+        )
+        context = provenance["context"]["body"]
+        invocation = provenance["invocation"]["body"]
+        response = provenance["response"]["body"]
+        context.update(
+            {
+                "context_nonce": nonce_digit * 64,
+                "wave": wave,
+                "role": role,
+                "baseline_commit": baseline,
+                "review_target": candidate if review_target is None else review_target,
+            }
+        )
+        invocation.update(
+            {
+                "context_nonce": context["context_nonce"],
+                "dispatch_id": dispatch_digit * 64,
+            }
+        )
+        response.update(
+            {
+                "context_nonce": context["context_nonce"],
+                "dispatch_id": invocation["dispatch_id"],
+                "reported_result_commit": reported_result_commit,
+            }
+        )
+        session.update(
+            {
+                "producer_session_id": session_digit * 64,
+                "attempt_binding_id": binding_digit * 64,
+                "predecessor_attempt_binding_id": (
+                    None if evidence_attempt == "001" else predecessor_binding
+                ),
+                "context_nonce": context["context_nonce"],
+                "dispatch_id": invocation["dispatch_id"],
+                "evidence_attempt": evidence_attempt,
+                "candidate": candidate,
+                "baseline_commit": baseline,
+                "candidate_relation": (
+                    "equal" if candidate == baseline else "descendant"
+                ),
+                "destination": (
+                    f"attempt-{evidence_attempt}/candidate-{candidate}/"
+                    f"orchestration/{role}.{wave}.001.json"
+                ),
+            }
+        )
+        for body_kind in ("context", "invocation", "response"):
+            AppendPlatformSchemaTests.rehash_platform_arm(provenance, body_kind)
+        return {
+            "context": context,
+            "invocation": invocation,
+            "response": response,
+            "session": session,
+        }
+
+    def install_facts(
+        self,
+        model,
+        fixture,
+        *,
+        candidate_parents=None,
+        raw_view="raw",
+        clean=True,
+        observed_head=None,
+        observed_tree=None,
+        install_candidate=True,
+        predecessor_candidate=None,
+    ):
+        context = fixture["context"]
+        session = fixture["session"]
+        baseline = session["baseline_commit"]
+        candidate = session["candidate"]
+        model.register_raw_commit(
+            baseline,
+            tree=(session["candidate_tree"] if candidate == baseline else "a" * 40),
+            parents=(),
+        )
+        if install_candidate and candidate != baseline:
+            model.register_raw_commit(
+                candidate,
+                tree=session["candidate_tree"],
+                parents=(baseline,) if candidate_parents is None else candidate_parents,
+                view=raw_view,
+            )
+        model.register_worktree_observation(
+            context["worktree_handle"],
+            head=candidate if observed_head is None else observed_head,
+            tree=(
+                session["candidate_tree"]
+                if observed_tree is None
+                else observed_tree
+            ),
+            clean=clean,
+            view="raw",
+        )
+        predecessor_binding = session["predecessor_attempt_binding_id"]
+        if predecessor_binding is not None:
+            model.register_attempt_predecessor(
+                predecessor_binding,
+                candidate=(
+                    baseline
+                    if predecessor_candidate is None
+                    else predecessor_candidate
+                ),
+            )
+
+    def ready_lineage(self, model, fixture):
+        model.open_attempt(
+            {"context": fixture["context"], "session": fixture["session"]}
+        )
+        created = model.seed_lineage(context=fixture["context"])
+        invoked = model.capture_invocation(
+            created["context_handle"], fixture["invocation"]
+        )
+        responded = model.capture_response(
+            invoked["context_handle"], fixture["response"]
+        )
+        handles = {
+            "producer_session_id": fixture["session"]["producer_session_id"],
+            "context_handle": responded["context_handle"],
+            "invocation_handle": responded["invocation_handle"],
+            "response_handle": responded["response_handle"],
+            "mode": "platform-envelope",
+        }
+        return created, invoked, responded, handles
+
+    @staticmethod
+    def durable_state(snapshot):
+        return {
+            key: copy.deepcopy(snapshot[key])
+            for key in ("attempts", "lineages", "handles", "records")
+        }
+
+    def test_append_platform_rejects_cross_lineage_generation_alias_duplicate_or_mode_mixed_handles(self):
+        _, core, _, model = self.host_state_model()
+        fixture = self.fixture()
+        self.install_facts(model, fixture)
+        created, _, responded, handles = self.ready_lineage(model, fixture)
+        connection = _AppendStateConnection(
+            40, "socket-positive", fixture["session"]["producer_session_id"]
+        )
+        lease = model.bind_append_connection(handles, connection=connection)
+        model.append_platform(lease, connection=connection, transaction_nonce="0" * 64)
+        self.assertEqual(
+            model.snapshot()["lineages"][responded["lineage_id"]]["state"],
+            "APPENDED_PLATFORM",
+        )
+
+        for case_id in ("old-generation", "alias", "mode-mixed"):
+            with self.subTest(case_id=case_id):
+                _, core, _, case_model = self.host_state_model()
+                case_fixture = self.fixture()
+                self.install_facts(case_model, case_fixture)
+                case_created, _, _, case_handles = self.ready_lineage(
+                    case_model, case_fixture
+                )
+                invalid = copy.deepcopy(case_handles)
+                if case_id == "old-generation":
+                    invalid["context_handle"] = case_created["context_handle"]
+                elif case_id == "alias":
+                    invalid["response_handle"] = invalid["context_handle"]
+                else:
+                    invalid["mode"] = "agent-report"
+                before = case_model.snapshot()
+                case_connection = _AppendStateConnection(
+                    41, case_id, case_fixture["session"]["producer_session_id"]
+                )
+                with self.assert_evidence_error(core.EvidenceError):
+                    case_model.bind_append_connection(
+                        invalid, connection=case_connection
+                    )
+                self.assertEqual(case_model.snapshot(), before)
+
+        _, core, _, cross_model = self.host_state_model()
+        first = self.fixture()
+        second = self.fixture(
+            evidence_attempt="003",
+            nonce_digit="a",
+            dispatch_digit="b",
+            binding_digit="4",
+            session_digit="5",
+            predecessor_binding="6" * 64,
+        )
+        for item in (first, second):
+            self.install_facts(cross_model, item)
+        _, _, _, first_handles = self.ready_lineage(cross_model, first)
+        _, _, _, second_handles = self.ready_lineage(cross_model, second)
+        cross = copy.deepcopy(first_handles)
+        cross["response_handle"] = second_handles["response_handle"]
+        before = cross_model.snapshot()
+        with self.assert_evidence_error(core.EvidenceError):
+            cross_model.bind_append_connection(
+                cross,
+                connection=_AppendStateConnection(
+                    42, "cross", first["session"]["producer_session_id"]
+                ),
+            )
+        self.assertEqual(cross_model.snapshot(), before)
+
+        before = cross_model.snapshot()
+        with self.assert_evidence_error(core.EvidenceError):
+            cross_model.capture_response(
+                first_handles["context_handle"], first["response"]
+            )
+        self.assertEqual(cross_model.snapshot(), before)
+
+        changed_binding = {
+            "context": first["context"],
+            "session": copy.deepcopy(first["session"]),
+        }
+        changed_binding["session"]["runtime_profile_id"] = "f" * 64
+        before = cross_model.snapshot()
+        with self.assert_evidence_error(core.EvidenceError, "immutable"):
+            cross_model.open_attempt(changed_binding)
+        self.assertEqual(cross_model.snapshot(), before)
+
+    def test_root_peer_with_wrong_recorder_session_fails_before_handle_lookup(self):
+        _, core, _, model = self.host_state_model()
+        fixture = self.fixture()
+        self.install_facts(model, fixture)
+        _, _, _, handles = self.ready_lineage(model, fixture)
+        positive = _AppendStateConnection(
+            50, "root-session-positive", fixture["session"]["producer_session_id"]
+        )
+        self.assertIn(
+            "lease_id", model.bind_append_connection(handles, connection=positive)
+        )
+
+        _, core, _, rejected_model = self.host_state_model()
+        rejected_fixture = self.fixture()
+        self.install_facts(rejected_model, rejected_fixture)
+        self.ready_lineage(rejected_model, rejected_fixture)
+        before = rejected_model.snapshot()
+        wrong_session = _AppendStateConnection(50, "wrong-session", "f" * 64)
+        unknown_handles = {
+            "producer_session_id": "f" * 64,
+            "context_handle": "not-looked-up",
+            "invocation_handle": "not-looked-up",
+            "response_handle": "not-looked-up",
+            "mode": "platform-envelope",
+        }
+        with self.assert_evidence_error(
+            core.EvidenceError, "recorder session authentication"
+        ):
+            rejected_model.bind_append_connection(
+                unknown_handles, connection=wrong_session
+            )
+        self.assertEqual(rejected_model.snapshot(), before)
+
+    def test_recorder_session_launch_lease_replay_and_fd_generation_reuse_fail_before_handle_lookup(self):
+        _, core, _, positive_model = self.host_state_model()
+        positive_fixture = self.fixture()
+        self.install_facts(positive_model, positive_fixture)
+        _, _, _, positive_handles = self.ready_lineage(
+            positive_model, positive_fixture
+        )
+        positive_connection = _AppendStateConnection(
+            60, "lease-positive", positive_fixture["session"]["producer_session_id"]
+        )
+        positive_lease = positive_model.bind_append_connection(
+            positive_handles, connection=positive_connection
+        )
+        positive_model.append_platform(
+            positive_lease,
+            connection=positive_connection,
+            transaction_nonce="1" * 64,
+        )
+
+        _, core, clock, expired_model = self.host_state_model()
+        expired_fixture = self.fixture()
+        self.install_facts(expired_model, expired_fixture)
+        _, _, _, expired_handles = self.ready_lineage(expired_model, expired_fixture)
+        expired_connection = _AppendStateConnection(
+            61, "expired", expired_fixture["session"]["producer_session_id"]
+        )
+        expired_lease = expired_model.bind_append_connection(
+            expired_handles, connection=expired_connection
+        )
+        durable_before = self.durable_state(expired_model.snapshot())
+        clock.advance(5.001)
+        with self.assert_evidence_error(core.EvidenceError, "launch lease expired"):
+            expired_model.append_platform(
+                expired_lease,
+                connection=expired_connection,
+                transaction_nonce="2" * 64,
+            )
+        self.assertEqual(
+            self.durable_state(expired_model.snapshot()), durable_before
+        )
+
+        _, core, _, reuse_model = self.host_state_model()
+        reuse_fixture = self.fixture()
+        self.install_facts(reuse_model, reuse_fixture)
+        _, _, _, reuse_handles = self.ready_lineage(reuse_model, reuse_fixture)
+        old_connection = _AppendStateConnection(
+            62, "kernel-generation-1", reuse_fixture["session"]["producer_session_id"]
+        )
+        old_lease = reuse_model.bind_append_connection(
+            reuse_handles, connection=old_connection
+        )
+        durable_before = self.durable_state(reuse_model.snapshot())
+        reused_fd_connection = _AppendStateConnection(
+            62, "kernel-generation-2", reuse_fixture["session"]["producer_session_id"]
+        )
+        with self.assert_evidence_error(core.EvidenceError, "connection generation"):
+            reuse_model.append_platform(
+                old_lease,
+                connection=reused_fd_connection,
+                transaction_nonce="3" * 64,
+            )
+        self.assertEqual(self.durable_state(reuse_model.snapshot()), durable_before)
+        fresh_lease = reuse_model.bind_append_connection(
+            reuse_handles, connection=reused_fd_connection
+        )
+        reuse_model.append_platform(
+            fresh_lease,
+            connection=reused_fd_connection,
+            transaction_nonce="4" * 64,
+        )
+        committed = reuse_model.snapshot()
+        with self.assert_evidence_error(core.EvidenceError, "replay"):
+            reuse_model.append_platform(
+                fresh_lease,
+                connection=reused_fd_connection,
+                transaction_nonce="4" * 64,
+            )
+        self.assertEqual(reuse_model.snapshot(), committed)
+
+    def test_root_internal_authentication_precedes_nonce_session_or_handle_lookup(self):
+        _, core, _, model = self.host_state_model()
+        fixture = self.fixture()
+        self.install_facts(model, fixture)
+        model.open_attempt({"context": fixture["context"], "session": fixture["session"]})
+        before = model.snapshot()
+        with self.assert_evidence_error(core.EvidenceError, "root supervisor"):
+            model.invoke_root_internal(
+                "not-an-operation",
+                {"nonce": "invalid", "handle": "invalid"},
+                principal="nonroot-recorder",
+            )
+        self.assertEqual(model.snapshot(), before)
+        result = model.invoke_root_internal(
+            "enumerate-attempt",
+            {"attempt_binding_id": fixture["session"]["attempt_binding_id"]},
+            principal=model.ROOT_SUPERVISOR_PRINCIPAL,
+        )
+        self.assertEqual(result["candidate"], fixture["session"]["candidate"])
+        with self.assert_evidence_error(core.EvidenceError, "root-internal operation"):
+            model.invoke_root_internal(
+                "not-an-operation",
+                {},
+                principal=model.ROOT_SUPERVISOR_PRINCIPAL,
+            )
+
+    def test_append_platform_rejects_wave_a_baseline_drift_and_unrelated_wave_b_candidate(self):
+        for positive_fixture in (
+            self.fixture(
+                wave="wave-a",
+                baseline="a" * 40,
+                candidate="a" * 40,
+                reported_result_commit=None,
+                review_target="a" * 40,
+            ),
+            self.fixture(
+                wave="wave-b",
+                role="implementation",
+                baseline="a" * 40,
+                candidate="b" * 40,
+                reported_result_commit="b" * 40,
+                review_target="a" * 40,
+            ),
+        ):
+            _, _, _, model = self.host_state_model()
+            self.install_facts(model, positive_fixture)
+            self.assertEqual(
+                model.open_attempt(
+                    {
+                        "context": positive_fixture["context"],
+                        "session": positive_fixture["session"],
+                    }
+                )["candidate"],
+                positive_fixture["session"]["candidate"],
+            )
+
+        invalid_fixtures = (
+            (
+                "wave-a-drift",
+                self.fixture(
+                    wave="wave-a",
+                    baseline="a" * 40,
+                    candidate="b" * 40,
+                    review_target="a" * 40,
+                ),
+                None,
+            ),
+            (
+                "wave-b-unrelated",
+                self.fixture(
+                    wave="wave-b",
+                    role="implementation",
+                    baseline="a" * 40,
+                    candidate="c" * 40,
+                    reported_result_commit="c" * 40,
+                    review_target="a" * 40,
+                ),
+                ("d" * 40,),
+            ),
+        )
+        for case_id, invalid, parents in invalid_fixtures:
+            with self.subTest(case_id=case_id):
+                _, core, _, model = self.host_state_model()
+                if parents == ("d" * 40,):
+                    model.register_raw_commit("d" * 40, tree="d" * 40, parents=())
+                self.install_facts(model, invalid, candidate_parents=parents)
+                before = model.snapshot()
+                with self.assert_evidence_error(core.EvidenceError):
+                    model.open_attempt(
+                        {"context": invalid["context"], "session": invalid["session"]}
+                    )
+                self.assertEqual(model.snapshot(), before)
+
+    def test_candidate_relation_matches_raw_ancestry_in_wave_c_and_closure(self):
+        for wave in ("wave-c", "closure-a"):
+            host_model, core, _, model = self.host_state_model()
+            fixture = self.fixture(wave=wave)
+            self.install_facts(model, fixture)
+            model.open_attempt({"context": fixture["context"], "session": fixture["session"]})
+            record_tripwire = AssertionError("Host record builder used client derivation")
+            io_tripwire = AssertionError("Host record builder launched external I/O")
+            with (
+                mock.patch.object(
+                    core,
+                    "derive_platform_orchestration_record",
+                    side_effect=record_tripwire,
+                ),
+                mock.patch.object(core.subprocess, "run", side_effect=io_tripwire),
+                mock.patch.object(core.subprocess, "Popen", side_effect=io_tripwire),
+                mock.patch.object(core.os, "system", side_effect=io_tripwire),
+            ):
+                record = model.build_host_orchestration_record(
+                    fixture["context"],
+                    fixture["invocation"],
+                    fixture["response"],
+                    fixture["session"],
+                )
+            self.assertEqual(record["reviewed_commit"], fixture["session"]["candidate"])
+            self.assertNotIn(
+                "derive_platform_orchestration_record",
+                inspect.getsource(host_model),
+            )
+
+        negative_cases = (
+            ("replacement", {"raw_view": "replacement"}),
+            ("graft", {"raw_view": "graft"}),
+            ("shallow", {"raw_view": "shallow"}),
+            ("alternate", {"raw_view": "alternate"}),
+            ("wrong-tree", {"observed_tree": "f" * 40}),
+            ("dirty", {"clean": False}),
+            ("missing-object", {"install_candidate": False}),
+            ("unborn-head", {"observed_head": None, "unborn": True}),
+            ("body-to-commit-drift", {"observed_head": "f" * 40}),
+        )
+        for case_id, options in negative_cases:
+            with self.subTest(case_id=case_id):
+                _, core, _, model = self.host_state_model()
+                fixture = self.fixture()
+                options = dict(options)
+                if options.pop("unborn", False):
+                    model.register_raw_commit("a" * 40, tree="a" * 40, parents=())
+                    model.register_raw_commit(
+                        "b" * 40,
+                        tree=fixture["session"]["candidate_tree"],
+                        parents=("a" * 40,),
+                    )
+                    model.register_worktree_observation(
+                        fixture["context"]["worktree_handle"],
+                        head=None,
+                        tree=fixture["session"]["candidate_tree"],
+                        clean=True,
+                        view="raw",
+                    )
+                    model.register_attempt_predecessor("3" * 64, candidate="a" * 40)
+                else:
+                    self.install_facts(model, fixture, **options)
+                before = model.snapshot()
+                with self.assert_evidence_error(core.EvidenceError):
+                    model.open_attempt(
+                        {"context": fixture["context"], "session": fixture["session"]}
+                    )
+                self.assertEqual(model.snapshot(), before)
+
+        _, core, _, model = self.host_state_model()
+        wrong_relation = self.fixture()
+        wrong_relation["session"]["candidate_relation"] = "equal"
+        self.install_facts(model, wrong_relation)
+        before = model.snapshot()
+        with self.assert_evidence_error(core.EvidenceError):
+            model.open_attempt(
+                {"context": wrong_relation["context"], "session": wrong_relation["session"]}
+            )
+        self.assertEqual(model.snapshot(), before)
+
+    def test_wave_b_baseline_is_immediate_predecessor_not_older_context_ancestor(self):
+        older = "a" * 40
+        immediate = "b" * 40
+        candidate = "c" * 40
+        _, core, _, model = self.host_state_model()
+        model.register_raw_commit(older, tree="a" * 40, parents=())
+        model.register_raw_commit(immediate, tree="b" * 40, parents=(older,))
+        model.register_raw_commit(candidate, tree="4" * 40, parents=(immediate,))
+        model.register_attempt_predecessor("3" * 64, candidate=immediate)
+
+        invalid = self.fixture(
+            wave="wave-b",
+            role="implementation",
+            baseline=older,
+            candidate=candidate,
+            reported_result_commit=candidate,
+            review_target=older,
+        )
+        model.register_worktree_observation(
+            invalid["context"]["worktree_handle"],
+            head=candidate,
+            tree="4" * 40,
+            clean=True,
+            view="raw",
+        )
+        before = model.snapshot()
+        with self.assert_evidence_error(core.EvidenceError, "immediate predecessor"):
+            model.open_attempt({"context": invalid["context"], "session": invalid["session"]})
+        self.assertEqual(model.snapshot(), before)
+
+        valid = self.fixture(
+            wave="wave-b",
+            role="implementation",
+            baseline=immediate,
+            candidate=candidate,
+            reported_result_commit=candidate,
+            review_target=immediate,
+        )
+        self.assertEqual(
+            model.open_attempt({"context": valid["context"], "session": valid["session"]})[
+                "baseline_commit"
+            ],
+            immediate,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
