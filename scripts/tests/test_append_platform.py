@@ -1,3 +1,4 @@
+import ast
 import copy
 import contextlib
 import hashlib
@@ -6,6 +7,10 @@ import inspect
 import json
 import pathlib
 import re
+import socket
+import struct
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -3441,6 +3446,23 @@ class _AppendStateConnection:
         return self._fd
 
 
+class _AppendWireHostSocket(socket.socket):
+    def __init__(self, *args, **kwargs):
+        self.sent_frames = []
+        self.frame_observer = None
+        super().__init__(*args, **kwargs)
+
+    def sendall(self, data, flags=0):
+        if flags == 0 and len(data) >= 4:
+            size = struct.unpack(">I", data[:4])[0]
+            if size == len(data) - 4:
+                frame = json.loads(data[4:])
+                self.sent_frames.append(frame)
+                if self.frame_observer is not None:
+                    self.frame_observer(copy.deepcopy(frame))
+        return super().sendall(data, flags)
+
+
 class AppendPlatformStateTests(unittest.TestCase):
     @contextlib.contextmanager
     def assert_evidence_error(self, error_class, message=None):
@@ -4048,6 +4070,525 @@ class AppendPlatformStateTests(unittest.TestCase):
             ],
             immediate,
         )
+
+
+class AppendPlatformWireTests(unittest.TestCase):
+    def append_platform_client(self):
+        core = importlib.import_module("scripts.evidence_core")
+        append = getattr(core, "append_platform_on_authenticated_socket", None)
+        self.assertTrue(
+            callable(append),
+            "append_platform_on_authenticated_socket is required",
+        )
+        self.assertEqual(
+            tuple(inspect.signature(append).parameters),
+            (
+                "sock",
+                "context_handle",
+                "invocation_handle",
+                "response_handle",
+            ),
+        )
+        return core, append
+
+    def run_reference_wire(self, *, reported_record_sha256=None):
+        core, append = self.append_platform_client()
+        host_module = importlib.import_module(
+            "scripts.tests.append_platform_host_model"
+        )
+        model = host_module.AppendPlatformHostModel()
+        fixture = AppendPlatformStateTests.fixture()
+        fixture["response"]["reported_record_sha256"] = reported_record_sha256
+        state_helpers = AppendPlatformStateTests(methodName="runTest")
+        state_helpers.install_facts(model, fixture)
+        _, _, responded, handles = state_helpers.ready_lineage(model, fixture)
+
+        client, raw_host = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        host = _AppendWireHostSocket(fileno=raw_host.detach())
+        host.peer_principal = model.ROOT_SUPERVISOR_PRINCIPAL
+        host.producer_session_id = fixture["session"]["producer_session_id"]
+        precommit_snapshots = []
+
+        def observe_frame(frame):
+            if frame.get("body_kind") == "orchestration-record":
+                precommit_snapshots.append(model.snapshot())
+
+        host.frame_observer = observe_frame
+        lease = model.bind_append_connection(handles, connection=host)
+        host_errors = []
+
+        def serve():
+            try:
+                model.serve_append_platform(host, lease)
+            except BaseException as error:
+                host_errors.append(error)
+
+        thread = threading.Thread(target=serve)
+        thread.start()
+        try:
+            result = append(
+                client,
+                handles["context_handle"],
+                handles["invocation_handle"],
+                handles["response_handle"],
+            )
+        finally:
+            client.close()
+            thread.join(timeout=3)
+            sent_frames = copy.deepcopy(host.sent_frames)
+            host.close()
+        self.assertFalse(thread.is_alive(), "reference Host wire did not terminate")
+        self.assertEqual(host_errors, [])
+        return (
+            core,
+            model,
+            fixture,
+            responded,
+            handles,
+            result,
+            sent_frames,
+            precommit_snapshots,
+        )
+
+    def run_scripted_client(self, scenario):
+        core, append = self.append_platform_client()
+        fixture = AppendPlatformStateTests.fixture()
+        host_module = importlib.import_module(
+            "scripts.tests.append_platform_host_model"
+        )
+        host_builder = host_module.AppendPlatformHostModel()
+        record = host_builder.build_host_orchestration_record(
+            fixture["context"],
+            fixture["invocation"],
+            fixture["response"],
+            fixture["session"],
+        )
+        if scenario == "mutated-record":
+            record["agent_id"] = "mutated-host-agent"
+        bodies = (
+            fixture["context"],
+            fixture["invocation"],
+            fixture["response"],
+            fixture["session"],
+            record,
+        )
+        body_kinds = APPROVED_BODY_KINDS
+        body_hashes = [
+            hashlib.sha256(core.canonical_json_bytes(body)).hexdigest()
+            for body in bodies
+        ]
+        handles = ("a" * 64, "b" * 64, "c" * 64)
+        client, host = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        host_errors = []
+
+        def scripted_host():
+            deadline = time.monotonic() + 2.0
+            try:
+                begin = core.recv_host_frame(host, deadline)
+                nonce = begin["transaction_nonce"]
+                self.assertEqual(
+                    begin,
+                    {
+                        "schema": "tersh-host-transaction-begin-v1",
+                        "transaction_nonce": nonce,
+                        "operation": "append-platform",
+                        "context_handle": handles[0],
+                        "invocation_handle": handles[1],
+                        "response_handle": handles[2],
+                    },
+                )
+                limit = 4 if scenario == "hash-only" else 5
+                for ordinal, (body_kind, body, digest) in enumerate(
+                    zip(body_kinds[:limit], bodies[:limit], body_hashes[:limit]),
+                    start=1,
+                ):
+                    schema = "tersh-host-transaction-body-v1"
+                    if scenario == "record-frame" and ordinal == 5:
+                        schema = "tersh-host-transaction-record-begin-v1"
+                    core.send_host_frame(
+                        host,
+                        {
+                            "schema": schema,
+                            "transaction_nonce": nonce,
+                            "operation": "append-platform",
+                            "body_kind": body_kind,
+                            "ordinal": ordinal,
+                            "total": limit,
+                            "body": body,
+                            "body_sha256": digest,
+                        },
+                        deadline,
+                    )
+                core.send_host_frame(
+                    host,
+                    {
+                        "schema": "tersh-host-transaction-body-end-v1",
+                        "transaction_nonce": nonce,
+                        "operation": "append-platform",
+                        "total": limit,
+                        "body_sha256s": body_hashes[:limit],
+                    },
+                    deadline,
+                )
+                if scenario in {"record-frame", "hash-only", "mutated-record"}:
+                    host.shutdown(socket.SHUT_WR)
+                    return
+
+                commit = core.recv_host_frame(host, deadline)
+                self.assertEqual(
+                    commit,
+                    {
+                        "schema": "tersh-host-transaction-commit-v1",
+                        "transaction_nonce": nonce,
+                        "operation": "append-platform",
+                        "body_sha256s": body_hashes,
+                        "record_facts": {
+                            "evidence_id": fixture["context"]["evidence_id"],
+                            "evidence_attempt": fixture["context"]["evidence_attempt"],
+                            "run_binding": fixture["context"]["run_binding"],
+                            "candidate": fixture["session"]["candidate"],
+                            "destination": fixture["session"]["destination"],
+                            "record_sha256": body_hashes[4],
+                        },
+                    },
+                )
+                request_end = core.recv_host_frame(host, deadline)
+                self.assertEqual(
+                    request_end,
+                    {
+                        "schema": "tersh-host-transaction-request-end-v1",
+                        "transaction_nonce": nonce,
+                        "operation": "append-platform",
+                        "commit_sha256": hashlib.sha256(
+                            core.canonical_json_bytes(commit)
+                        ).hexdigest(),
+                    },
+                )
+                core.require_host_eof(host, deadline)
+                receipt = AppendPlatformSchemaTests.producer_receipt_fixture(
+                    fixture["session"],
+                    record,
+                )
+                if scenario == "receipt-drift":
+                    receipt["destination"] = "attempt-002/alternate.json"
+                result = {
+                    "schema": "tersh-host-record-result-v1",
+                    "receipt": receipt,
+                }
+                if scenario == "private-result":
+                    result["pending_report_authority"] = "private-canary"
+                reply = {
+                    "schema": "tersh-host-transaction-reply-v1",
+                    "transaction_nonce": nonce,
+                    "operation": "append-platform",
+                    "body_sha256s": body_hashes,
+                    "result": result,
+                }
+                core.send_host_frame(host, reply, deadline)
+                if scenario in {"receipt-drift", "private-result"}:
+                    host.shutdown(socket.SHUT_WR)
+                    return
+                core.send_host_frame(
+                    host,
+                    {
+                        "schema": "tersh-host-transaction-reply-end-v1",
+                        "transaction_nonce": nonce,
+                        "operation": "append-platform",
+                        "reply_sha256": hashlib.sha256(
+                            core.canonical_json_bytes(reply)
+                        ).hexdigest(),
+                    },
+                    deadline,
+                )
+                host.shutdown(socket.SHUT_WR)
+            except BaseException as error:
+                host_errors.append(error)
+            finally:
+                host.close()
+
+        thread = threading.Thread(target=scripted_host)
+        thread.start()
+        result = None
+        error = None
+        try:
+            result = append(client, *handles)
+        except BaseException as caught:
+            error = caught
+        finally:
+            client.close()
+            thread.join(timeout=3)
+        self.assertFalse(thread.is_alive(), f"scripted Host hung for {scenario}")
+        self.assertEqual(host_errors, [])
+        return core, result, error
+
+    def test_append_platform_exact_session_and_host_built_record_body_order(self):
+        _, model, _, responded, handles, result, sent_frames, _ = (
+            self.run_reference_wire()
+        )
+        self.assertEqual(result["schema"], "tersh-host-record-result-v1")
+        snapshot = model.snapshot()
+        self.assertEqual(
+            snapshot["lineages"][responded["lineage_id"]]["state"],
+            "APPENDED_PLATFORM",
+        )
+        self.assertEqual(len(snapshot["records"]), 1)
+        self.assertEqual(
+            [frame["body_kind"] for frame in sent_frames[:5]],
+            list(APPROVED_BODY_KINDS),
+        )
+        self.assertEqual(
+            [frame["ordinal"] for frame in sent_frames[:5]],
+            [1, 2, 3, 4, 5],
+        )
+        self.assertTrue(all(frame["total"] == 5 for frame in sent_frames[:5]))
+        self.assertEqual(
+            sent_frames[5],
+            {
+                "schema": "tersh-host-transaction-body-end-v1",
+                "transaction_nonce": sent_frames[0]["transaction_nonce"],
+                "operation": "append-platform",
+                "total": 5,
+                "body_sha256s": [
+                    frame["body_sha256"] for frame in sent_frames[:5]
+                ],
+            },
+        )
+        self.assertTrue(
+            all(not snapshot["handles"][handle]["live"] for handle in (
+                handles["context_handle"],
+                handles["invocation_handle"],
+                handles["response_handle"],
+            ))
+        )
+
+    def test_host_record_constructor_is_independent_from_client_derivation(self):
+        core, _ = self.append_platform_client()
+        host_module = importlib.import_module(
+            "scripts.tests.append_platform_host_model"
+        )
+        model = host_module.AppendPlatformHostModel()
+        fixture = AppendPlatformStateTests.fixture()
+        tripwire = AssertionError("Host constructor called client derivation")
+        with mock.patch.object(
+            core,
+            "derive_platform_orchestration_record",
+            side_effect=tripwire,
+        ):
+            record = model.build_host_orchestration_record(
+                fixture["context"],
+                fixture["invocation"],
+                fixture["response"],
+                fixture["session"],
+            )
+        host_tree = ast.parse(
+            inspect.getsource(host_module),
+            filename=str(host_module.__file__),
+        )
+        forbidden_references = [
+            node
+            for node in ast.walk(host_tree)
+            if (
+                isinstance(node, ast.Name)
+                and node.id == "derive_platform_orchestration_record"
+            )
+            or (
+                isinstance(node, ast.Attribute)
+                and node.attr == "derive_platform_orchestration_record"
+            )
+            or (
+                isinstance(node, ast.alias)
+                and (
+                    node.name == "derive_platform_orchestration_record"
+                    or node.asname == "derive_platform_orchestration_record"
+                )
+            )
+        ]
+        self.assertEqual(forbidden_references, [])
+        mutated = copy.deepcopy(record)
+        mutated["agent_id"] = "mutated-host-agent"
+        derived = core.derive_platform_orchestration_record(
+            fixture["context"],
+            fixture["invocation"],
+            fixture["response"],
+            fixture["session"],
+        )
+        self.assertNotEqual(mutated, derived)
+        scripted_core, result, error = self.run_scripted_client("mutated-record")
+        self.assertIsNone(result)
+        self.assertIs(type(error), scripted_core.EvidenceError)
+
+    def test_append_platform_rejects_record_frame_or_hash_only_commit(self):
+        for scenario in ("record-frame", "hash-only"):
+            with self.subTest(scenario=scenario):
+                core, result, error = self.run_scripted_client(scenario)
+                self.assertIsNone(result)
+                self.assertIs(type(error), core.EvidenceError)
+
+    def test_host_spools_exact_record_body_sent_before_commit(self):
+        core, model, _, _, _, result, _, precommit_snapshots = (
+            self.run_reference_wire()
+        )
+        self.assertEqual(len(precommit_snapshots), 1)
+        self.assertEqual(precommit_snapshots[0]["blobs"], {})
+        self.assertEqual(precommit_snapshots[0]["receipts"], [])
+        snapshot = model.snapshot()
+        record_row = snapshot["records"][0]
+        frozen = core.canonical_json_bytes(record_row["body"])
+        self.assertEqual(record_row["body_bytes"], frozen)
+        self.assertEqual(
+            snapshot["blobs"],
+            {hashlib.sha256(frozen).hexdigest(): frozen},
+        )
+        self.assertEqual(
+            result["receipt"]["body_sha256"],
+            hashlib.sha256(frozen).hexdigest(),
+        )
+
+    def test_record_reply_receipt_joins_session_route_body_and_chain(self):
+        core, model, fixture, _, _, result, _, _ = self.run_reference_wire()
+        receipt = result["receipt"]
+        session = fixture["session"]
+        record = model.snapshot()["records"][0]["body"]
+        validated = core._validate_append_platform_producer_receipt(
+            receipt,
+            recorder_session=session,
+            record=record,
+        )
+        self.assertEqual(validated, receipt)
+        self.assertEqual(receipt["sequence"], session["next_receipt_sequence"])
+        self.assertEqual(receipt["previous_receipt_id"], session["previous_receipt_id"])
+        self.assertNotIn("authority", result)
+        for scenario in ("receipt-drift", "private-result"):
+            with self.subTest(scenario=scenario):
+                scripted_core, invalid_result, error = self.run_scripted_client(
+                    scenario
+                )
+                self.assertIsNone(invalid_result)
+                self.assertIs(type(error), scripted_core.EvidenceError)
+
+    def test_append_platform_one_absolute_deadline_covers_begin_bodies_commit_request_end_eof_and_reply(self):
+        core, append = self.append_platform_client()
+        fixture = AppendPlatformStateTests.fixture()
+        host_builder = importlib.import_module(
+            "scripts.tests.append_platform_host_model"
+        ).AppendPlatformHostModel()
+        record = host_builder.build_host_orchestration_record(
+            fixture["context"],
+            fixture["invocation"],
+            fixture["response"],
+            fixture["session"],
+        )
+        bodies = {
+            "context": fixture["context"],
+            "invocation": fixture["invocation"],
+            "response": fixture["response"],
+            "recorder-session": fixture["session"],
+            "orchestration-record": record,
+        }
+        body_hashes = [
+            hashlib.sha256(core.canonical_json_bytes(bodies[kind])).hexdigest()
+            for kind in APPROVED_BODY_KINDS
+        ]
+        nonce = "f" * 64
+        receipt = AppendPlatformSchemaTests.producer_receipt_fixture(
+            fixture["session"],
+            record,
+        )
+        reply = {
+            "schema": "tersh-host-transaction-reply-v1",
+            "transaction_nonce": nonce,
+            "operation": "append-platform",
+            "body_sha256s": body_hashes,
+            "result": {
+                "schema": "tersh-host-record-result-v1",
+                "receipt": receipt,
+            },
+        }
+        reply_end = {
+            "schema": "tersh-host-transaction-reply-end-v1",
+            "transaction_nonce": nonce,
+            "operation": "append-platform",
+            "reply_sha256": hashlib.sha256(
+                core.canonical_json_bytes(reply)
+            ).hexdigest(),
+        }
+        observed_deadlines = []
+
+        def receive_bodies(*args):
+            observed_deadlines.append(args[-1])
+            return copy.deepcopy(bodies), list(body_hashes)
+
+        def receive_reply(_sock, deadline):
+            observed_deadlines.append(deadline)
+            return copy.deepcopy(
+                receive_reply.frames.pop(0)
+            )
+
+        receive_reply.frames = [reply, reply_end]
+        client, peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            with (
+                mock.patch.object(core.time, "monotonic", return_value=100.0) as clock,
+                mock.patch.object(core.secrets, "token_hex", return_value=nonce),
+                mock.patch.object(
+                    core,
+                    "send_host_frame",
+                    side_effect=lambda _sock, _value, deadline: observed_deadlines.append(deadline),
+                ),
+                mock.patch.object(
+                    core,
+                    "_receive_host_body_sequence",
+                    side_effect=receive_bodies,
+                ),
+                mock.patch.object(
+                    core,
+                    "_send_host_request_end",
+                    side_effect=lambda _sock, _nonce, _operation, _commit, deadline: observed_deadlines.append(deadline),
+                ),
+                mock.patch.object(core, "recv_host_frame", side_effect=receive_reply),
+                mock.patch.object(
+                    core,
+                    "require_host_eof",
+                    side_effect=lambda _sock, deadline: observed_deadlines.append(deadline),
+                ),
+            ):
+                result = append(client, "a" * 64, "b" * 64, "c" * 64)
+            self.assertEqual(result["receipt"], receipt)
+            self.assertEqual(observed_deadlines, [105.0] * 6)
+            clock.assert_called_once_with()
+        finally:
+            client.close()
+            peer.close()
+
+    def test_append_platform_deadline_is_not_reset_or_caller_configurable(self):
+        core, append = self.append_platform_client()
+        function_tree = ast.parse(inspect.getsource(append))
+        monotonic_calls = [
+            node
+            for node in ast.walk(function_tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "time"
+            and node.func.attr == "monotonic"
+        ]
+        self.assertEqual(len(monotonic_calls), 1)
+        client, peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            with self.assertRaises(TypeError):
+                append(
+                    client,
+                    "a" * 64,
+                    "b" * 64,
+                    "c" * 64,
+                    deadline=1.0,
+                )
+            with mock.patch.object(core.time, "monotonic", return_value=105.001):
+                with self.assertRaises(core.EvidenceError):
+                    core._remaining_host_deadline(105.0)
+        finally:
+            client.close()
+            peer.close()
 
 
 if __name__ == "__main__":

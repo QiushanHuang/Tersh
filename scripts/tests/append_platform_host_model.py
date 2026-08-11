@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import socket
+import time
 from typing import Any
 
 from scripts import evidence_core as core
@@ -294,6 +296,9 @@ class AppendPlatformHostModel:
             "worktrees": {},
             "predecessors": {},
             "records": [],
+            "blobs": {},
+            "receipts": [],
+            "authorities": {},
             "next_id": 1,
             "next_connection_generation": 1,
         }
@@ -905,6 +910,428 @@ class AppendPlatformHostModel:
             "terminal_status": response_body["terminal_status"],
             "provenance": provenance,
         }
+
+    def _bound_append_lease_before_handles(
+        self,
+        lease_value: Any,
+        connection: Any,
+        *,
+        check_launch_deadline: bool = True,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        if getattr(connection, "peer_principal", None) != self.ROOT_SUPERVISOR_PRINCIPAL:
+            raise core.EvidenceError("root supervisor peer authentication failed")
+        lease_id = lease_value.get("lease_id") if type(lease_value) is dict else None
+        lease = self._state["leases"].get(lease_id)
+        if lease is None:
+            raise core.EvidenceError("recorder session lease is unknown")
+        if not lease["valid"]:
+            if lease["invalid_reason"] == "consumed":
+                raise core.EvidenceError("recorder session replay rejected")
+            raise core.EvidenceError("recorder session lease is permanently invalid")
+        session = self._state["sessions"].get(lease["producer_session_id"])
+        if (
+            session is None
+            or not session["live"]
+            or session["active_lease_id"] != lease_id
+            or getattr(connection, "producer_session_id", None)
+            != lease["producer_session_id"]
+        ):
+            self._invalidate_lease(lease_id, "session")
+            raise core.EvidenceError("recorder session authentication failed")
+        object_id, numeric_fd, kernel_identity = self._connection_identity(connection)
+        connection_row = self._state["connections"].get(str(object_id))
+        if (
+            object_id != lease["connection_object_id"]
+            or numeric_fd != lease["numeric_fd"]
+            or kernel_identity != lease["kernel_identity"]
+            or connection_row is None
+            or connection_row["generation"] != lease["connection_generation"]
+        ):
+            self._invalidate_lease(lease_id, "connection-generation")
+            raise core.EvidenceError("connection generation changed before handle lookup")
+        if check_launch_deadline and self._clock() >= lease["launch_deadline"]:
+            self._invalidate_lease(lease_id, "launch-expired")
+            raise core.EvidenceError("launch lease expired before handle lookup")
+        return lease, session
+
+    def _append_body_tuple(
+        self,
+        lease: dict[str, Any],
+        session: dict[str, Any],
+    ) -> tuple[
+        dict[str, Any],
+        dict[str, Any],
+        dict[str, Any],
+        dict[str, Any],
+        dict[str, Any],
+    ]:
+        handles = lease["handles"]
+        context_row, lineage = self._current_handle(
+            handles["context_handle"], kind="context"
+        )
+        invocation_row, invocation_lineage = self._current_handle(
+            handles["invocation_handle"], kind="invocation"
+        )
+        response_row, response_lineage = self._current_handle(
+            handles["response_handle"], kind="response"
+        )
+        if (
+            lineage["state"] != "RESPONDED_PLATFORM"
+            or lineage["context_handle"] != handles["context_handle"]
+            or lineage["invocation_handle"] != handles["invocation_handle"]
+            or lineage["response_handle"] != handles["response_handle"]
+            or {
+                context_row["lineage_id"],
+                invocation_row["lineage_id"],
+                response_row["lineage_id"],
+            }
+            != {lineage["lineage_id"]}
+            or invocation_lineage["lineage_id"] != lineage["lineage_id"]
+            or response_lineage["lineage_id"] != lineage["lineage_id"]
+        ):
+            raise core.EvidenceError("append handle tuple is no longer current")
+        context = copy.deepcopy(context_row["body"])
+        invocation = copy.deepcopy(invocation_row["body"])
+        response = copy.deepcopy(response_row["body"])
+        session_body = copy.deepcopy(session["body"])
+        self._validate_candidate_facts(context, session_body)
+        record = self.build_host_orchestration_record(
+            context,
+            invocation,
+            response,
+            session_body,
+        )
+        return context, invocation, response, session_body, record
+
+    def _linearize_append_happy_path(
+        self,
+        lease: dict[str, Any],
+        transaction_nonce: str,
+        bodies: tuple[
+            dict[str, Any],
+            dict[str, Any],
+            dict[str, Any],
+            dict[str, Any],
+            dict[str, Any],
+        ],
+        frozen_record: bytes,
+    ) -> dict[str, Any]:
+        context, invocation, response, session_body, record = bodies
+        lease_id = lease["lease_id"]
+        session_id = lease["producer_session_id"]
+        handles = lease["handles"]
+        attempt_binding_id = session_body["attempt_binding_id"]
+        attempt = self._state["attempts"].get(attempt_binding_id)
+        if attempt is None or attempt["state"] != "ACTIVE":
+            raise core.EvidenceError("append attempt is not active")
+        expected_chain = {
+            "next_receipt_sequence": session_body["next_receipt_sequence"],
+            "previous_receipt_id": session_body["previous_receipt_id"],
+        }
+        if attempt["marker_receipt_chain"] != expected_chain:
+            raise core.EvidenceError("append receipt chain head drifted")
+        if self._clock() >= lease["transaction_deadline"]:
+            raise core.EvidenceError("append transaction deadline expired")
+
+        record_sha256 = hashlib.sha256(frozen_record).hexdigest()
+        if record_sha256 in self._state["blobs"]:
+            raise core.EvidenceError("append record blob already exists")
+        shadow = copy.deepcopy(self._state)
+        receipt_id = self._new_id(shadow, "producer-receipt")
+        receipt = {
+            "schema": "tersh-host-producer-receipt-v1",
+            "receipt_id": receipt_id,
+            "attempt_binding_id": attempt_binding_id,
+            "producer_session_id": session_body["producer_session_id"],
+            "sequence": session_body["next_receipt_sequence"],
+            "previous_receipt_id": session_body["previous_receipt_id"],
+            "producer_mode": session_body["producer_mode"],
+            "entrypoint": session_body["entrypoint"],
+            "bundle_id": session_body["bundle_id"],
+            "runtime_profile_id": session_body["runtime_profile_id"],
+            "policy_entry_id": session_body["policy_entry_id"],
+            "policy_entry_sha256": session_body["policy_entry_sha256"],
+            "environment_capability": None,
+            "projection_root_class": session_body["projection_root_class"],
+            "record_class": session_body["record_class"],
+            "record_schema": session_body["record_schema"],
+            "destination": session_body["destination"],
+            "body_sha256": record_sha256,
+            "byte_count": len(frozen_record),
+            "dispatch_id": None,
+            "reported_record_sha256": None,
+            "created_at": response["ended_at"],
+        }
+        core._validate_append_platform_producer_receipt(
+            receipt,
+            recorder_session=session_body,
+            record=record,
+        )
+
+        shadow_lease = shadow["leases"][lease_id]
+        shadow_lease["valid"] = False
+        shadow_lease["invalid_reason"] = "consumed"
+        for handle_id in (
+            handles["context_handle"],
+            handles["invocation_handle"],
+            handles["response_handle"],
+        ):
+            shadow["handles"][handle_id]["live"] = False
+        lineage = shadow["lineages"][lease["lineage_id"]]
+        lineage["state"] = "APPENDED_PLATFORM"
+        lineage["terminal_state"] = (
+            "appended-no-report"
+            if response["reported_record_sha256"] is None
+            else None
+        )
+        shadow_session = shadow["sessions"][session_id]
+        shadow_session["live"] = False
+        shadow_session["active_lease_id"] = None
+        shadow["blobs"][record_sha256] = bytes(frozen_record)
+        shadow["receipts"].append(copy.deepcopy(receipt))
+        shadow["records"].append(
+            {
+                "attempt_binding_id": attempt_binding_id,
+                "lineage_id": lease["lineage_id"],
+                "body": copy.deepcopy(record),
+                "body_bytes": bytes(frozen_record),
+                "body_sha256": record_sha256,
+                "receipt_id": receipt_id,
+            }
+        )
+        shadow_attempt = shadow["attempts"][attempt_binding_id]
+        shadow_attempt["marker_receipt_chain"] = {
+            "next_receipt_sequence": receipt["sequence"] + 1,
+            "previous_receipt_id": receipt_id,
+        }
+        if response["reported_record_sha256"] is not None:
+            authority = {
+                "schema": "tersh-host-agent-report-authority-v1",
+                "dispatch_id": invocation["dispatch_id"],
+                "attempt_binding_id": attempt_binding_id,
+                "agent_id": response["agent_id"],
+                "canonical_task_path": context["canonical_task_path"],
+                "agent_run_id": response["agent_run_id"],
+                "context_body_sha256": self._body_sha256(context),
+                "invocation_body_sha256": self._body_sha256(invocation),
+                "response_body_sha256": self._body_sha256(response),
+                "reported_result_commit": response["reported_result_commit"],
+                "reported_record_sha256": response["reported_record_sha256"],
+                "orchestration_receipt_id": receipt_id,
+                "draft_path": (
+                    f"private-agent-reports/{invocation['dispatch_id']}.json"
+                ),
+                "review_destination": (
+                    f"attempt-{context['evidence_attempt']}/"
+                    f"candidate-{session_body['candidate']}/review/"
+                    f"{context['role']}.{context['wave']}."
+                    f"{context['review_attempt']}.json"
+                ),
+            }
+            shadow["authorities"][invocation["dispatch_id"]] = authority
+        replay_key = (
+            f"{session_id}:{lease['connection_generation']}:"
+            f"{transaction_nonce}"
+        )
+        shadow["replays"][replay_key] = {
+            "lease_id": lease_id,
+            "lineage_id": lease["lineage_id"],
+            "receipt_id": receipt_id,
+        }
+        self._state = shadow
+        return copy.deepcopy(receipt)
+
+    def serve_append_platform(
+        self,
+        sock: Any,
+        lease_value: Any,
+        *,
+        fault_at: Any = None,
+    ) -> None:
+        """Serve the Task-7 non-faulted append-platform wire transcript."""
+
+        if fault_at is not None:
+            raise core.EvidenceError("Task 7 Host wire does not implement fault hooks")
+        lease, session = self._bound_append_lease_before_handles(
+            lease_value,
+            sock,
+        )
+        lease_id = lease["lease_id"]
+        launch_wire_deadline = time.monotonic() + max(
+            0.0,
+            lease["launch_deadline"] - self._clock(),
+        )
+        committed = False
+        try:
+            begin = _require_closed_object(
+                core.recv_host_frame(sock, launch_wire_deadline),
+                {
+                    "schema",
+                    "transaction_nonce",
+                    "operation",
+                    "context_handle",
+                    "invocation_handle",
+                    "response_handle",
+                },
+                "append-platform BEGIN",
+            )
+            _require_literal(
+                begin["schema"],
+                "tersh-host-transaction-begin-v1",
+                "append-platform BEGIN schema",
+            )
+            _require_literal(
+                begin["operation"],
+                "append-platform",
+                "append-platform BEGIN operation",
+            )
+            transaction_nonce = core.validate_sha256(
+                begin["transaction_nonce"],
+                "append-platform transaction nonce",
+            )
+            wire_deadline = time.monotonic() + core.HOST_TRANSACTION_TIMEOUT_SECONDS
+
+            shadow = copy.deepcopy(self._state)
+            shadow["leases"][lease_id]["transaction_nonce"] = transaction_nonce
+            shadow["leases"][lease_id]["transaction_deadline"] = self._clock() + 5.0
+            self._state = shadow
+            lease = self._state["leases"][lease_id]
+            for field in (
+                "context_handle",
+                "invocation_handle",
+                "response_handle",
+            ):
+                if begin[field] != lease["handles"][field]:
+                    raise core.EvidenceError(
+                        "append-platform BEGIN handle does not match bound lease"
+                    )
+
+            bodies = self._append_body_tuple(lease, session)
+            body_kinds = (
+                "context",
+                "invocation",
+                "response",
+                "recorder-session",
+                "orchestration-record",
+            )
+            body_hashes = [self._body_sha256(body) for body in bodies]
+            frozen_record = core.canonical_json_bytes(bodies[4])
+            if not 1 <= len(frozen_record) <= core.ORCHESTRATION_RECORD_MAX_BYTES:
+                raise core.EvidenceError("Host record is outside 1..61440 bytes")
+            for ordinal, (body_kind, body, digest) in enumerate(
+                zip(body_kinds, bodies, body_hashes),
+                start=1,
+            ):
+                core.send_host_frame(
+                    sock,
+                    {
+                        "schema": "tersh-host-transaction-body-v1",
+                        "transaction_nonce": transaction_nonce,
+                        "operation": "append-platform",
+                        "body_kind": body_kind,
+                        "ordinal": ordinal,
+                        "total": 5,
+                        "body": body,
+                        "body_sha256": digest,
+                    },
+                    wire_deadline,
+                )
+            core.send_host_frame(
+                sock,
+                {
+                    "schema": "tersh-host-transaction-body-end-v1",
+                    "transaction_nonce": transaction_nonce,
+                    "operation": "append-platform",
+                    "total": 5,
+                    "body_sha256s": body_hashes,
+                },
+                wire_deadline,
+            )
+
+            expected_commit = {
+                "schema": "tersh-host-transaction-commit-v1",
+                "transaction_nonce": transaction_nonce,
+                "operation": "append-platform",
+                "body_sha256s": body_hashes,
+                "record_facts": {
+                    "evidence_id": bodies[0]["evidence_id"],
+                    "evidence_attempt": bodies[0]["evidence_attempt"],
+                    "run_binding": bodies[0]["run_binding"],
+                    "candidate": bodies[3]["candidate"],
+                    "destination": bodies[3]["destination"],
+                    "record_sha256": body_hashes[4],
+                },
+            }
+            commit = core.recv_host_frame(sock, wire_deadline)
+            if commit != expected_commit:
+                raise core.EvidenceError("append-platform COMMIT is not exact")
+            expected_request_end = {
+                "schema": "tersh-host-transaction-request-end-v1",
+                "transaction_nonce": transaction_nonce,
+                "operation": "append-platform",
+                "commit_sha256": hashlib.sha256(
+                    core.canonical_json_bytes(commit)
+                ).hexdigest(),
+            }
+            request_end = core.recv_host_frame(sock, wire_deadline)
+            if request_end != expected_request_end:
+                raise core.EvidenceError("append-platform REQUEST-END is not exact")
+            core.require_host_eof(sock, wire_deadline)
+
+            lease, current_session = self._bound_append_lease_before_handles(
+                lease_value,
+                sock,
+                check_launch_deadline=False,
+            )
+            current_bodies = self._append_body_tuple(lease, current_session)
+            if current_bodies != bodies:
+                raise core.EvidenceError("append-platform BODY facts drifted before commit")
+            if core.canonical_json_bytes(current_bodies[4]) != frozen_record:
+                raise core.EvidenceError("append-platform frozen record bytes drifted")
+            receipt = self._linearize_append_happy_path(
+                lease,
+                transaction_nonce,
+                bodies,
+                frozen_record,
+            )
+            committed = True
+            reply = {
+                "schema": "tersh-host-transaction-reply-v1",
+                "transaction_nonce": transaction_nonce,
+                "operation": "append-platform",
+                "body_sha256s": body_hashes,
+                "result": {
+                    "schema": "tersh-host-record-result-v1",
+                    "receipt": receipt,
+                },
+            }
+            core.send_host_frame(sock, reply, wire_deadline)
+            core.send_host_frame(
+                sock,
+                {
+                    "schema": "tersh-host-transaction-reply-end-v1",
+                    "transaction_nonce": transaction_nonce,
+                    "operation": "append-platform",
+                    "reply_sha256": hashlib.sha256(
+                        core.canonical_json_bytes(reply)
+                    ).hexdigest(),
+                },
+                wire_deadline,
+            )
+            try:
+                sock.shutdown(socket.SHUT_WR)
+            except OSError as error:
+                raise core.EvidenceError(
+                    f"Host append reply half-close failed: {error}"
+                ) from error
+        except BaseException:
+            if (
+                not committed
+                and lease_id in self._state["leases"]
+                and self._state["leases"][lease_id]["valid"]
+            ):
+                self._invalidate_lease(lease_id, "pre-linearization-failure")
+            raise
 
     def append_platform(
         self,

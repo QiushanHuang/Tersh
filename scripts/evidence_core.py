@@ -26,7 +26,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 
 EVIDENCE_ID_RE = re.compile(r"^(?:impl|hardening)-0[1-7]$")
@@ -1476,6 +1476,126 @@ def _validate_capture_result(
     return result
 
 
+def _receive_host_body_sequence(
+    sock: socket.socket,
+    transaction_nonce: str,
+    operation: str,
+    body_order: Sequence[str],
+    validators: dict[str, Callable[[Any], dict[str, Any]]],
+    deadline: float,
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    """Receive one exact ordered BODY sequence and its closing BODY-END."""
+
+    connection = _require_host_socket(sock)
+    validate_sha256(transaction_nonce, "transaction nonce")
+    if type(operation) is not str or not operation:
+        raise EvidenceError("host operation must be a nonempty exact string")
+    if type(body_order) not in (tuple, list) or not body_order:
+        raise EvidenceError("host BODY order must be a nonempty exact sequence")
+    if (
+        any(type(body_kind) is not str or not body_kind for body_kind in body_order)
+        or len(set(body_order)) != len(body_order)
+        or type(validators) is not dict
+        or set(validators) != set(body_order)
+        or any(not callable(validator) for validator in validators.values())
+    ):
+        raise EvidenceError("host BODY order and validators do not match exactly")
+
+    wrapper_keys = {
+        "schema", "transaction_nonce", "operation", "body_kind", "ordinal",
+        "total", "body", "body_sha256",
+    }
+    body_hashes: list[str] = []
+    bodies: dict[str, dict[str, Any]] = {}
+    for ordinal, body_kind in enumerate(body_order, start=1):
+        wrapper = _require_closed_object(
+            recv_host_frame(connection, deadline),
+            wrapper_keys,
+            "host BODY wrapper",
+        )
+        _require_literal(
+            wrapper["schema"],
+            "tersh-host-transaction-body-v1",
+            "BODY schema",
+        )
+        _require_literal(
+            wrapper["transaction_nonce"],
+            transaction_nonce,
+            "BODY transaction nonce",
+        )
+        _require_literal(wrapper["operation"], operation, "BODY operation")
+        _require_literal(wrapper["body_kind"], body_kind, "BODY kind")
+        if require_exact_int(wrapper["ordinal"], "BODY ordinal", minimum=1) != ordinal:
+            raise EvidenceError("BODY ordinal is not the expected one-based value")
+        if (
+            require_exact_int(wrapper["total"], "BODY total", minimum=1)
+            != len(body_order)
+        ):
+            raise EvidenceError("BODY total does not match operation body count")
+        body = validators[body_kind](wrapper["body"])
+        if type(body) is not dict:
+            raise EvidenceError("BODY validator did not return an exact object")
+        digest = sha256_bytes(canonical_json_bytes(body))
+        validate_sha256(wrapper["body_sha256"], "BODY sha256")
+        if wrapper["body_sha256"] != digest:
+            raise EvidenceError("BODY sha256 does not match its canonical body")
+        bodies[body_kind] = body
+        body_hashes.append(digest)
+
+    body_end = _require_closed_object(
+        recv_host_frame(connection, deadline),
+        {"schema", "transaction_nonce", "operation", "total", "body_sha256s"},
+        "host BODY-END",
+    )
+    _require_literal(
+        body_end["schema"],
+        "tersh-host-transaction-body-end-v1",
+        "BODY-END schema",
+    )
+    _require_literal(
+        body_end["transaction_nonce"],
+        transaction_nonce,
+        "BODY-END transaction nonce",
+    )
+    _require_literal(body_end["operation"], operation, "BODY-END operation")
+    if (
+        require_exact_int(body_end["total"], "BODY-END total", minimum=1)
+        != len(body_order)
+    ):
+        raise EvidenceError("BODY-END total does not match operation body count")
+    if type(body_end["body_sha256s"]) is not list:
+        raise EvidenceError("BODY-END body_sha256s must be an array")
+    for digest in body_end["body_sha256s"]:
+        validate_sha256(digest, "BODY-END digest")
+    if body_end["body_sha256s"] != body_hashes:
+        raise EvidenceError("BODY-END digests do not match BODY sequence")
+    return bodies, body_hashes
+
+
+def _send_host_request_end(
+    sock: socket.socket,
+    transaction_nonce: str,
+    operation: str,
+    commit: dict[str, Any],
+    deadline: float,
+) -> None:
+    """Send exact COMMIT and REQUEST-END, then half-close the request."""
+
+    connection = _require_host_socket(sock)
+    send_host_frame(connection, commit, deadline)
+    request_end = {
+        "schema": "tersh-host-transaction-request-end-v1",
+        "transaction_nonce": transaction_nonce,
+        "operation": operation,
+        "commit_sha256": sha256_bytes(canonical_json_bytes(commit)),
+    }
+    send_host_frame(connection, request_end, deadline)
+    try:
+        connection.shutdown(socket.SHUT_WR)
+    except OSError as error:
+        raise EvidenceError(f"host request half-close failed: {error}") from error
+
+
 def capture_host_envelope_on_authenticated_socket(
     sock: Any,
     operation: Any,
@@ -1513,55 +1633,22 @@ def capture_host_envelope_on_authenticated_socket(
     send_host_frame(connection, begin, deadline)
 
     body_order = body_order_by_operation[operation]
-    body_hashes: list[str] = []
-    bodies: dict[str, dict[str, Any]] = {}
-    validators = {
+    available_validators = {
         "context": _validate_context_body,
         "invocation": _validate_invocation_body,
         "response": _validate_response_body,
     }
-    wrapper_keys = {
-        "schema", "transaction_nonce", "operation", "body_kind", "ordinal",
-        "total", "body", "body_sha256",
-    }
-    for ordinal, body_kind in enumerate(body_order, start=1):
-        wrapper = _require_closed_object(
-            recv_host_frame(connection, deadline),
-            wrapper_keys,
-            "host BODY wrapper",
-        )
-        _require_literal(wrapper["schema"], "tersh-host-transaction-body-v1", "BODY schema")
-        _require_literal(wrapper["transaction_nonce"], transaction_nonce, "BODY transaction nonce")
-        _require_literal(wrapper["operation"], operation, "BODY operation")
-        _require_literal(wrapper["body_kind"], body_kind, "BODY kind")
-        if require_exact_int(wrapper["ordinal"], "BODY ordinal", minimum=1) != ordinal:
-            raise EvidenceError("BODY ordinal is not the expected one-based value")
-        if require_exact_int(wrapper["total"], "BODY total", minimum=1) != len(body_order):
-            raise EvidenceError("BODY total does not match operation body count")
-        body = validators[body_kind](wrapper["body"])
-        digest = sha256_bytes(canonical_json_bytes(body))
-        validate_sha256(wrapper["body_sha256"], "BODY sha256")
-        if wrapper["body_sha256"] != digest:
-            raise EvidenceError("BODY sha256 does not match its canonical body")
-        bodies[body_kind] = body
-        body_hashes.append(digest)
-
-    body_end = _require_closed_object(
-        recv_host_frame(connection, deadline),
-        {"schema", "transaction_nonce", "operation", "total", "body_sha256s"},
-        "host BODY-END",
+    bodies, body_hashes = _receive_host_body_sequence(
+        connection,
+        transaction_nonce,
+        operation,
+        body_order,
+        {
+            body_kind: available_validators[body_kind]
+            for body_kind in body_order
+        },
+        deadline,
     )
-    _require_literal(body_end["schema"], "tersh-host-transaction-body-end-v1", "BODY-END schema")
-    _require_literal(body_end["transaction_nonce"], transaction_nonce, "BODY-END transaction nonce")
-    _require_literal(body_end["operation"], operation, "BODY-END operation")
-    if require_exact_int(body_end["total"], "BODY-END total", minimum=1) != len(body_order):
-        raise EvidenceError("BODY-END total does not match operation body count")
-    if type(body_end["body_sha256s"]) is not list:
-        raise EvidenceError("BODY-END body_sha256s must be an array")
-    for digest in body_end["body_sha256s"]:
-        validate_sha256(digest, "BODY-END digest")
-    if body_end["body_sha256s"] != body_hashes:
-        raise EvidenceError("BODY-END digests do not match BODY sequence")
     _validate_capture_relationships(operation, bodies)
 
     commit = {
@@ -1570,18 +1657,13 @@ def capture_host_envelope_on_authenticated_socket(
         "operation": operation,
         "body_sha256s": body_hashes,
     }
-    send_host_frame(connection, commit, deadline)
-    request_end = {
-        "schema": "tersh-host-transaction-request-end-v1",
-        "transaction_nonce": transaction_nonce,
-        "operation": operation,
-        "commit_sha256": sha256_bytes(canonical_json_bytes(commit)),
-    }
-    send_host_frame(connection, request_end, deadline)
-    try:
-        connection.shutdown(socket.SHUT_WR)
-    except OSError as error:
-        raise EvidenceError(f"host request half-close failed: {error}") from error
+    _send_host_request_end(
+        connection,
+        transaction_nonce,
+        operation,
+        commit,
+        deadline,
+    )
 
     reply = _require_closed_object(
         recv_host_frame(connection, deadline),
@@ -1612,6 +1694,199 @@ def capture_host_envelope_on_authenticated_socket(
         raise EvidenceError("REPLY-END digest does not match REPLY")
     require_host_eof(connection, deadline)
     return result
+
+
+def append_platform_on_authenticated_socket(
+    sock: Any,
+    context_handle: Any,
+    invocation_handle: Any,
+    response_handle: Any,
+) -> dict[str, Any]:
+    """Append one Host-built platform orchestration record over an authenticated socket."""
+
+    connection = _require_host_socket(sock)
+    handles = (
+        validate_sha256(context_handle, "context handle"),
+        validate_sha256(invocation_handle, "invocation handle"),
+        validate_sha256(response_handle, "response handle"),
+    )
+    if len(set(handles)) != len(handles):
+        raise EvidenceError("append-platform handles must be distinct")
+
+    operation = "append-platform"
+    deadline = time.monotonic() + HOST_TRANSACTION_TIMEOUT_SECONDS
+    transaction_nonce = validate_sha256(
+        secrets.token_hex(32),
+        "transaction nonce",
+    )
+    if transaction_nonce in handles:
+        raise EvidenceError("append-platform transaction nonce aliases a handle")
+    begin = {
+        "schema": "tersh-host-transaction-begin-v1",
+        "transaction_nonce": transaction_nonce,
+        "operation": operation,
+        "context_handle": handles[0],
+        "invocation_handle": handles[1],
+        "response_handle": handles[2],
+    }
+    send_host_frame(connection, begin, deadline)
+
+    def validate_session_body(value: Any) -> dict[str, Any]:
+        return copy.deepcopy(
+            _require_closed_object(
+                value,
+                _ORCHESTRATION_RECORDER_SESSION_KEYS,
+                "append-platform recorder session BODY",
+            )
+        )
+
+    def validate_record_body(value: Any) -> dict[str, Any]:
+        record = _require_closed_object(
+            value,
+            _ORCHESTRATION_RECORD_KEYS,
+            "append-platform orchestration record BODY",
+        )
+        _require_literal(
+            record["schema"],
+            "tersh-evidence-orchestration-v1",
+            "append-platform orchestration record schema",
+        )
+        return copy.deepcopy(record)
+
+    body_order = (
+        "context",
+        "invocation",
+        "response",
+        "recorder-session",
+        "orchestration-record",
+    )
+    bodies, body_hashes = _receive_host_body_sequence(
+        connection,
+        transaction_nonce,
+        operation,
+        body_order,
+        {
+            "context": _validate_context_body,
+            "invocation": _validate_invocation_body,
+            "response": _validate_response_body,
+            "recorder-session": validate_session_body,
+            "orchestration-record": validate_record_body,
+        },
+        deadline,
+    )
+    context = bodies["context"]
+    invocation = bodies["invocation"]
+    response = bodies["response"]
+    session = validate_orchestration_recorder_session(
+        bodies["recorder-session"],
+        context=context,
+        invocation=invocation,
+        response=response,
+    )
+    derived_record = derive_platform_orchestration_record(
+        context,
+        invocation,
+        response,
+        session,
+    )
+    host_record = bodies["orchestration-record"]
+    if host_record != derived_record:
+        raise EvidenceError(
+            "Host orchestration record does not equal independent client derivation"
+        )
+    frozen_record = canonical_json_bytes(host_record)
+    record_digest = sha256_bytes(frozen_record)
+    if body_hashes[4] != record_digest:
+        raise EvidenceError("Host orchestration record digest does not match BODY 5")
+    if not 1 <= len(frozen_record) <= ORCHESTRATION_RECORD_MAX_BYTES:
+        raise EvidenceError("append-platform record is outside 1..61440 bytes")
+
+    commit = {
+        "schema": "tersh-host-transaction-commit-v1",
+        "transaction_nonce": transaction_nonce,
+        "operation": operation,
+        "body_sha256s": body_hashes,
+        "record_facts": {
+            "evidence_id": context["evidence_id"],
+            "evidence_attempt": context["evidence_attempt"],
+            "run_binding": context["run_binding"],
+            "candidate": session["candidate"],
+            "destination": session["destination"],
+            "record_sha256": body_hashes[4],
+        },
+    }
+    _send_host_request_end(
+        connection,
+        transaction_nonce,
+        operation,
+        commit,
+        deadline,
+    )
+
+    reply = _require_closed_object(
+        recv_host_frame(connection, deadline),
+        {"schema", "transaction_nonce", "operation", "body_sha256s", "result"},
+        "host REPLY",
+    )
+    _require_literal(
+        reply["schema"],
+        "tersh-host-transaction-reply-v1",
+        "REPLY schema",
+    )
+    _require_literal(
+        reply["transaction_nonce"],
+        transaction_nonce,
+        "REPLY transaction nonce",
+    )
+    _require_literal(reply["operation"], operation, "REPLY operation")
+    if type(reply["body_sha256s"]) is not list:
+        raise EvidenceError("REPLY body_sha256s must be an array")
+    for digest in reply["body_sha256s"]:
+        validate_sha256(digest, "REPLY body digest")
+    if reply["body_sha256s"] != body_hashes:
+        raise EvidenceError("REPLY body digests do not match committed bodies")
+
+    result = _require_closed_object(
+        reply["result"],
+        {"schema", "receipt"},
+        "append-platform record result",
+    )
+    _require_literal(
+        result["schema"],
+        "tersh-host-record-result-v1",
+        "append-platform record result schema",
+    )
+    receipt = _validate_append_platform_producer_receipt(
+        result["receipt"],
+        recorder_session=session,
+        record=host_record,
+    )
+    detached_result = {
+        "schema": result["schema"],
+        "receipt": receipt,
+    }
+
+    reply_end = _require_closed_object(
+        recv_host_frame(connection, deadline),
+        {"schema", "transaction_nonce", "operation", "reply_sha256"},
+        "host REPLY-END",
+    )
+    _require_literal(
+        reply_end["schema"],
+        "tersh-host-transaction-reply-end-v1",
+        "REPLY-END schema",
+    )
+    _require_literal(
+        reply_end["transaction_nonce"],
+        transaction_nonce,
+        "REPLY-END transaction nonce",
+    )
+    _require_literal(reply_end["operation"], operation, "REPLY-END operation")
+    validate_sha256(reply_end["reply_sha256"], "REPLY-END digest")
+    if reply_end["reply_sha256"] != sha256_bytes(canonical_json_bytes(reply)):
+        raise EvidenceError("REPLY-END digest does not match REPLY")
+    require_host_eof(connection, deadline)
+    return copy.deepcopy(detached_result)
 
 
 def parse_output_root(raw: Any) -> tuple[bool, tuple[str, ...]]:
