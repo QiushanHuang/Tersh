@@ -1611,13 +1611,19 @@ class ImplementationEvidenceTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, adapter_source)
 
+        shared_core = importlib.import_module("scripts.evidence_core")
         adapter_module = importlib.import_module(
             "scripts.implementation_evidence.host_envelope_adapter"
         )
         self.assertIs(
-            getattr(adapter_module, "core", None),
             importlib.import_module("scripts.evidence_core"),
-            "adapter must call the shared evidence_core module",
+            shared_core,
+            "exact-path adapter loading must not replace the shared module identity",
+        )
+        self.assertEqual(
+            pathlib.Path(adapter_module.core.__file__).resolve(),
+            adapter_module.CORE_PATH,
+            "adapter must call the exact harness-root evidence_core module",
         )
         unisolated_help = subprocess.run(
             [sys.executable, str(adapter), "--help"],

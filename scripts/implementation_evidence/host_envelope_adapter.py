@@ -26,12 +26,11 @@ def _load_trusted_core() -> Any:
     sys.modules[CORE_MODULE_NAME] = module
     try:
         spec.loader.exec_module(module)
-    except BaseException:
+    finally:
         if previous is None:
             sys.modules.pop(CORE_MODULE_NAME, None)
         else:
             sys.modules[CORE_MODULE_NAME] = previous
-        raise
     return module
 
 

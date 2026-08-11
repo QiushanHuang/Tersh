@@ -10,6 +10,7 @@ import pathlib
 import re
 import socket
 import struct
+import sys
 import tempfile
 import threading
 import time
@@ -5850,8 +5851,10 @@ class RecordOrchestrationCliTests(unittest.TestCase):
             self.assertNotIn(forbidden, source)
 
     def test_record_orchestration_isolated_runtime_and_exact_harness_imports(self):
+        previous_core = sys.modules.get("scripts.evidence_core")
         module = self.load_cli()
         source = self.CLI_PATH.read_text(encoding="utf-8")
+        self.assertIs(sys.modules.get("scripts.evidence_core"), previous_core)
         self.assertEqual(module.HARNESS_ROOT, self.CLI_PATH.resolve().parents[2])
         self.assertEqual(
             module.CORE_PATH,
