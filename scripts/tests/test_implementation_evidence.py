@@ -321,6 +321,26 @@ class ImplementationEvidenceTests(unittest.TestCase):
         }
         return context, invocation, response
 
+    def platform_envelope_provenance(self):
+        context, invocation, response = self.host_envelope_bodies()
+        bodies = {
+            "context": context,
+            "invocation": invocation,
+            "response": response,
+        }
+        return {
+            "mode": "platform-envelope",
+            **{
+                kind: {
+                    "body": body,
+                    "sha256": hashlib.sha256(
+                        fixture_canonical_json(body)
+                    ).hexdigest(),
+                }
+                for kind, body in bodies.items()
+            },
+        }
+
     def run_scripted_capture(
         self,
         store,
@@ -2365,6 +2385,364 @@ class ImplementationEvidenceTests(unittest.TestCase):
         )
         self.assertIn(response_result["context_handle"], store.contexts)
         self.assertIn(response_result["response_handle"], store.responses)
+
+    def test_validate_platform_envelope_provenance_embeds_exact_canonical_triplet(self):
+        core = importlib.import_module("scripts.evidence_core")
+        validate = getattr(core, "validate_platform_envelope_provenance", None)
+        self.assertTrue(
+            callable(validate),
+            "shared platform-envelope provenance validator is required",
+        )
+        provenance = self.platform_envelope_provenance()
+        before = copy.deepcopy(provenance)
+
+        validated = validate(provenance)
+
+        self.assertIs(type(validated), dict)
+        self.assertEqual(
+            set(validated),
+            {"mode", "context", "invocation", "response"},
+        )
+        self.assertEqual(validated["mode"], "platform-envelope")
+        self.assertEqual(provenance, before, "validation mutated its input")
+        self.assertEqual(validated, before)
+        self.assertIsNot(validated, provenance)
+        for kind in ("context", "invocation", "response"):
+            with self.subTest(kind=kind):
+                self.assertIs(type(validated[kind]), dict)
+                self.assertEqual(set(validated[kind]), {"body", "sha256"})
+                self.assertIs(type(validated[kind]["body"]), dict)
+                self.assertEqual(validated[kind]["body"], before[kind]["body"])
+                self.assertIsNot(validated[kind], provenance[kind])
+                self.assertIsNot(
+                    validated[kind]["body"],
+                    provenance[kind]["body"],
+                )
+                self.assertEqual(
+                    validated[kind]["sha256"],
+                    hashlib.sha256(
+                        fixture_canonical_json(before[kind]["body"])
+                    ).hexdigest(),
+                )
+
+        equal_timestamp = "2026-08-10T00:00:00.000000001Z"
+        for terminal_status in (
+            "completed",
+            "failed",
+            "cancelled",
+            "interrupted",
+        ):
+            for reported_result_commit in (None, self.candidate_b):
+                for reported_record_sha256 in (None, "a" * 64):
+                    with self.subTest(
+                        terminal_status=terminal_status,
+                        reported_result_commit=reported_result_commit,
+                        reported_record_sha256=reported_record_sha256,
+                        equal_timestamps=True,
+                    ):
+                        variant = self.platform_envelope_provenance()
+                        variant["context"]["body"]["created_at"] = equal_timestamp
+                        variant["invocation"]["body"][
+                            "dispatched_at"
+                        ] = equal_timestamp
+                        variant["response"]["body"]["started_at"] = equal_timestamp
+                        variant["response"]["body"]["ended_at"] = equal_timestamp
+                        variant["response"]["body"][
+                            "terminal_status"
+                        ] = terminal_status
+                        variant["response"]["body"][
+                            "reported_result_commit"
+                        ] = reported_result_commit
+                        variant["response"]["body"][
+                            "reported_record_sha256"
+                        ] = reported_record_sha256
+                        for kind in ("context", "invocation", "response"):
+                            variant[kind]["sha256"] = hashlib.sha256(
+                                fixture_canonical_json(variant[kind]["body"])
+                            ).hexdigest()
+                        variant_before = copy.deepcopy(variant)
+
+                        accepted = validate(variant)
+
+                        self.assertEqual(accepted, variant_before)
+                        self.assertEqual(variant, variant_before)
+                        self.assertIsNot(accepted, variant)
+                        for kind in ("context", "invocation", "response"):
+                            self.assertIsNot(
+                                accepted[kind]["body"],
+                                variant[kind]["body"],
+                            )
+                            self.assertEqual(
+                                accepted[kind]["sha256"],
+                                hashlib.sha256(
+                                    fixture_canonical_json(
+                                        variant_before[kind]["body"]
+                                    )
+                                ).hexdigest(),
+                            )
+
+        validated["context"]["body"]["role"] = "product"
+        validated["invocation"]["body"]["dispatch_id"] = "e" * 64
+        validated["response"]["body"]["agent_id"] = "changed-agent"
+        self.assertEqual(
+            provenance,
+            before,
+            "validated provenance does not own detached body copies",
+        )
+
+    def test_validate_platform_envelope_provenance_rejects_closed_digest_dispatch_and_lifecycle_drift(self):
+        core = importlib.import_module("scripts.evidence_core")
+        validate = getattr(core, "validate_platform_envelope_provenance", None)
+        self.assertTrue(
+            callable(validate),
+            "shared platform-envelope provenance validator is required",
+        )
+
+        def rehash(provenance, *kinds):
+            for kind in kinds:
+                provenance[kind]["sha256"] = hashlib.sha256(
+                    fixture_canonical_json(provenance[kind]["body"])
+                ).hexdigest()
+            return provenance
+
+        def alternate_digest(current):
+            for character in ("0", "1"):
+                candidate = character * 64
+                if candidate != current:
+                    return candidate
+            raise AssertionError("cannot construct an alternate valid digest")
+
+        def outer_extra(provenance):
+            provenance["extra"] = None
+            return provenance
+
+        def outer_missing_invocation(provenance):
+            del provenance["invocation"]
+            return provenance
+
+        def wrong_mode(provenance):
+            provenance["mode"] = "operator-attestation"
+            return provenance
+
+        def entry_extra(provenance):
+            provenance["context"]["extra"] = None
+            return provenance
+
+        def entry_missing_body(provenance):
+            del provenance["invocation"]["body"]
+            return provenance
+
+        def entry_missing_digest(provenance):
+            del provenance["response"]["sha256"]
+            return provenance
+
+        def digest_drift(provenance):
+            provenance["context"]["sha256"] = alternate_digest(
+                provenance["context"]["sha256"]
+            )
+            return provenance
+
+        def invocation_digest_drift(provenance):
+            provenance["invocation"]["sha256"] = alternate_digest(
+                provenance["invocation"]["sha256"]
+            )
+            return provenance
+
+        def response_digest_drift(provenance):
+            provenance["response"]["sha256"] = alternate_digest(
+                provenance["response"]["sha256"]
+            )
+            return provenance
+
+        def context_body_extra(provenance):
+            provenance["context"]["body"]["extra"] = None
+            return rehash(provenance, "context")
+
+        def context_wrong_schema(provenance):
+            provenance["context"]["body"][
+                "schema"
+            ] = "tersh-host-dispatch-context-v0"
+            return rehash(provenance, "context")
+
+        def context_wrong_role(provenance):
+            provenance["context"]["body"]["role"] = "observer"
+            return rehash(provenance, "context")
+
+        def context_bool_evidence_attempt(provenance):
+            provenance["context"]["body"]["evidence_attempt"] = True
+            return rehash(provenance, "context")
+
+        def invocation_wrong_schema(provenance):
+            provenance["invocation"]["body"][
+                "schema"
+            ] = "tersh-host-spawn-invocation-v0"
+            return rehash(provenance, "invocation")
+
+        def invocation_wrong_selected_model(provenance):
+            provenance["invocation"]["body"][
+                "selected_model"
+            ] = "untrusted-model"
+            return rehash(provenance, "invocation")
+
+        def invocation_body_extra(provenance):
+            provenance["invocation"]["body"]["extra"] = None
+            return rehash(provenance, "invocation")
+
+        def response_legacy_schema(provenance):
+            provenance["response"]["body"][
+                "schema"
+            ] = "tersh-host-spawn-response-v1"
+            return rehash(provenance, "response")
+
+        def response_unknown_terminal_status(provenance):
+            provenance["response"]["body"]["terminal_status"] = "unknown"
+            return rehash(provenance, "response")
+
+        def response_bool_terminal_status(provenance):
+            provenance["response"]["body"]["terminal_status"] = True
+            return rehash(provenance, "response")
+
+        def response_malformed_report_digest(provenance):
+            provenance["response"]["body"]["reported_record_sha256"] = "g" * 64
+            return rehash(provenance, "response")
+
+        def response_body_extra(provenance):
+            provenance["response"]["body"]["extra"] = None
+            return rehash(provenance, "response")
+
+        def both_members_wrong_bundle(provenance):
+            for kind in ("invocation", "response"):
+                provenance[kind]["body"]["harness_bundle_revision"] = "6" * 40
+                provenance[kind]["body"]["harness_bundle_sha256"] = "9" * 64
+            return rehash(provenance, "invocation", "response")
+
+        def invocation_revision_drift(provenance):
+            provenance["invocation"]["body"]["harness_bundle_revision"] = "6" * 40
+            return rehash(provenance, "invocation")
+
+        def response_revision_drift(provenance):
+            provenance["response"]["body"]["harness_bundle_revision"] = "6" * 40
+            return rehash(provenance, "response")
+
+        def invocation_bundle_hash_drift(provenance):
+            provenance["invocation"]["body"]["harness_bundle_sha256"] = "9" * 64
+            return rehash(provenance, "invocation")
+
+        def response_bundle_hash_drift(provenance):
+            provenance["response"]["body"]["harness_bundle_sha256"] = "9" * 64
+            return rehash(provenance, "response")
+
+        def both_members_nonce_drift(provenance):
+            for kind in ("invocation", "response"):
+                provenance[kind]["body"]["context_nonce"] = "e" * 64
+            return rehash(provenance, "invocation", "response")
+
+        def invocation_nonce_drift(provenance):
+            provenance["invocation"]["body"]["context_nonce"] = "e" * 64
+            return rehash(provenance, "invocation")
+
+        def response_nonce_drift(provenance):
+            provenance["response"]["body"]["context_nonce"] = "e" * 64
+            return rehash(provenance, "response")
+
+        def dispatch_drift(provenance):
+            provenance["response"]["body"]["dispatch_id"] = "e" * 64
+            return rehash(provenance, "response")
+
+        def task_drift(provenance):
+            provenance["response"]["body"][
+                "canonical_task_path"
+            ] = "/root/other/reviewer"
+            return rehash(provenance, "response")
+
+        def created_after_dispatched(provenance):
+            provenance["context"]["body"][
+                "created_at"
+            ] = "2026-08-10T00:00:01.000000002Z"
+            return rehash(provenance, "context")
+
+        def dispatched_after_started(provenance):
+            provenance["invocation"]["body"][
+                "dispatched_at"
+            ] = "2026-08-10T00:00:02.000000002Z"
+            return rehash(provenance, "invocation")
+
+        def started_after_ended(provenance):
+            provenance["response"]["body"][
+                "started_at"
+            ] = "2026-08-10T00:00:04.000000001Z"
+            return rehash(provenance, "response")
+
+        valid = self.platform_envelope_provenance()
+        self.assertEqual(validate(valid), valid)
+        invalid_mutators = (
+            outer_extra,
+            outer_missing_invocation,
+            wrong_mode,
+            entry_extra,
+            entry_missing_body,
+            entry_missing_digest,
+            digest_drift,
+            invocation_digest_drift,
+            response_digest_drift,
+            context_body_extra,
+            context_wrong_schema,
+            context_wrong_role,
+            context_bool_evidence_attempt,
+            invocation_wrong_schema,
+            invocation_wrong_selected_model,
+            invocation_body_extra,
+            response_legacy_schema,
+            response_unknown_terminal_status,
+            response_bool_terminal_status,
+            response_malformed_report_digest,
+            response_body_extra,
+            both_members_wrong_bundle,
+            invocation_revision_drift,
+            response_revision_drift,
+            invocation_bundle_hash_drift,
+            response_bundle_hash_drift,
+            both_members_nonce_drift,
+            invocation_nonce_drift,
+            response_nonce_drift,
+            dispatch_drift,
+            task_drift,
+            created_after_dispatched,
+            dispatched_after_started,
+            started_after_ended,
+        )
+        digest_only_mutators = {
+            digest_drift: "context",
+            invocation_digest_drift: "invocation",
+            response_digest_drift: "response",
+        }
+        for mutator in invalid_mutators:
+            with self.subTest(mutation=mutator.__name__):
+                pristine = self.platform_envelope_provenance()
+                invalid = mutator(copy.deepcopy(pristine))
+                digest_kind = digest_only_mutators.get(mutator)
+                if digest_kind is not None:
+                    self.assertEqual(
+                        invalid[digest_kind]["body"],
+                        pristine[digest_kind]["body"],
+                        f"{mutator.__name__} unexpectedly changed its body",
+                    )
+                    self.assertRegex(
+                        invalid[digest_kind]["sha256"],
+                        r"^[0-9a-f]{64}$",
+                    )
+                    self.assertNotEqual(
+                        invalid[digest_kind]["sha256"],
+                        pristine[digest_kind]["sha256"],
+                    )
+                before = copy.deepcopy(invalid)
+                with self.assertRaises(core.EvidenceError):
+                    validate(invalid)
+                self.assertEqual(
+                    invalid,
+                    before,
+                    f"{mutator.__name__} rejection mutated its input",
+                )
 
     def test_capture_response_v2_accepts_null_or_exact_report_digest(self):
         for reported_record_sha256 in (None, "a" * 64):

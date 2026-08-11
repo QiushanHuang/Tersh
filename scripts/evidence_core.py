@@ -7,6 +7,7 @@ re-open that could traverse a substituted symlink.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import math
@@ -658,6 +659,89 @@ def _validate_response_body(value: Any) -> dict[str, Any]:
     if body["reported_record_sha256"] is not None:
         validate_sha256(body["reported_record_sha256"], "reported record sha256")
     return body
+
+
+def validate_platform_envelope_provenance(value: Any) -> dict[str, Any]:
+    """Validate and detach one exact platform-envelope provenance triplet."""
+
+    provenance = _require_closed_object(
+        value,
+        {"mode", "context", "invocation", "response"},
+        "platform-envelope provenance",
+    )
+    _require_literal(
+        provenance["mode"],
+        "platform-envelope",
+        "platform-envelope provenance mode",
+    )
+
+    validators = {
+        "context": _validate_context_body,
+        "invocation": _validate_invocation_body,
+        "response": _validate_response_body,
+    }
+    bodies: dict[str, dict[str, Any]] = {}
+    for body_kind, validator in validators.items():
+        arm = _require_closed_object(
+            provenance[body_kind],
+            {"body", "sha256"},
+            f"platform-envelope {body_kind} arm",
+        )
+        body = validator(arm["body"])
+        claimed_digest = validate_sha256(
+            arm["sha256"],
+            f"platform-envelope {body_kind} sha256",
+        )
+        actual_digest = sha256_bytes(canonical_json_bytes(body))
+        if claimed_digest != actual_digest:
+            raise EvidenceError(
+                f"platform-envelope {body_kind} sha256 does not match its canonical body"
+            )
+        bodies[body_kind] = body
+
+    context = bodies["context"]
+    invocation = bodies["invocation"]
+    response = bodies["response"]
+    for member_kind, member in (
+        ("invocation", invocation),
+        ("response", response),
+    ):
+        for field in (
+            "context_nonce",
+            "harness_bundle_revision",
+            "harness_bundle_sha256",
+        ):
+            if member[field] != context[field]:
+                raise EvidenceError(
+                    f"platform-envelope {member_kind} {field} does not match context"
+                )
+    for field in ("requested_model", "requested_reasoning_effort"):
+        if invocation[field] != context[field]:
+            raise EvidenceError(
+                f"platform-envelope invocation {field} does not match context"
+            )
+    if response["dispatch_id"] != invocation["dispatch_id"]:
+        raise EvidenceError(
+            "platform-envelope response dispatch ID does not match invocation"
+        )
+    if response["canonical_task_path"] != context["canonical_task_path"]:
+        raise EvidenceError(
+            "platform-envelope response task path does not match context"
+        )
+
+    lifecycle = (
+        _parse_rfc3339_nano(context["created_at"], "context created_at"),
+        _parse_rfc3339_nano(
+            invocation["dispatched_at"],
+            "invocation dispatched_at",
+        ),
+        _parse_rfc3339_nano(response["started_at"], "response started_at"),
+        _parse_rfc3339_nano(response["ended_at"], "response ended_at"),
+    )
+    if any(earlier > later for earlier, later in zip(lifecycle, lifecycle[1:])):
+        raise EvidenceError("platform-envelope lifecycle timestamps are out of order")
+
+    return copy.deepcopy(provenance)
 
 
 def _validate_capture_relationships(
