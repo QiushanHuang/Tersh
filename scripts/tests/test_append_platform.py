@@ -7,6 +7,7 @@ import json
 import pathlib
 import re
 import unittest
+from unittest import mock
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -144,6 +145,18 @@ FORBIDDEN_NORMATIVE_EXAMPLES = (
         "The recorder may create-new publish the formal projection.",
     ),
 )
+SESSION_KEYS = {
+    "schema", "producer_session_id", "attempt_binding_id",
+    "predecessor_attempt_binding_id", "entrypoint", "producer_mode",
+    "operation", "context_nonce", "dispatch_id", "evidence_id",
+    "evidence_attempt", "run_binding", "candidate", "candidate_tree",
+    "worktree_handle", "worktree_observed_at", "baseline_commit",
+    "candidate_relation", "bundle_id", "runtime_profile_id",
+    "policy_sha256", "policy_entry_id", "policy_entry_sha256",
+    "projection_root_class", "record_class", "record_schema",
+    "destination", "parent_finding_ids_sha256",
+    "next_receipt_sequence", "previous_receipt_id",
+}
 
 
 def normalized_paragraph(paragraph):
@@ -369,6 +382,160 @@ class AppendPlatformSchemaTests(unittest.TestCase):
             "validate_dispatch_context_v2 is required for context v2",
         )
         return core, validate
+
+    def recorder_session_validator(self):
+        core = importlib.import_module("scripts.evidence_core")
+        validate = getattr(
+            core,
+            "validate_orchestration_recorder_session",
+            None,
+        )
+        self.assertTrue(
+            callable(validate),
+            "validate_orchestration_recorder_session is required",
+        )
+        parameters = tuple(inspect.signature(validate).parameters.values())
+        self.assertEqual(
+            tuple(parameter.name for parameter in parameters),
+            ("value", "context", "invocation", "response"),
+        )
+        self.assertIs(
+            parameters[0].kind,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
+        for parameter in parameters[1:]:
+            self.assertIs(parameter.kind, inspect.Parameter.KEYWORD_ONLY)
+            self.assertIs(parameter.default, inspect.Parameter.empty)
+        return core, validate
+
+    @classmethod
+    def append_platform_fixture(
+        cls,
+        *,
+        evidence_attempt="002",
+        parent_finding_ids=("impl-01-F001",),
+        candidate=None,
+        candidate_relation=None,
+        next_receipt_sequence=2,
+    ):
+        context = cls.context_v2(list(parent_finding_ids))
+        context["evidence_attempt"] = evidence_attempt
+        context["worktree_handle"] = "e" * 64
+        dispatch_id = "d" * 64
+        invocation = {
+            "schema": "tersh-host-spawn-invocation-v1",
+            "context_nonce": context["context_nonce"],
+            "harness_bundle_revision": context["harness_bundle_revision"],
+            "harness_bundle_sha256": context["harness_bundle_sha256"],
+            "dispatch_id": dispatch_id,
+            "requested_model": context["requested_model"],
+            "requested_reasoning_effort": context[
+                "requested_reasoning_effort"
+            ],
+            "selected_model": "gpt-5.6-sol",
+            "selected_reasoning_effort": "xhigh",
+            "dispatched_at": "2026-08-10T00:00:01.000000001Z",
+        }
+        response = {
+            "schema": "tersh-host-spawn-response-v2",
+            "context_nonce": context["context_nonce"],
+            "harness_bundle_revision": context["harness_bundle_revision"],
+            "harness_bundle_sha256": context["harness_bundle_sha256"],
+            "dispatch_id": dispatch_id,
+            "agent_id": "fixture-agent",
+            "canonical_task_path": context["canonical_task_path"],
+            "agent_run_id": "fixture-run",
+            "started_at": "2026-08-10T00:00:02.000000001Z",
+            "ended_at": "2026-08-10T00:00:03.000000001Z",
+            "terminal_status": "completed",
+            "reported_result_commit": context["review_target"],
+            "reported_record_sha256": None,
+        }
+        selected_candidate = candidate or context["review_target"]
+        relation = candidate_relation or (
+            "equal"
+            if selected_candidate == context["baseline_commit"]
+            else "descendant"
+        )
+        previous_receipt_id = (
+            None if next_receipt_sequence == 1 else "9" * 64
+        )
+        session = {
+            "schema": "tersh-host-orchestration-recorder-session-v1",
+            "producer_session_id": "1" * 64,
+            "attempt_binding_id": "2" * 64,
+            "predecessor_attempt_binding_id": (
+                None if evidence_attempt == "001" else "3" * 64
+            ),
+            "entrypoint": "record-orchestration",
+            "producer_mode": "harness",
+            "operation": "append-platform",
+            "context_nonce": context["context_nonce"],
+            "dispatch_id": dispatch_id,
+            "evidence_id": context["evidence_id"],
+            "evidence_attempt": evidence_attempt,
+            "run_binding": context["run_binding"],
+            "candidate": selected_candidate,
+            "candidate_tree": "4" * 40,
+            "worktree_handle": context["worktree_handle"],
+            "worktree_observed_at": "2026-08-10T00:00:00.500000001Z",
+            "baseline_commit": context["baseline_commit"],
+            "candidate_relation": relation,
+            "bundle_id": context["harness_bundle_sha256"],
+            "runtime_profile_id": "5" * 64,
+            "policy_sha256": "6" * 64,
+            "policy_entry_id": "record-orchestration",
+            "policy_entry_sha256": "7" * 64,
+            "projection_root_class": "local",
+            "record_class": "orchestration",
+            "record_schema": "tersh-evidence-orchestration-v1",
+            "destination": (
+                f"attempt-{evidence_attempt}/candidate-{selected_candidate}/"
+                f"orchestration/{context['role']}.{context['wave']}."
+                f"{context['review_attempt']}.json"
+            ),
+            "parent_finding_ids_sha256": hashlib.sha256(
+                cls.canonical_fixture_body_bytes(
+                    context["parent_finding_ids"]
+                )
+            ).hexdigest(),
+            "next_receipt_sequence": next_receipt_sequence,
+            "previous_receipt_id": previous_receipt_id,
+        }
+        provenance = {
+            "mode": "platform-envelope",
+            **{
+                kind: {
+                    "body": body,
+                    "sha256": hashlib.sha256(
+                        cls.canonical_fixture_body_bytes(body)
+                    ).hexdigest(),
+                }
+                for kind, body in (
+                    ("context", context),
+                    ("invocation", invocation),
+                    ("response", response),
+                )
+            },
+        }
+        return provenance, session
+
+    @classmethod
+    def rehash_platform_arm(cls, provenance, body_kind):
+        provenance[body_kind]["sha256"] = hashlib.sha256(
+            cls.canonical_fixture_body_bytes(
+                provenance[body_kind]["body"]
+            )
+        ).hexdigest()
+
+    @staticmethod
+    def validate_recorder_session(validate, session, provenance):
+        return validate(
+            session,
+            context=provenance["context"]["body"],
+            invocation=provenance["invocation"]["body"],
+            response=provenance["response"]["body"],
+        )
 
     def host_parent_source_model(self):
         core = importlib.import_module("scripts.evidence_core")
@@ -1791,6 +1958,892 @@ class AppendPlatformSchemaTests(unittest.TestCase):
                 ambiguous_model.validate_context_parent_sources(
                     self.context_v2(["impl-01-F001"])
                 )
+
+    def test_recorder_session_schema_rejects_wrong_schema_extra_missing_alias_null_bool_and_wrong_type_fields(
+        self,
+    ):
+        core, validate = self.recorder_session_validator()
+        positive_fixtures = (
+            ("attempt-002-sequence-2", *self.append_platform_fixture()),
+            (
+                "attempt-002-sequence-1",
+                *self.append_platform_fixture(next_receipt_sequence=1),
+            ),
+            (
+                "attempt-001-null-predecessor",
+                *self.append_platform_fixture(
+                    evidence_attempt="001",
+                    next_receipt_sequence=1,
+                ),
+            ),
+            (
+                "equal-candidate",
+                *self.append_platform_fixture(
+                    candidate="a" * 40,
+                    candidate_relation="equal",
+                ),
+            ),
+            (
+                "opaque-host-assertions",
+                *self.append_platform_fixture(candidate="c" * 40),
+            ),
+        )
+        positive_fixtures[-1][2].update(
+            {
+                "producer_session_id": "a" * 64,
+                "attempt_binding_id": "b" * 64,
+                "predecessor_attempt_binding_id": "c" * 64,
+                "candidate_tree": "d" * 40,
+                "worktree_observed_at": "2026-08-09T23:59:59.1Z",
+                "runtime_profile_id": "e" * 64,
+                "policy_sha256": "f" * 64,
+                "policy_entry_id": "alternate-policy-row",
+                "policy_entry_sha256": "0" * 64,
+            }
+        )
+        for case_id, provenance, session in positive_fixtures:
+            with self.subTest(case_id=case_id):
+                self.assertEqual(set(session), SESSION_KEYS)
+                provenance_before = copy.deepcopy(provenance)
+                session_before = copy.deepcopy(session)
+
+                validated = self.validate_recorder_session(
+                    validate,
+                    session,
+                    provenance,
+                )
+
+                self.assertIs(type(validated), dict)
+                self.assertEqual(validated, session_before)
+                self.assertIsNot(validated, session)
+                self.assertEqual(session, session_before)
+                self.assertEqual(provenance, provenance_before)
+
+        provenance, session = self.append_platform_fixture()
+
+        class SessionDict(dict):
+            pass
+
+        class SessionKey(str):
+            pass
+
+        class SessionString(str):
+            pass
+
+        class SessionInteger(int):
+            pass
+
+        structural_cases = []
+        extra = copy.deepcopy(session)
+        extra["projection_path"] = "/tmp/untrusted"
+        structural_cases.append(("extra-key", extra))
+        for field in sorted(SESSION_KEYS):
+            missing = copy.deepcopy(session)
+            del missing[field]
+            structural_cases.append((f"missing-{field}", missing))
+        alias = copy.deepcopy(session)
+        alias["session_id"] = alias.pop("producer_session_id")
+        structural_cases.extend(
+            (
+                ("legacy-session-id-alias", alias),
+                ("dict-subclass", SessionDict(session)),
+            )
+        )
+        key_subclass = copy.deepcopy(session)
+        schema = key_subclass.pop("schema")
+        key_subclass[SessionKey("schema")] = schema
+        structural_cases.append(("string-subclass-key", key_subclass))
+
+        for case_id, invalid in structural_cases:
+            with self.subTest(case_id=case_id):
+                before = copy.deepcopy(invalid)
+                with self.assert_exact_evidence_error(core.EvidenceError):
+                    self.validate_recorder_session(validate, invalid, provenance)
+                self.assertEqual(invalid, before)
+
+        for field in sorted(SESSION_KEYS):
+            with self.subTest(case_id=f"null-{field}"):
+                invalid = copy.deepcopy(session)
+                invalid[field] = None
+                before = copy.deepcopy(invalid)
+                with self.assert_exact_evidence_error(core.EvidenceError):
+                    self.validate_recorder_session(validate, invalid, provenance)
+                self.assertEqual(invalid, before)
+
+            with self.subTest(case_id=f"bool-{field}"):
+                invalid = copy.deepcopy(session)
+                invalid[field] = True
+                before = copy.deepcopy(invalid)
+                with self.assert_exact_evidence_error(core.EvidenceError):
+                    self.validate_recorder_session(validate, invalid, provenance)
+                self.assertEqual(invalid, before)
+
+        for field, value in session.items():
+            if type(value) is not str:
+                continue
+            with self.subTest(case_id=f"wrong-type-{field}"):
+                invalid = copy.deepcopy(session)
+                invalid[field] = []
+                before = copy.deepcopy(invalid)
+                with self.assert_exact_evidence_error(core.EvidenceError):
+                    self.validate_recorder_session(validate, invalid, provenance)
+                self.assertEqual(invalid, before)
+            with self.subTest(case_id=f"string-subclass-{field}"):
+                invalid = copy.deepcopy(session)
+                invalid[field] = SessionString(value)
+                before = copy.deepcopy(invalid)
+                with self.assert_exact_evidence_error(core.EvidenceError):
+                    self.validate_recorder_session(validate, invalid, provenance)
+                self.assertEqual(invalid, before)
+
+        for case_id, sequence in (
+            ("sequence-string", "2"),
+            ("sequence-float", 2.0),
+            ("sequence-int-subclass", SessionInteger(2)),
+        ):
+            with self.subTest(case_id=case_id):
+                invalid = copy.deepcopy(session)
+                invalid["next_receipt_sequence"] = sequence
+                before = copy.deepcopy(invalid)
+                with self.assert_exact_evidence_error(core.EvidenceError):
+                    self.validate_recorder_session(validate, invalid, provenance)
+                self.assertEqual(invalid, before)
+
+        malformed_fields = {
+            "schema": "tersh-host-orchestration-recorder-session-v2",
+            "producer_session_id": "A" * 64,
+            "attempt_binding_id": "A" * 64,
+            "predecessor_attempt_binding_id": "A" * 64,
+            "entrypoint": "record_orchestration",
+            "producer_mode": "agent-report",
+            "operation": "append_platform",
+            "context_nonce": "A" * 64,
+            "dispatch_id": "A" * 64,
+            "evidence_id": "impl-08",
+            "evidence_attempt": "2",
+            "run_binding": "run_local",
+            "candidate": "A" * 40,
+            "candidate_tree": "A" * 40,
+            "worktree_handle": "fixture-worktree",
+            "worktree_observed_at": "2026-08-10T00:00:00Z",
+            "baseline_commit": "A" * 40,
+            "candidate_relation": "ancestor",
+            "bundle_id": "A" * 64,
+            "runtime_profile_id": "A" * 64,
+            "policy_sha256": "A" * 64,
+            "policy_entry_id": "record_orchestration",
+            "policy_entry_sha256": "A" * 64,
+            "projection_root_class": "repository",
+            "record_class": "review",
+            "record_schema": "tersh-evidence-orchestration-v2",
+            "destination": "/absolute/orchestration.json",
+            "parent_finding_ids_sha256": "0" * 64,
+            "next_receipt_sequence": 0,
+            "previous_receipt_id": "A" * 64,
+        }
+        self.assertEqual(set(malformed_fields), SESSION_KEYS)
+        for field, value in malformed_fields.items():
+            with self.subTest(case_id=f"malformed-{field}"):
+                invalid = copy.deepcopy(session)
+                invalid[field] = value
+                before = copy.deepcopy(invalid)
+                with self.assert_exact_evidence_error(core.EvidenceError):
+                    self.validate_recorder_session(validate, invalid, provenance)
+                self.assertEqual(invalid, before)
+
+        hex64_fields = (
+            "producer_session_id",
+            "attempt_binding_id",
+            "predecessor_attempt_binding_id",
+            "context_nonce",
+            "dispatch_id",
+            "worktree_handle",
+            "bundle_id",
+            "runtime_profile_id",
+            "policy_sha256",
+            "policy_entry_sha256",
+            "parent_finding_ids_sha256",
+            "previous_receipt_id",
+        )
+        oid40_fields = ("candidate", "candidate_tree", "baseline_commit")
+        for field_group, malformed_values in (
+            (hex64_fields, ("a" * 63, "a" * 65, "g" * 64)),
+            (oid40_fields, ("a" * 39, "a" * 41, "g" * 40)),
+        ):
+            for field in field_group:
+                for value in malformed_values:
+                    with self.subTest(
+                        case_id=f"boundary-or-nonhex-{field}-{len(value)}"
+                    ):
+                        invalid = copy.deepcopy(session)
+                        invalid[field] = value
+                        before = copy.deepcopy(invalid)
+                        with self.assert_exact_evidence_error(
+                            core.EvidenceError
+                        ):
+                            self.validate_recorder_session(
+                                validate,
+                                invalid,
+                                provenance,
+                            )
+                        self.assertEqual(invalid, before)
+
+        attempt_one_provenance, attempt_one_session = (
+            self.append_platform_fixture(evidence_attempt="001")
+        )
+        attempt_one_session["predecessor_attempt_binding_id"] = "3" * 64
+        receipt_one_provenance, receipt_one_session = (
+            self.append_platform_fixture(next_receipt_sequence=1)
+        )
+        receipt_one_session["previous_receipt_id"] = "9" * 64
+        crossed_pairs = (
+            (
+                "attempt-001-with-predecessor",
+                attempt_one_provenance,
+                attempt_one_session,
+            ),
+            (
+                "attempt-002-without-predecessor",
+                provenance,
+                {**session, "predecessor_attempt_binding_id": None},
+            ),
+            (
+                "sequence-1-with-previous",
+                receipt_one_provenance,
+                receipt_one_session,
+            ),
+            (
+                "sequence-2-without-previous",
+                provenance,
+                {**session, "previous_receipt_id": None},
+            ),
+        )
+        for case_id, case_provenance, invalid in crossed_pairs:
+            with self.subTest(case_id=case_id):
+                before = copy.deepcopy(invalid)
+                with self.assert_exact_evidence_error(core.EvidenceError):
+                    self.validate_recorder_session(
+                        validate,
+                        invalid,
+                        case_provenance,
+                    )
+                self.assertEqual(invalid, before)
+
+        class ArmedHostile:
+            armed = False
+
+            def arm(self):
+                self.hook_calls = []
+                self.armed = True
+
+            def trip_if_armed(self, hook):
+                if self.armed:
+                    self.hook_calls.append(hook)
+                    raise AssertionError(
+                        f"{type(self).__name__}.{hook} was invoked"
+                    )
+
+        class ArmedSessionDict(dict, ArmedHostile):
+            def __deepcopy__(self, memo):
+                self.trip_if_armed("__deepcopy__")
+                return self
+
+            def __iter__(self):
+                self.trip_if_armed("__iter__")
+                return dict.__iter__(self)
+
+            def __repr__(self):
+                self.trip_if_armed("__repr__")
+                return dict.__repr__(self)
+
+        class ArmedSessionString(str, ArmedHostile):
+            def __deepcopy__(self, memo):
+                self.trip_if_armed("__deepcopy__")
+                return self
+
+            def __eq__(self, other):
+                self.trip_if_armed("__eq__")
+                return str.__eq__(self, other)
+
+            def __format__(self, format_spec):
+                self.trip_if_armed("__format__")
+                return str.__format__(self, format_spec)
+
+            def __hash__(self):
+                self.trip_if_armed("__hash__")
+                return str.__hash__(self)
+
+            def __repr__(self):
+                self.trip_if_armed("__repr__")
+                return str.__repr__(self)
+
+        hostile_session = ArmedSessionDict(session)
+        hostile_session.arm()
+        hostile_key = ArmedSessionString("schema")
+        key_session = copy.deepcopy(session)
+        schema = key_session.pop("schema")
+        key_session[hostile_key] = schema
+        hostile_key.arm()
+        hostile_value = ArmedSessionString(session["producer_session_id"])
+        value_session = copy.deepcopy(session)
+        value_session["producer_session_id"] = hostile_value
+        hostile_value.arm()
+        for case_id, invalid, hostile in (
+            ("armed-dict-subclass", hostile_session, hostile_session),
+            ("armed-key-subclass", key_session, hostile_key),
+            ("armed-value-subclass", value_session, hostile_value),
+        ):
+            with self.subTest(case_id=case_id):
+                with self.assert_exact_evidence_error(core.EvidenceError):
+                    self.validate_recorder_session(validate, invalid, provenance)
+                self.assertEqual(hostile.hook_calls, [])
+
+    def test_append_platform_rejects_each_context_session_and_dispatch_identity_drift(
+        self,
+    ):
+        core, validate = self.recorder_session_validator()
+        provenance, session = self.append_platform_fixture(parent_finding_ids=())
+        validated_provenance = core.validate_platform_envelope_provenance(
+            provenance
+        )
+        self.assertEqual(
+            self.validate_recorder_session(
+                validate,
+                session,
+                validated_provenance,
+            ),
+            session,
+        )
+
+        alternate = copy.deepcopy(provenance)
+        alternate_context = alternate["context"]["body"]
+        alternate_context.update(
+            {
+                "context_nonce": "0" * 64,
+                "harness_bundle_revision": "6" * 40,
+                "harness_bundle_sha256": "b" * 64,
+                "evidence_id": "hardening-07",
+                "evidence_attempt": "010",
+                "role": "product",
+                "wave": "closure-b",
+                "review_attempt": "999",
+                "run_binding": "run-cumulative",
+                "baseline_commit": "c" * 40,
+                "review_target": "d" * 40,
+                "canonical_task_path": "/root/product/reviewer",
+                "worktree_handle": "f" * 64,
+            }
+        )
+        alternate["invocation"]["body"].update(
+            {
+                "context_nonce": alternate_context["context_nonce"],
+                "harness_bundle_revision": alternate_context[
+                    "harness_bundle_revision"
+                ],
+                "harness_bundle_sha256": alternate_context[
+                    "harness_bundle_sha256"
+                ],
+                "dispatch_id": "a" * 64,
+            }
+        )
+        alternate["response"]["body"].update(
+            {
+                "context_nonce": alternate_context["context_nonce"],
+                "harness_bundle_revision": alternate_context[
+                    "harness_bundle_revision"
+                ],
+                "harness_bundle_sha256": alternate_context[
+                    "harness_bundle_sha256"
+                ],
+                "dispatch_id": "a" * 64,
+                "canonical_task_path": alternate_context[
+                    "canonical_task_path"
+                ],
+                "reported_result_commit": alternate_context[
+                    "review_target"
+                ],
+            }
+        )
+        for body_kind in ("context", "invocation", "response"):
+            self.rehash_platform_arm(alternate, body_kind)
+        alternate = core.validate_platform_envelope_provenance(alternate)
+        alternate_session = copy.deepcopy(session)
+        alternate_session.update(
+            {
+                "context_nonce": alternate_context["context_nonce"],
+                "dispatch_id": "a" * 64,
+                "evidence_id": alternate_context["evidence_id"],
+                "evidence_attempt": alternate_context["evidence_attempt"],
+                "run_binding": alternate_context["run_binding"],
+                "candidate": alternate_context["review_target"],
+                "worktree_handle": alternate_context["worktree_handle"],
+                "baseline_commit": alternate_context["baseline_commit"],
+                "bundle_id": alternate_context["harness_bundle_sha256"],
+                "destination": (
+                    "attempt-010/candidate-"
+                    f"{alternate_context['review_target']}/orchestration/"
+                    "product.closure-b.999.json"
+                ),
+            }
+        )
+        alternate_before = copy.deepcopy(alternate)
+        alternate_session_before = copy.deepcopy(alternate_session)
+        self.assertEqual(
+            self.validate_recorder_session(
+                validate,
+                alternate_session,
+                alternate,
+            ),
+            alternate_session,
+            "valid nondefault route and identity values must not be hardcoded",
+        )
+        self.assertEqual(alternate, alternate_before)
+        self.assertEqual(alternate_session, alternate_session_before)
+
+        for case_id, field, value in (
+            ("context-nonce", "context_nonce", "0" * 64),
+            ("evidence-id", "evidence_id", "impl-02"),
+            ("evidence-attempt", "evidence_attempt", "003"),
+            ("run-binding", "run_binding", "run-cumulative"),
+            ("worktree-handle", "worktree_handle", "f" * 64),
+            ("baseline-commit", "baseline_commit", "c" * 40),
+            ("bundle-id", "bundle_id", "0" * 64),
+            ("dispatch-id", "dispatch_id", "0" * 64),
+        ):
+            with self.subTest(case_id=case_id):
+                invalid = copy.deepcopy(session)
+                invalid[field] = value
+                before = copy.deepcopy(invalid)
+                with self.assert_exact_evidence_error(core.EvidenceError):
+                    self.validate_recorder_session(
+                        validate,
+                        invalid,
+                        validated_provenance,
+                    )
+                self.assertEqual(invalid, before)
+
+        coherent_body_drifts = (
+            (
+                "coherent-context-nonce",
+                {
+                    "context": {"context_nonce": "0" * 64},
+                    "invocation": {"context_nonce": "0" * 64},
+                    "response": {"context_nonce": "0" * 64},
+                },
+            ),
+            (
+                "coherent-bundle-id",
+                {
+                    "context": {"harness_bundle_sha256": "0" * 64},
+                    "invocation": {"harness_bundle_sha256": "0" * 64},
+                    "response": {"harness_bundle_sha256": "0" * 64},
+                },
+            ),
+            (
+                "coherent-dispatch-id",
+                {
+                    "invocation": {"dispatch_id": "0" * 64},
+                    "response": {"dispatch_id": "0" * 64},
+                },
+            ),
+            ("context-evidence-id", {"context": {"evidence_id": "impl-02"}}),
+            (
+                "context-evidence-attempt",
+                {"context": {"evidence_attempt": "003"}},
+            ),
+            (
+                "context-run-binding",
+                {"context": {"run_binding": "run-cumulative"}},
+            ),
+            (
+                "context-worktree-handle",
+                {"context": {"worktree_handle": "f" * 64}},
+            ),
+            (
+                "context-baseline-commit",
+                {"context": {"baseline_commit": "c" * 40}},
+            ),
+        )
+        for case_id, changes in coherent_body_drifts:
+            with self.subTest(case_id=case_id):
+                drifted = copy.deepcopy(provenance)
+                for body_kind, fields in changes.items():
+                    drifted[body_kind]["body"].update(fields)
+                    self.rehash_platform_arm(drifted, body_kind)
+                    self.assertEqual(
+                        drifted[body_kind]["sha256"],
+                        hashlib.sha256(
+                            self.canonical_fixture_body_bytes(
+                                drifted[body_kind]["body"]
+                            )
+                        ).hexdigest(),
+                    )
+                locally_valid = core.validate_platform_envelope_provenance(
+                    drifted
+                )
+                locally_valid_before = copy.deepcopy(locally_valid)
+                with self.assert_exact_evidence_error(core.EvidenceError):
+                    self.validate_recorder_session(
+                        validate,
+                        session,
+                        locally_valid,
+                    )
+                self.assertEqual(locally_valid, locally_valid_before)
+
+        internally_incoherent_drifts = (
+            ("context-only-nonce", "context", "context_nonce", "0" * 64),
+            ("invocation-only-nonce", "invocation", "context_nonce", "0" * 64),
+            ("response-only-nonce", "response", "context_nonce", "0" * 64),
+            (
+                "context-only-bundle-revision",
+                "context",
+                "harness_bundle_revision",
+                "6" * 40,
+            ),
+            (
+                "invocation-only-bundle-revision",
+                "invocation",
+                "harness_bundle_revision",
+                "6" * 40,
+            ),
+            (
+                "response-only-bundle-revision",
+                "response",
+                "harness_bundle_revision",
+                "6" * 40,
+            ),
+            (
+                "context-only-bundle-id",
+                "context",
+                "harness_bundle_sha256",
+                "0" * 64,
+            ),
+            (
+                "invocation-only-bundle-id",
+                "invocation",
+                "harness_bundle_sha256",
+                "0" * 64,
+            ),
+            (
+                "response-only-bundle-id",
+                "response",
+                "harness_bundle_sha256",
+                "0" * 64,
+            ),
+            ("invocation-only-dispatch", "invocation", "dispatch_id", "0" * 64),
+            ("response-only-dispatch", "response", "dispatch_id", "0" * 64),
+            (
+                "response-only-task-path",
+                "response",
+                "canonical_task_path",
+                "/root/alternate/reviewer",
+            ),
+            (
+                "invocation-only-requested-model",
+                "invocation",
+                "requested_model",
+                "gpt-5.6-terra",
+            ),
+            (
+                "invocation-only-requested-reasoning-effort",
+                "invocation",
+                "requested_reasoning_effort",
+                "high",
+            ),
+        )
+        for case_id, body_kind, field, value in internally_incoherent_drifts:
+            with self.subTest(case_id=case_id):
+                drifted = copy.deepcopy(provenance)
+                drifted[body_kind]["body"][field] = value
+                self.rehash_platform_arm(drifted, body_kind)
+                self.assertEqual(
+                    drifted[body_kind]["sha256"],
+                    hashlib.sha256(
+                        self.canonical_fixture_body_bytes(
+                            drifted[body_kind]["body"]
+                        )
+                    ).hexdigest(),
+                )
+                drifted_before = copy.deepcopy(drifted)
+                with self.assert_exact_evidence_error(core.EvidenceError):
+                    self.validate_recorder_session(
+                        validate,
+                        session,
+                        drifted,
+                    )
+                self.assertEqual(drifted, drifted_before)
+
+        original_invocation_validator = core._validate_invocation_body
+        for case_id, field, alternate in (
+            (
+                "isolated-invocation-requested-model-join",
+                "requested_model",
+                "gpt-5.6-terra",
+            ),
+            (
+                "isolated-invocation-requested-reasoning-effort-join",
+                "requested_reasoning_effort",
+                "high",
+            ),
+        ):
+            with self.subTest(case_id=case_id):
+                drifted = copy.deepcopy(provenance)
+                drifted["invocation"]["body"][field] = alternate
+                self.rehash_platform_arm(drifted, "invocation")
+                self.assertEqual(
+                    drifted["invocation"]["sha256"],
+                    hashlib.sha256(
+                        self.canonical_fixture_body_bytes(
+                            drifted["invocation"]["body"]
+                        )
+                    ).hexdigest(),
+                )
+
+                def validate_locally_alternate_invocation(value):
+                    if (
+                        type(value) is not dict
+                        or value.get(field) != alternate
+                    ):
+                        return original_invocation_validator(value)
+                    normalized = copy.deepcopy(value)
+                    normalized[field] = provenance["context"]["body"][field]
+                    original_invocation_validator(normalized)
+                    normalized[field] = alternate
+                    return normalized
+
+                drifted_before = copy.deepcopy(drifted)
+                session_before = copy.deepcopy(session)
+                with mock.patch.object(
+                    core,
+                    "_validate_invocation_body",
+                    side_effect=validate_locally_alternate_invocation,
+                ):
+                    self.assertEqual(
+                        core._validate_invocation_body(
+                            drifted["invocation"]["body"]
+                        ),
+                        drifted["invocation"]["body"],
+                        "alternate invocation must reach the cross-body join",
+                    )
+                    with self.assert_exact_evidence_error(core.EvidenceError):
+                        self.validate_recorder_session(
+                            validate,
+                            session,
+                            drifted,
+                        )
+                self.assertEqual(drifted, drifted_before)
+                self.assertEqual(session, session_before)
+
+        revision_only = copy.deepcopy(provenance)
+        for body_kind in ("context", "invocation", "response"):
+            revision_only[body_kind]["body"][
+                "harness_bundle_revision"
+            ] = "6" * 40
+            self.rehash_platform_arm(revision_only, body_kind)
+        revision_only = core.validate_platform_envelope_provenance(
+            revision_only
+        )
+        self.assertEqual(
+            self.validate_recorder_session(
+                validate,
+                session,
+                revision_only,
+            ),
+            session,
+            "pure validation must not assert unavailable installed revision state",
+        )
+
+    def test_append_platform_rejects_candidate_tree_policy_destination_or_parent_join_drift(
+        self,
+    ):
+        core, validate = self.recorder_session_validator()
+        provenance, session = self.append_platform_fixture()
+        equal_provenance, equal_session = self.append_platform_fixture(
+            candidate="a" * 40,
+            candidate_relation="equal",
+        )
+        for case_id, valid_provenance, valid_session in (
+            ("unequal-descendant", provenance, session),
+            ("equal-equal", equal_provenance, equal_session),
+        ):
+            with self.subTest(case_id=case_id):
+                self.assertEqual(
+                    self.validate_recorder_session(
+                        validate,
+                        valid_session,
+                        valid_provenance,
+                    ),
+                    valid_session,
+                )
+
+        equal_session_wrong = copy.deepcopy(equal_session)
+        equal_session_wrong["candidate_relation"] = "descendant"
+        relation_crosses = (
+            ("unequal-marked-equal", provenance, {**session, "candidate_relation": "equal"}),
+            ("equal-marked-descendant", equal_provenance, equal_session_wrong),
+        )
+        for case_id, case_provenance, invalid in relation_crosses:
+            with self.subTest(case_id=case_id):
+                before = copy.deepcopy(invalid)
+                with self.assert_exact_evidence_error(core.EvidenceError):
+                    self.validate_recorder_session(
+                        validate,
+                        invalid,
+                        case_provenance,
+                    )
+                self.assertEqual(invalid, before)
+
+        malformed_host_assertions = (
+            ("candidate", "candidate", "A" * 40),
+            ("candidate-tree", "candidate_tree", "A" * 40),
+            ("policy-sha256", "policy_sha256", "A" * 64),
+            ("runtime-profile-id", "runtime_profile_id", "A" * 64),
+            ("policy-entry", "policy_entry_id", "record_orchestration"),
+            ("policy-entry-sha256", "policy_entry_sha256", "A" * 64),
+        )
+        for case_id, field, value in malformed_host_assertions:
+            with self.subTest(case_id=case_id):
+                invalid = copy.deepcopy(session)
+                invalid[field] = value
+                before = copy.deepcopy(invalid)
+                with self.assert_exact_evidence_error(core.EvidenceError):
+                    self.validate_recorder_session(validate, invalid, provenance)
+                self.assertEqual(invalid, before)
+
+        expected_destination = session["destination"]
+        destination_drifts = (
+            ("wrong-attempt", expected_destination.replace("attempt-002", "attempt-003")),
+            ("wrong-candidate", expected_destination.replace("candidate-b", "candidate-c")),
+            ("wrong-role", expected_destination.replace("safety.wave-c", "product.wave-c")),
+            ("wrong-wave", expected_destination.replace("safety.wave-c", "safety.wave-a")),
+            ("wrong-review-attempt", expected_destination.replace(".001.json", ".002.json")),
+            ("wrong-suffix", expected_destination.removesuffix(".json") + ".txt"),
+            ("absolute", "/" + expected_destination),
+            ("traversal", "../" + expected_destination),
+        )
+        for case_id, destination in destination_drifts:
+            with self.subTest(case_id=f"destination-{case_id}"):
+                invalid = copy.deepcopy(session)
+                invalid["destination"] = destination
+                before = copy.deepcopy(invalid)
+                with self.assert_exact_evidence_error(core.EvidenceError):
+                    self.validate_recorder_session(validate, invalid, provenance)
+                self.assertEqual(invalid, before)
+
+        for case_id, field, value in (
+            ("context-role", "role", "product"),
+            ("context-wave", "wave", "wave-a"),
+            ("context-review-attempt", "review_attempt", "002"),
+        ):
+            with self.subTest(case_id=case_id):
+                drifted = copy.deepcopy(provenance)
+                drifted["context"]["body"][field] = value
+                self.rehash_platform_arm(drifted, "context")
+                locally_valid = core.validate_platform_envelope_provenance(
+                    drifted
+                )
+                before = copy.deepcopy(locally_valid)
+                with self.assert_exact_evidence_error(core.EvidenceError):
+                    self.validate_recorder_session(
+                        validate,
+                        session,
+                        locally_valid,
+                    )
+                self.assertEqual(locally_valid, before)
+
+        canonical_parents = self.canonical_fixture_body_bytes(
+            provenance["context"]["body"]["parent_finding_ids"]
+        )
+        self.assertTrue(canonical_parents.endswith(b"\n"))
+        without_lf_digest = hashlib.sha256(canonical_parents[:-1]).hexdigest()
+        self.assertNotEqual(
+            without_lf_digest,
+            session["parent_finding_ids_sha256"],
+        )
+        for case_id, digest in (
+            ("canonical-array-without-lf", without_lf_digest),
+            (
+                "different-canonical-array",
+                hashlib.sha256(
+                    self.canonical_fixture_body_bytes([])
+                ).hexdigest(),
+            ),
+        ):
+            with self.subTest(case_id=case_id):
+                invalid = copy.deepcopy(session)
+                invalid["parent_finding_ids_sha256"] = digest
+                before = copy.deepcopy(invalid)
+                with self.assert_exact_evidence_error(core.EvidenceError):
+                    self.validate_recorder_session(validate, invalid, provenance)
+                self.assertEqual(invalid, before)
+
+        changed_parent_provenance = copy.deepcopy(provenance)
+        changed_parent_provenance["context"]["body"][
+            "parent_finding_ids"
+        ] = ["impl-01-F001", "impl-01-F002"]
+        self.rehash_platform_arm(changed_parent_provenance, "context")
+        changed_parent_provenance = (
+            core.validate_platform_envelope_provenance(
+                changed_parent_provenance
+            )
+        )
+        changed_parent_before = copy.deepcopy(changed_parent_provenance)
+        with self.assert_exact_evidence_error(core.EvidenceError):
+            self.validate_recorder_session(
+                validate,
+                session,
+                changed_parent_provenance,
+            )
+        self.assertEqual(changed_parent_provenance, changed_parent_before)
+
+        opaque_provenance, opaque_session = self.append_platform_fixture(
+            candidate="c" * 40,
+            candidate_relation="descendant",
+        )
+        opaque_session.update(
+            {
+                "producer_session_id": "a" * 64,
+                "attempt_binding_id": "b" * 64,
+                "predecessor_attempt_binding_id": "c" * 64,
+                "candidate_tree": "d" * 40,
+                "runtime_profile_id": "e" * 64,
+                "policy_sha256": "f" * 64,
+                "policy_entry_id": "syntactic-policy-row",
+                "policy_entry_sha256": "0" * 64,
+            }
+        )
+        tripwire = AssertionError(
+            "pure recorder-session validation attempted subprocess or Git I/O"
+        )
+        with (
+            mock.patch.object(core.subprocess, "Popen", side_effect=tripwire),
+            mock.patch.object(core.subprocess, "run", side_effect=tripwire),
+            mock.patch.object(
+                core.subprocess,
+                "check_output",
+                side_effect=tripwire,
+            ),
+            mock.patch.object(core.subprocess, "call", side_effect=tripwire),
+            mock.patch.object(core.os, "system", side_effect=tripwire),
+            mock.patch.object(core.os, "popen", side_effect=tripwire),
+            mock.patch.object(core.os, "open", side_effect=tripwire),
+            mock.patch.object(core.os, "stat", side_effect=tripwire),
+            mock.patch.object(core.os, "listdir", side_effect=tripwire),
+            mock.patch.object(core.Path, "open", side_effect=tripwire),
+            mock.patch.object(core.Path, "read_bytes", side_effect=tripwire),
+            mock.patch.object(core.Path, "read_text", side_effect=tripwire),
+            mock.patch.object(core, "run_and_drain", side_effect=tripwire),
+            mock.patch.object(core.socket, "socket", side_effect=tripwire),
+        ):
+            self.assertEqual(
+                self.validate_recorder_session(
+                    validate,
+                    opaque_session,
+                    opaque_provenance,
+                ),
+                opaque_session,
+                "syntactic Host assertions must not trigger origin or ancestry lookup",
+            )
 
 
 if __name__ == "__main__":

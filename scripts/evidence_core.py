@@ -60,6 +60,18 @@ PROCESS_TERM_GRACE_SECONDS = 1.0
 PROCESS_KILL_GRACE_SECONDS = 1.0
 READER_CLEANUP_SECONDS = 1.0
 MAX_PARENT_FINDING_IDS = 128
+_ORCHESTRATION_RECORDER_SESSION_KEYS = {
+    "schema", "producer_session_id", "attempt_binding_id",
+    "predecessor_attempt_binding_id", "entrypoint", "producer_mode",
+    "operation", "context_nonce", "dispatch_id", "evidence_id",
+    "evidence_attempt", "run_binding", "candidate", "candidate_tree",
+    "worktree_handle", "worktree_observed_at", "baseline_commit",
+    "candidate_relation", "bundle_id", "runtime_profile_id",
+    "policy_sha256", "policy_entry_id", "policy_entry_sha256",
+    "projection_root_class", "record_class", "record_schema",
+    "destination", "parent_finding_ids_sha256",
+    "next_receipt_sequence", "previous_receipt_id",
+}
 
 
 class EvidenceError(Exception):
@@ -799,6 +811,196 @@ def validate_platform_envelope_provenance(value: Any) -> dict[str, Any]:
         raise EvidenceError("platform-envelope lifecycle timestamps are out of order")
 
     return copy.deepcopy(provenance)
+
+
+def validate_orchestration_recorder_session(
+    value: Any,
+    *,
+    context: Any,
+    invocation: Any,
+    response: Any,
+) -> dict[str, Any]:
+    """Validate and detach one append-platform recorder session."""
+
+    validated_bodies = {
+        "context": _validate_context_body(context),
+        "invocation": _validate_invocation_body(invocation),
+        "response": _validate_response_body(response),
+    }
+    provenance = validate_platform_envelope_provenance(
+        {
+            "mode": "platform-envelope",
+            **{
+                body_kind: {
+                    "body": body,
+                    "sha256": hashlib.sha256(
+                        canonical_json_bytes(body)
+                    ).hexdigest(),
+                }
+                for body_kind, body in validated_bodies.items()
+            },
+        }
+    )
+    context_body = provenance["context"]["body"]
+    invocation_body = provenance["invocation"]["body"]
+
+    session = _require_closed_object(
+        value,
+        _ORCHESTRATION_RECORDER_SESSION_KEYS,
+        "orchestration recorder session",
+    )
+    _require_literal(
+        session["schema"],
+        "tersh-host-orchestration-recorder-session-v1",
+        "orchestration recorder session schema",
+    )
+    validate_sha256(session["producer_session_id"], "producer session ID")
+    validate_sha256(session["attempt_binding_id"], "attempt binding ID")
+    _require_literal(
+        session["entrypoint"],
+        "record-orchestration",
+        "recorder session entrypoint",
+    )
+    _require_literal(
+        session["producer_mode"],
+        "harness",
+        "recorder session producer mode",
+    )
+    _require_literal(
+        session["operation"],
+        "append-platform",
+        "recorder session operation",
+    )
+    validate_sha256(session["context_nonce"], "recorder session context nonce")
+    validate_sha256(session["dispatch_id"], "recorder session dispatch ID")
+    validate_evidence_id(session["evidence_id"])
+    validate_attempt(session["evidence_attempt"])
+    validate_run_binding(session["run_binding"])
+    validate_candidate(session["candidate"])
+    validate_candidate(session["candidate_tree"])
+    validate_sha256(session["worktree_handle"], "recorder session worktree handle")
+    _parse_rfc3339_nano(
+        session["worktree_observed_at"],
+        "recorder session worktree_observed_at",
+    )
+    validate_candidate(session["baseline_commit"])
+    _require_enum(
+        session["candidate_relation"],
+        {"equal", "descendant"},
+        "recorder session candidate relation",
+    )
+    validate_sha256(session["bundle_id"], "recorder session bundle ID")
+    validate_sha256(
+        session["runtime_profile_id"],
+        "recorder session runtime profile ID",
+    )
+    validate_sha256(session["policy_sha256"], "recorder session policy sha256")
+    validate_gate_name(session["policy_entry_id"])
+    validate_sha256(
+        session["policy_entry_sha256"],
+        "recorder session policy entry sha256",
+    )
+    _require_literal(
+        session["projection_root_class"],
+        "local",
+        "recorder session projection root class",
+    )
+    _require_literal(
+        session["record_class"],
+        "orchestration",
+        "recorder session record class",
+    )
+    _require_literal(
+        session["record_schema"],
+        "tersh-evidence-orchestration-v1",
+        "recorder session record schema",
+    )
+    validate_sha256(
+        session["parent_finding_ids_sha256"],
+        "recorder session parent finding IDs sha256",
+    )
+    sequence = require_exact_int(
+        session["next_receipt_sequence"],
+        "recorder session next receipt sequence",
+        minimum=1,
+    )
+
+    predecessor = session["predecessor_attempt_binding_id"]
+    if session["evidence_attempt"] == "001":
+        if predecessor is not None:
+            raise EvidenceError(
+                "attempt 001 recorder session predecessor must be null"
+            )
+    else:
+        if predecessor is None:
+            raise EvidenceError(
+                "later recorder session predecessor must be present"
+            )
+        validate_sha256(predecessor, "predecessor attempt binding ID")
+
+    previous_receipt_id = session["previous_receipt_id"]
+    if sequence == 1:
+        if previous_receipt_id is not None:
+            raise EvidenceError(
+                "receipt sequence 1 recorder session predecessor must be null"
+            )
+    else:
+        if previous_receipt_id is None:
+            raise EvidenceError(
+                "later recorder session receipt predecessor must be present"
+            )
+        validate_sha256(previous_receipt_id, "previous receipt ID")
+
+    expected_relation = (
+        "equal"
+        if session["candidate"] == session["baseline_commit"]
+        else "descendant"
+    )
+    if session["candidate_relation"] != expected_relation:
+        raise EvidenceError(
+            "recorder session candidate relation does not match candidate equality"
+        )
+
+    context_joins = {
+        "context_nonce": "context_nonce",
+        "evidence_id": "evidence_id",
+        "evidence_attempt": "evidence_attempt",
+        "run_binding": "run_binding",
+        "worktree_handle": "worktree_handle",
+        "baseline_commit": "baseline_commit",
+        "bundle_id": "harness_bundle_sha256",
+    }
+    for session_field, context_field in context_joins.items():
+        if session[session_field] != context_body[context_field]:
+            raise EvidenceError(
+                f"recorder session {session_field} does not match context"
+            )
+    if session["dispatch_id"] != invocation_body["dispatch_id"]:
+        raise EvidenceError(
+            "recorder session dispatch ID does not match platform dispatch"
+        )
+
+    expected_parent_sha256 = hashlib.sha256(
+        canonical_json_bytes(context_body["parent_finding_ids"])
+    ).hexdigest()
+    if session["parent_finding_ids_sha256"] != expected_parent_sha256:
+        raise EvidenceError(
+            "recorder session parent finding IDs sha256 does not match context"
+        )
+
+    expected_destination = (
+        f"attempt-{context_body['evidence_attempt']}/"
+        f"candidate-{session['candidate']}/orchestration/"
+        f"{context_body['role']}.{context_body['wave']}."
+        f"{context_body['review_attempt']}.json"
+    )
+    _require_literal(
+        session["destination"],
+        expected_destination,
+        "recorder session destination",
+    )
+
+    return copy.deepcopy(session)
 
 
 def _validate_capture_relationships(
