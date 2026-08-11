@@ -20,6 +20,22 @@ acceptance bootstrap.
 
 ---
 
+## Approved Append-Platform Contract (Normative)
+
+The sole authoritative append-platform design is
+`docs/superpowers/specs/2026-08-11-tersh-append-platform-design.md` with
+SHA-256
+`fc761d1ee4550e14aac10e70211f2b8cd87eab1d2ac3b9ace32aefdb224dade9`.
+
+append-platform imports the approved 2026-08-11 design verbatim: exact five
+BODYs, Host-built frozen BODY 5, client validation, no client RECORD stream,
+Host-ledger linearization, and Host-exclusive formal projection. Operator
+attestation is deferred and no formal attest CLI exists in this checkpoint.
+
+This section supersedes every conflicting append-platform, attestation, BODY
+order, record-upload, or projection-writer detail retained elsewhere in this
+older execution plan. Those unrelated task recipes remain in force.
+
 ## Authority, Order, And Non-Goals
 
 This plan is the sole execution order for the seven implementation iterations required by design lines 1244–1261 and 1476–1505. The numbered tasks inside Plans 1–5 remain test-driven component recipes. A component commit is not a slice acceptance event, and a component plan's local GREEN state is not an implementation-cycle manifest.
@@ -68,7 +84,7 @@ No executor may run Plan1 Task6b or Task7b before `impl-01` is closed. Plan1 Tas
 | `scripts/implementation_evidence/gate_catalog.json` | Frozen registered per-iteration gate policy; a candidate copy is never acceptance authority |
 | `scripts/implementation_evidence/run_cumulative_gates.py` | Repository source/diagnostic copy of the registered cumulative producer |
 | `scripts/tests/test_implementation_evidence.py` | Canonicality, output bounds, append-only attempt layout, cumulative catalogs, unique push selection, deadlines/cancel, and closure tests |
-| `target/implementation-evidence/impl-{01,02,03,04,05,06,07}/attempt-NNN/candidate-SHA/` | Policy-fixed shared physical root for both implementation `local` and `external` projection classes; receipt class disambiguates ownership, the host ledger/spool is authoritative, and every projected record must bijectively match it |
+| `target/implementation-evidence/impl-{01,02,03,04,05,06,07}/attempt-NNN/candidate-SHA/` | Candidate-visible diagnostic mirror only; it is never a formal projection root or authority. The Host ledger/spool is authoritative and only the Host may publish or repair the policy-bound formal projection outside candidate-writable directories. |
 | `docs/superpowers/evidence/2026-08-10-tersh-implementation/impl-{01,02,03,04,05,06,07}.json` | Seven sole-destination canonical envelopes; each is formal only with its detached online closure receipt |
 
 ## Locked Evidence Schemas And Five-Role Waves
@@ -260,58 +276,36 @@ adapter stores the actual terminal spawn result in a private mode-0600,
 create-new response-envelope store outside the agent/operator sandbox and under
 the fixed OS root principal (UID `0`). That store contains the host-issued agent ID,
 canonical task path, agent run ID, start/end timestamps, terminal status, and a
-nullable host-returned reported-result-commit field. The recorder, not that
-field, observes the clean worktree commit and compares it when present. Neither
-the agent nor an operator can address, write, or edit the store. The first
+nullable host-returned reported-result-commit field. The Host, not that field or
+the recorder, owns the clean worktree observation and compares the reported
+commit when present. Neither the agent nor an operator can address, write, or
+edit the store. The first
 context capability `H0` is single-consumption. Capturing an invocation consumes
 `H0` and atomically returns successor context capability `H1` plus invocation
 handle `HI`; capturing a response consumes the current context capability and
-atomically returns its successor plus response handle `HR`. Thus the platform
-path is `H0 -> (H1, HI) -> (H2, HR)`, while the no-invocation attestation path is
-`H0 -> (H1, HR)`. A predecessor capability becomes invalid as soon as its
-successful transaction commits. The recorder atomically consumes the final
-context capability and its member handles; no handle can be replayed or mixed
-across context generations. Immutable receipt IDs are read-only/queryable
-through closure so a failed finalizer retry cannot erase provenance. If this
-supervisor boundary is unavailable, neither provenance mode is evidence-bearing.
+atomically returns its successor plus response handle `HR`. The platform path is
+`H0 -> (H1, HI) -> (H2, HR)`. A predecessor capability becomes invalid as soon
+as its successful transaction commits. The Host-ledger append transaction
+atomically consumes the final context capability and its member handles; no
+handle can be replayed or mixed across context generations. Immutable receipt
+IDs are read-only/queryable through closure so a failed finalizer retry cannot
+erase provenance. If this supervisor boundary is unavailable, the platform
+provenance path is not evidence-bearing.
 
-When the platform also supplies immutable requested/selected model metadata, the
-adapter stores one spawn-invocation envelope and the recorder compares its
-requested/selected model and effort while joining the separate response identity,
-hashes all three canonical
-envelopes, embeds each complete canonical body plus its hash, and appends
-provenance mode `platform-envelope`. In that mode there is no model, effort,
-identity, timestamp, output-path, or override value supplied through CLI or
-environment. If and only if the host-owned response envelope has trustworthy
-identity/lifecycle fields but the platform omits trustworthy model/effort
-metadata, the recorder consumes that response handle and appends provenance mode
-`operator-attestation` with the operator identity, exact requested
-`gpt-5.6-sol`/`xhigh` from the fixed context, attestation timestamp, and reason
-`platform-model-metadata-unavailable`. The finalizer may use that explicit
-attestation to enforce the requested dispatch contract, but must label it as
-operator-attested and must not claim the platform independently verified the
-model. If the host cannot provide the immutable identity/lifecycle response
-envelope, the dispatch is not evidence-bearing and finalization fails; the
-recorder never fabricates or claims to observe absent data. Reviewer report JSON
-is never an envelope or attestation source in either mode.
+The adapter stores the immutable context-v2, spawn-invocation, and terminal
+response envelopes. The nonroot recorder validates their complete canonical
+bodies, hashes, requested/selected model and effort, and joined response
+identity as part of the exact five-BODY transaction imported above. It accepts
+only the `platform-envelope` provenance arm and has no model, effort, identity,
+timestamp, output-path, record-upload, or projection-writer override through
+CLI or environment. If trustworthy invocation model metadata is unavailable,
+this checkpoint cannot append formal orchestration evidence; a future operator
+attestation design requires its own schema, source map, and operation.
 
-The shared schema's `provenance` is an exact tagged union with no extra fields.
-Both variants contain `mode`, `context: {body, sha256}`, and
-`response: {body, sha256}`; each `body` is the complete canonical host envelope
-and `sha256` is its 64-lowercase-hex digest. `platform-envelope` additionally
-contains `invocation: {body, sha256}` and nothing attestation-specific.
-`operator-attestation` instead contains `operator_id`, `attested_at`, fixed
-`reason: "platform-model-metadata-unavailable"`,
-`requested_model: "gpt-5.6-sol"`, and `requested_reasoning_effort: "xhigh"`,
-and contains no invocation or platform-verified-model claim. `operator_id` uses
-the shared agent-ID grammar and `attested_at` uses the timestamp grammar below.
-
-The three embedded canonical bodies have these exact closed field sets and no
-aliases or extra keys:
-
-- Context: `{schema,context_nonce,harness_bundle_revision,harness_bundle_sha256,evidence_id,evidence_attempt,role,wave,review_attempt,run_binding,baseline_commit,review_target,canonical_task_path,worktree_handle,requested_model,requested_reasoning_effort,created_at}` with schema `tersh-host-dispatch-context-v1`.
-- Invocation: `{schema,context_nonce,harness_bundle_revision,harness_bundle_sha256,dispatch_id,requested_model,requested_reasoning_effort,selected_model,selected_reasoning_effort,dispatched_at}` with schema `tersh-host-spawn-invocation-v1`.
-- Response: `{schema,context_nonce,harness_bundle_revision,harness_bundle_sha256,dispatch_id,agent_id,canonical_task_path,agent_run_id,started_at,ended_at,terminal_status,reported_result_commit,reported_record_sha256}` with schema `tersh-host-spawn-response-v2`.
+The exact append-platform context, invocation, response, recorder-session, and
+orchestration-record schemas and source maps are owned by the approved contract
+above. In particular, context v1 is not an optional alias for the required
+context v2 body, and this older plan does not restate those closed field sets.
 
 `context_nonce` and `dispatch_id` are 64 lowercase hex; evidence/review attempts,
 IDs, roles, waves, run bindings, commits, task path, and agent IDs use the shared
@@ -331,8 +325,7 @@ starts a new evidence attempt and no accepting attempt may mix bundle identities
 fields are exactly `xhigh`. Every timestamp matches UTC RFC 3339
 `^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{1,9}Z$`.
 Platform mode requires
-`created_at <= dispatched_at <= started_at <= ended_at`; attestation mode
-requires `created_at <= started_at <= ended_at <= attested_at`. `terminal_status` is
+`created_at <= dispatched_at <= started_at <= ended_at`. `terminal_status` is
 exactly `completed|failed|cancelled|interrupted`. All three bodies repeat one
 nonce, invocation/response repeat one dispatch ID, response task identity equals
 context task identity, and every duplicated requested field is byte-identical.
@@ -516,9 +509,9 @@ Add exact Python unittest methods:
 - `test_finalizer_requires_host_receipt_body_hashes_and_destination_binding`
 - `test_verify_only_rehashes_embedded_context_invocation_and_response_without_host_store`
 - `test_platform_recorder_consumes_one_host_owned_invocation_and_response_handle_pair`
-- `test_operator_attestation_requires_host_response_handle_when_platform_model_metadata_is_unavailable`
-- `test_operator_attestation_rejects_identity_timestamp_model_effort_and_output_inputs`
-- `test_provenance_tagged_union_rejects_extra_fields_mixed_arms_or_unhashed_bodies`
+- `test_append_platform_rejects_missing_invocation_or_untrusted_model_metadata`
+- `test_append_platform_rejects_attest_operation_and_authority_overrides`
+- `test_platform_provenance_rejects_extra_fields_or_unhashed_bodies`
 - `test_orchestration_fails_when_host_identity_response_is_unavailable`
 - `test_reviewer_report_cannot_self_attest_model_or_reasoning_effort`
 - `test_finalize_embeds_every_append_only_review_body_and_hash`
@@ -537,7 +530,7 @@ with the host binding invariant above. The replacement proves candidate A binds
 one attempt, candidate B requires the next host-opened attempt, and neither
 create-new history can be overwritten or replayed.
 
-The agent-report fixture first completes `append-platform`/`attest` and proves
+The agent-report fixture first completes `append-platform` and proves
 the final context/member handles are consumed before opening the sealer session.
 It then drives the zero-selector `seal-agent-record` CLI through the exact
 Host-selected authority, wrong/missing callback digest, wrong orchestration
@@ -620,8 +613,8 @@ plus independent verifying review. Bundle fixtures reject
 an unregistered ID, extra/missing/symlink/writable bundle member, wrong runtime
 profile, mixed-attempt bundle, and candidate-root executable. Agent-report
 fixtures require response-v2's terminal digest and reject a changed draft,
-wrong dispatch/generation/destination, null required digest, or operator
-attestation substituted for byte binding. Pre-COMMIT
+wrong dispatch/generation/destination, null required digest, or any attempted
+substitute for byte binding. Pre-COMMIT
 failures prove the same input handles remain retryable and no store mutation
 occurs. Post-COMMIT missing, malformed, or trailing REPLY fixtures prove stdout
 is empty, all predecessor/member handles are already invalid, their replay is
@@ -1084,8 +1077,6 @@ The frame schemas and field sets are closed as follows:
   `{schema,transaction_nonce,operation,context_handle}`. The `append-platform`
   arm is exactly
   `{schema,transaction_nonce,operation,context_handle,invocation_handle,response_handle}`.
-  The `attest` arm is exactly
-  `{schema,transaction_nonce,operation,context_handle,response_handle}`.
   `enumerate-evidence` instead uses schema
   `tersh-host-enumerate-evidence-begin-v1` and exactly
   `{schema,transaction_nonce,operation,evidence_id,through_evidence_attempt}`,
@@ -1143,20 +1134,15 @@ The frame schemas and field sets are closed as follows:
   the canonical complete ordered BODY-digest array including LF without placing
   any unbounded digest array in one frame.
 - COMMIT has schema `tersh-host-transaction-commit-v1`. Capture arms are exactly
-  `{schema,transaction_nonce,operation,body_sha256s}`. The two record arms are
-  exactly
+  `{schema,transaction_nonce,operation,body_sha256s}`. The `append-platform`
+  record arm is exactly
   `{schema,transaction_nonce,operation,body_sha256s,record_facts}`.
   `append-platform` record facts are exactly
   `{evidence_id,evidence_attempt,run_binding,candidate,destination,record_sha256}`.
-  `attest` record facts have those fields plus exactly
-  `{operator_id,attested_at,reason,requested_model,requested_reasoning_effort}`.
-  The candidate is the clean observed HEAD, destination is the derived
-  candidate-relative orchestration path, reason is exactly
-  `platform-model-metadata-unavailable`, and requested model/effort are exactly
-  `gpt-5.6-sol`/`xhigh`. `record_sha256` hashes the complete canonical record
-  exactly as written to the host spool and later projected. The detached receipt
-  joins it by destination, byte count, and digest; no receipt ID is inserted into
-  or omitted from the record body.
+  Candidate and destination equal the Host recorder-session BODY, and
+  `record_sha256` equals the Host-frozen orchestration-record BODY digest. The
+  detached receipt joins those exact frozen bytes by destination, byte count,
+  and digest; no receipt ID is inserted into or omitted from the record body.
   The enumeration arm is exactly
   `{schema,transaction_nonce,operation,evidence_id,through_evidence_attempt,attempt_binding_count,producer_receipt_count,spool_record_count,spool_byte_count,ordered_attempt_binding_ids_sha256,ordered_producer_receipt_ids_sha256,ordered_body_sha256s_sha256,ordered_spool_body_sha256s_sha256,ordered_spool_join_sha256s_sha256}`
   and every value equals SUMMARY, PAGE-END, and the validated BODY sequence.
@@ -1176,7 +1162,8 @@ The frame schemas and field sets are closed as follows:
   `{schema,context_handle,invocation_handle}` with schema
   `tersh-host-capture-invocation-result-v1`. For `capture-response`, it is
   exactly `{schema,context_handle,response_handle}` with schema
-  `tersh-host-capture-response-result-v1`. For either record arm, it is exactly
+  `tersh-host-capture-response-result-v1`. For the `append-platform` record arm,
+  it is exactly
   `{schema,receipt}` with schema `tersh-host-record-result-v1`, and `receipt` is
   the exact closed receipt body below. An `enumerate-evidence` REPLY is instead
   exactly
@@ -1547,11 +1534,17 @@ passes a descriptor to a child, or reuses a retired FD.
 
 The fixed BODY orders are: `capture-context` = `context`;
 `capture-invocation` = `context, invocation`; `capture-response` = `context,
-response`; `append-platform` = `context, invocation, response`; `attest` =
-`context, response`; and `enumerate-evidence` = each `attempt-binding` in
-attempt order followed immediately by its `producer-receipt` BODY and matching
-SPOOL stream in sequence order. No operation permits a null, optional,
-additional, omitted, or different-kind BODY or spool stream.
+response`; `append-platform` uses exactly `context`, `invocation`, `response`,
+`recorder-session`, and `orchestration-record`; and `enumerate-evidence` = each
+`attempt-binding` in attempt order followed immediately by its
+`producer-receipt` BODY and matching SPOOL stream in sequence order. No
+operation permits a null, optional, additional, omitted, or different-kind BODY
+or spool stream.
+
+> **Superseded non-normative context:** Earlier revisions described
+> append-platform with only the context, invocation, and response BODYs. That
+> three-BODY mapping is retained only to explain older implementation notes and
+> is not an executable contract.
 
 Each framed Host Envelope transaction's host-store linearization point is the host's atomic
 application of the validated COMMIT after it has accepted exact REQUEST-END plus
@@ -1601,13 +1594,28 @@ exactly `{schema,context_handle,invocation_handle}` with schema
 `tersh-host-capture-response-result-v1`, yielding `H2` and `HR`. Each old context
 handle becomes invalid at the host's atomic COMMIT point, before REPLY; the
 successor/member handles are printed only after the client validates the entire
-reply and EOF. If invocation metadata is absent, the invocation command is not
-run; response capture instead consumes `H0` and yields `H1` plus `HR`. The
-supervisor records only callback fields it actually exposes, and absence of
-terminal identity/lifecycle means no response
-handle. Every command uses a fresh authenticated FD and the exact transaction
-above; same-principal/fake peers, FIFO or plain pipes, regular files, TTY/stdin,
-caller JSON, wrong nonce, replay, trailing bytes, and unknown options fail.
+reply and EOF. Append-platform always requires the invocation member; missing
+trustworthy invocation metadata cannot fall back to another formal operation in
+this checkpoint. The supervisor records only callback fields it actually
+exposes, and absence of terminal identity/lifecycle means no response handle.
+Every command uses a fresh authenticated FD and the exact transaction above;
+same-principal/fake peers, FIFO or plain pipes, regular files, TTY/stdin, caller
+JSON, wrong nonce, replay, trailing bytes, and unknown options fail.
+
+### Append-Platform Operative Invariants (Normative)
+
+<!-- append-platform-operative:begin -->
+- `body-order` = `context,invocation,response,recorder-session,orchestration-record`
+- `body-5-builder` = `Host`
+- `client-record-or-body-upload` = `none`
+- `formal-projection-writer-and-repairer` = `Host-only`
+- `attestation-operation` = `none`
+- `provenance-mode` = `platform-envelope`
+<!-- append-platform-operative:end -->
+
+The detailed append-platform sequence below is subordinate, non-authoritative
+implementation guidance. The pinned design and operative invariant capsule
+control if this guidance conflicts.
 
 In `platform-envelope` mode the supervisor launches the recorder with a fresh
 authenticated store connection:
@@ -1616,27 +1624,24 @@ authenticated store connection:
 SUPERVISOR_PINNED_PYTHON -I -S -B SUPERVISOR_HARNESS_ROOT/scripts/implementation_evidence/record_orchestration.py append-platform --context-handle CONTEXT_HANDLE_H2 --invocation-handle INVOCATION_HANDLE_HI --response-handle RESPONSE_HANDLE_HR --host-store-fd FD
 ```
 
-The recorder sends BEGIN and retrieves the three ordered bodies without yet
-consuming any handle. It verifies every closed envelope, digest, nonce, dispatch
-ID, and duplicated field. The root session supplies and revalidates the bound
-worktree candidate/tree directly; this record operation never launches Git or
-any other subprocess and therefore needs no runtime-profile BODY. It compares the
-nullable reported commit, derives the only permitted destination, and constructs
-the complete final record. Its COMMIT carries the ordered body
-hashes and exact derived record facts. Only after REQUEST-END plus EOF does the
-host atomically consumes `H2`, `HI`, and `HR`, create-new fsyncs the complete
-orchestration record in the host-only spool, and appends its consecutive
-`producer_mode=harness`, `record_class=orchestration` producer receipt. The
-recorder validates REPLY, REPLY-END, and EOF and then create-new publishes the
-byte-identical local
-projection. A projection failure or post-COMMIT reply failure cannot revive the
-handles or erase the host record/receipt; host enumeration exposes the unmatched
-side and invalidates the attempt unless an idempotent projection retry restores
-the exact bytes. Consume, spool create, and receipt append are one indivisible
-transition, never partial. If the captured response has a nonnull
-`reported_record_sha256`, that same transition also installs exactly one pending
-Host-selected `agent_report_authority` joined to the new orchestration receipt;
-if it is null, no formal review authority exists.
+The recorder sends BEGIN and validates the exact ordered five BODYs: context,
+invocation, response, recorder-session, and orchestration-record. The Host
+constructs and freezes BODY 5 before sending it; the recorder independently
+derives and validates every available record field from BODYs 1-4. The recorder
+sends no RECORD-BEGIN, RECORD-CHUNK, RECORD-END, body JSON, or upload frame. Its
+COMMIT carries only the ordered BODY hashes and derived record facts.
+
+Only after REQUEST-END plus EOF and under the Host-ledger lock does the Host
+atomically consume `H2`, `HI`, and `HR`, store the exact frozen BODY 5 bytes,
+append the consecutive `producer_mode=harness`,
+`record_class=orchestration` receipt, and create the conditional pending report
+authority. The nonroot recorder validates REPLY, REPLY-END, and EOF but never
+writes a projection path. Only the Host may publish or repair the byte-identical
+formal projection through its policy-bound root capability. A projection or
+post-COMMIT reply failure cannot revive the handles or erase the durable Host
+blob/receipt; Host enumeration and repair recover that same record without a
+second receipt. Consume, blob store, receipt append, and conditional authority
+creation are one indivisible transition, never partial.
 
 That receipt uses the exact shared `tersh-host-producer-receipt-v1` schema.
 Its harness-mode agent-report fields are null, its bundle/runtime/entrypoint and
@@ -1647,21 +1652,10 @@ their hashes as part of the record's closed provenance arm. No model, effort,
 identity, timestamp, response body, destination, producer, bundle, or receipt
 override exists on CLI or environment.
 
-If and only if the authenticated response exists but invocation model metadata
-does not, the operator requests this supervisor-launched fallback:
-
-```text
-SUPERVISOR_PINNED_PYTHON -I -S -B SUPERVISOR_HARNESS_ROOT/scripts/implementation_evidence/record_orchestration.py attest --context-handle CONTEXT_HANDLE_H1 --response-handle RESPONSE_HANDLE_HR --operator-id ID --host-store-fd FD
-```
-
-It uses the same retrieve-before-commit transaction, atomically consumes `H1`
-and `HR`, derives identity and lifecycle only from the response, independently
-matches the root-session-bound worktree commit without launching Git, and writes the exact `operator-attestation` arm
-plus fixed reason `platform-model-metadata-unavailable`; only the context's
-model/effort request is operator-attested. The CLI rejects identity, task, run,
-timestamp, commit, model, effort, output, receipt, or free-form reason arguments.
-Its atomic host transition applies the same nonnull-report-digest rule for
-creating the one pending `agent_report_authority`.
+Operator attestation is deferred. This checkpoint defines no attestation BEGIN,
+BODY order, provenance arm, record schema, or CLI; missing trustworthy
+invocation model metadata therefore fails closed without creating formal
+evidence.
 
 Reviewer reports use a separate root-bundle `seal-agent-record` entrypoint. The
 agent may create-new one draft only at the policy-derived disjoint diagnostic
@@ -1669,7 +1663,7 @@ path
 `target/evidence-agent-drafts/EVIDENCE_ID/attempt-NNN/DISPATCH_ID.json`; that
 tree is never a formal projection root and is not enumerated by a finalizer. The
 response-v2 terminal callback binds the draft's complete canonical SHA-256.
-After `append-platform` or `attest` atomically consumes the final context/member
+After `append-platform` atomically consumes the final context/member
 handles and creates the orchestration receipt, the host retains those immutable
 captured bodies and derives exactly one pending `agent_report_authority` from
 that receipt plus the response callback. The already-consumed `H2`/`HI`/`HR`
@@ -1690,19 +1684,20 @@ after validating the Host-selected authority does the sealer no-follow open its
 schema, context/task/attempt/candidate identities, `dispatch_id`, callback
 digest, and `review_destination`. At COMMIT the host revalidates that authority,
 the existing orchestration receipt and captured response, then indivisibly marks
-the authority consumed, publishes the complete host-spool record, and appends a
+the authority consumed, stores the complete Host-ledger record, and appends a
 `producer_mode=agent-report` receipt binding the response's `dispatch_id`, the
-pre-seal `reported_record_sha256`, and the final `body_sha256`. The spool body and
+pre-seal `reported_record_sha256`, and the final `body_sha256`. The Host blob and
 formal projection are byte-identical to the complete draft, so the receipt's
 `body_sha256` must equal the response's `reported_record_sha256`; the detached
-receipt, not a field inserted into the review, supplies host origin. Only the
-sealer publishes the formal projection. A pre-COMMIT disconnect leaves the
+receipt, not a field inserted into the review, supplies Host origin. The
+nonroot sealer never writes the formal projection; only the Host publishes or
+repairs it through the policy-bound root capability. A pre-COMMIT disconnect leaves the
 authority unused and retryable through a newly authenticated session. After the
 atomic COMMIT, a lost/malformed reply cannot reuse the authority or append a
 second receipt; host enumeration plus `repair-projections` recovers the one
 spooled body and projection before any review consumer continues.
-A missing callback digest makes the report advisory, never formal; operator
-model attestation cannot substitute for report-byte binding. Cross-generation,
+A missing callback digest makes the report advisory, never formal; no deferred
+attestation can substitute for report-byte binding. Cross-generation,
 wrong-destination, modified-after-callback, duplicate, or replayed drafts fail
 without a receipt.
 
@@ -2259,8 +2254,9 @@ directories, noncanonical extras, missing historical reports, external results
 from another run/attempt, or a local gate that did not record one exact
 discovered/executed test where required. It also requires the iteration-specific
 gate IDs enumerated below and exact `gpt-5.6-sol`/`xhigh` identity for every
-orchestration/review entry in every attempt, while preserving whether that
-identity is platform-envelope-verified or operator-attested. It requires
+orchestration/review entry in every attempt, and requires that identity to be
+platform-envelope-verified; deferred attestation is not an accepted identity
+source in this checkpoint. It requires
 `--host-store-fd` in create mode to validate every host receipt; the
 committed-manifest `--verify-only` mode rejects that option and uses only the
 embedded bodies/hashes. Its history array
@@ -2632,7 +2628,7 @@ SUPERVISOR_PINNED_PYTHON -I -S -B SUPERVISOR_HARNESS_ROOT/scripts/implementation
 - [ ] Catalog argv uses only closed whole-token placeholders; no `$` variable, interpolation, or shell expansion survives into the committed catalog.
 - [ ] Every source-changing correction creates a new candidate and reruns applicable external gates.
 - [ ] Every iteration has Wave A, Wave B, Wave C, and five same-candidate closure reports with append-only bodies and hashes.
-- [ ] Every role in every required wave is bound by the root-owned, root-peer-authenticated Host Envelope Supervisor to requested `gpt-5.6-sol` with `xhigh`; create-mode finalization authenticates every host receipt, rejects any other value or a missing supervisor/response, and distinguishes platform-envelope verification from explicit operator attestation when trustworthy platform model metadata is unavailable.
+- [ ] Every role in every required wave is bound by the root-owned, root-peer-authenticated Host Envelope Supervisor to requested `gpt-5.6-sol` with `xhigh`; create-mode finalization authenticates every Host receipt and rejects any other value, a missing supervisor/response, or a dispatch without trustworthy platform invocation metadata. Operator attestation remains deferred.
 - [ ] Each closure commit contains exactly one of `impl-01.json` through `impl-07.json` and no code, test, workflow, or product-documentation change.
 - [ ] `impl-01` and `impl-02` use the split Plan1 component recipes; Task9 external evidence is never run before Task10a.
 - [ ] ADD-009 and ADD-010 map to exact Plan2/3/4 tests, including lock/snapshot lifetime and by-value single-use cases, and the final 269-ID requirement catalog.

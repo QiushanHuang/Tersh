@@ -10,6 +10,22 @@
 
 ---
 
+## Approved Append-Platform Contract (Normative)
+
+The sole authoritative append-platform design is
+`docs/superpowers/specs/2026-08-11-tersh-append-platform-design.md` with
+SHA-256
+`fc761d1ee4550e14aac10e70211f2b8cd87eab1d2ac3b9ace32aefdb224dade9`.
+
+append-platform imports the approved 2026-08-11 design verbatim: exact five
+BODYs, Host-built frozen BODY 5, client validation, no client RECORD stream,
+Host-ledger linearization, and Host-exclusive formal projection. Operator
+attestation is deferred and no formal attest CLI exists in this checkpoint.
+
+This section supersedes every conflicting append-platform, attestation, BODY
+order, record-upload, or projection-writer detail retained elsewhere in this
+older hardening plan. Unrelated cycle tasks remain in force.
+
 ## Entry Gate And Non-Goals
 
 Before this entry gate is evaluated, the implementation-iteration evidence plan must have committed its shared harness and `impl-01` through `impl-07` must each have a valid manifest. The clean entry `HEAD` must be exactly the verified `impl-07` evidence-only closure commit, not merely a descendant of it. Cycle 1 records that immutable entry commit plus all seven manifest hashes; every later hardening candidate must descend from it. Hardening reuses the already tested `scripts/evidence_core.py` and exact-test parser; it must not recreate or fork their canonicalization, bounded-drain, candidate/job/run selection, case-inventory, or append-only review validation logic.
@@ -26,7 +42,7 @@ Tasks 1-6 must not describe the full optimization objective as complete. Cycle 6
 | --- | --- |
 | `scripts/evidence_core.py` | Repository source and diagnostic copy of the shared primitives; formal execution uses only the reviewed exact byte from the registered root-owned bundle. |
 | `scripts/implementation_evidence/host_envelope_adapter.py` | Already committed host-only context/invocation/terminal-response ingress: run the exact shared BEGIN/BODY/COMMIT/REPLY transaction over one root-owned, root-peer-authenticated `AF_UNIX/SOCK_STREAM` FD and rotate opaque single-use context capabilities while the closed bodies remain in the private store. |
-| `scripts/implementation_evidence/record_orchestration.py` | Shared single-record writer that uses the same transaction to atomically consume the final rotated context capability and host-owned invocation/response handles, validate a receipt bound to the derived record facts, and then create-new publish implementation or hardening provenance. |
+| `scripts/implementation_evidence/record_orchestration.py` | Shared nonroot recorder/validator that consumes the final rotated context capability and host-owned invocation/response handles through the Host transaction. It never writes a formal projection; the Host alone stores the frozen record, appends its receipt, and publishes or repairs the formal projection. |
 | `scripts/hardening/run_gate.py` | Repository source/diagnostic copy; the registered `run-gate` entrypoint executes one argv without a shell, host-spools the canonical body, appends its producer receipt, and emits only an untrusted projection. |
 | `scripts/hardening/finalize_cycle.py` | Repository source/diagnostic copy; the registered `finalize-cycle` entrypoint enumerates the full host ledger/spool, proves the projection bijection and five-role closure, obtains a preimage receipt, and emits one manifest envelope without running Git. |
 | `scripts/hardening/gate_catalog.json` | Closed, ordered local gate and frozen case-matrix policy registered in the root bundle; the candidate copy is never acceptance authority. |
@@ -182,26 +198,30 @@ The shared helper's exact artifact CLI repeats `--require-artifact KIND=PRODUCER
 
 Cycles 3 and 4 require exactly the first two `ci` artifacts; Cycle 5 and every later external `ci` gate require exactly all four `ci` artifacts. Cycles 6 and 7 additionally require exactly all eight `release` artifacts. `--reject-extra-artifacts` makes an unexpected artifact a failure even when every required artifact is present.
 
-Every formal orchestration and review projection is one append-only root-owned
-file under the matching
+Every candidate-visible orchestration and review file is an untrusted
+diagnostic mirror under the matching
 `target/hardening/hardening-0N/attempt-NNN/candidate-SHA/orchestration/` or
-`reviews/` directory. Both use the exact filename grammar
+`reviews/` directory. The formal projections use the same relative destination
+and filename beneath the policy-bound Host-exclusive root outside every
+candidate-writable directory. Both use the exact filename grammar
 `ROLE.WAVE.REVIEW_ATTEMPT.json`, where ROLE is
 `product|architecture|implementation|safety|verification`, WAVE is
 `wave-a|wave-b|wave-c|closure-a|closure-b`, and REVIEW_ATTEMPT is the string
 `001` through `999`. For example, the first safety Wave C pair is
-`safety.wave-c.001.json` in both directories. The root-owned
-`record-orchestration` producer constructs and publishes the orchestration body
-from its context/invocation/response facts. The agent writes only the review's
+`safety.wave-c.001.json` in both record-class directories. The Host constructs,
+freezes, stores, receipts, and alone publishes or repairs the formal
+orchestration projection; the nonroot `record-orchestration` client only
+validates the five BODYs and receipt. The agent writes only the review's
 policy-derived diagnostic draft
 `target/evidence-agent-drafts/EVIDENCE_ID/attempt-NNN/DISPATCH_ID.json`; after
 the terminal callback binds that draft's digest, `seal-agent-record` no-follow
-rehashes it and alone publishes the byte-identical receipt-backed formal review
-projection. Each formal file is create-new; there is
+rehashes and validates it, then the Host-ledger transaction stores and receipts
+the exact bytes. Only the Host publishes or repairs the byte-identical formal
+review projection. Each formal file is create-new; there is
 no aggregate `orchestration.json`, append-by-replacement prefix, hardening-only
 identity schema, or numeric review attempt.
 
-Thus the only two complete record paths are exactly
+Thus the only two candidate-visible diagnostic mirror paths are exactly
 `target/hardening/EVIDENCE-ID/attempt-NNN/candidate-SHA/orchestration/ROLE.WAVE.REVIEW_ATTEMPT.json`
 and
 `target/hardening/EVIDENCE-ID/attempt-NNN/candidate-SHA/reviews/ROLE.WAVE.REVIEW_ATTEMPT.json`;
@@ -332,6 +352,21 @@ Only `commit-and-close` may create the evidence-only Git commit and detached
 closure. Formal verification is an online root-registry query; offline
 `--verify-only` emits only `STRUCTURAL_PASS/HOST_UNVERIFIED`.
 
+### Append-Platform Operative Invariants (Normative)
+
+<!-- append-platform-operative:begin -->
+- `body-order` = `context,invocation,response,recorder-session,orchestration-record`
+- `body-5-builder` = `Host`
+- `client-record-or-body-upload` = `none`
+- `formal-projection-writer-and-repairer` = `Host-only`
+- `attestation-operation` = `none`
+- `provenance-mode` = `platform-envelope`
+<!-- append-platform-operative:end -->
+
+The detailed append-platform sequence below is subordinate, non-authoritative
+implementation guidance. The pinned design and operative invariant capsule
+control if this guidance conflicts.
+
 The platform-envelope capture sequence is:
 
 ```text
@@ -346,54 +381,37 @@ under schemas `tersh-host-capture-context-result-v1`,
 `tersh-host-capture-response-result-v1`. Each capture invalidates its predecessor
 context capability at the host's atomic COMMIT point, before REPLY; a failed
 reply therefore exposes no successor but cannot revive the predecessor. When
-model metadata exists, the executor then runs this exact command with only the
-final context generation:
+trustworthy invocation model metadata exists, the executor runs this exact
+command with only the final context generation:
 
 ```text
 SUPERVISOR_PINNED_PYTHON -I -S -B SUPERVISOR_HARNESS_ROOT/scripts/implementation_evidence/record_orchestration.py append-platform --context-handle CONTEXT_HANDLE_H2 --invocation-handle INVOCATION_HANDLE_HI --response-handle RESPONSE_HANDLE_HR --host-store-fd FD
 ```
 
-It records provenance mode `platform-envelope`. When the host response still
-contains trustworthy agent/task/run identity and lifecycle but model/effort
-metadata is unavailable, it skips invocation capture, consumes `H0` during
-response capture to obtain `(H1, HR)`, and runs this exact command:
+It records only provenance mode `platform-envelope`. The Host sends exactly five
+ordered BODYs: context, invocation, response, recorder-session, and the
+Host-built frozen orchestration-record. The nonroot recorder independently
+validates the envelopes, recorder session, record source joins, canonical bytes,
+and digest, then sends only the BODY hashes and derived record facts in COMMIT.
+It sends no RECORD-BEGIN, RECORD-CHUNK, RECORD-END, body JSON, or upload frame.
 
-```text
-SUPERVISOR_PINNED_PYTHON -I -S -B SUPERVISOR_HARNESS_ROOT/scripts/implementation_evidence/record_orchestration.py attest --context-handle CONTEXT_HANDLE_H1 --response-handle RESPONSE_HANDLE_HR --operator-id ID --host-store-fd FD
-```
+Only REQUEST-END plus EOF permits the Host-ledger transaction to atomically
+consume every final context/member handle, store the exact frozen BODY 5 bytes,
+append the corresponding producer receipt, and create the conditional pending
+report authority. The recorder never writes an agent-visible or formal
+projection. Only the Host may publish or repair the exact formal projection
+through its policy-bound root capability. A post-linearization reply or
+projection failure leaves the handles consumed and stdout empty, but the exact
+receipt and blob remain discoverable through Host enumeration and repair; they
+are never silently omitted or duplicated.
 
-The record operation first retrieves and validates the fixed BODY sequence,
-derives the clean candidate, destination, and preparatory-record hash, and
-streams the proposed canonical body without mutating the host store. Every
-pre-linearization failure consumes no host capability and creates no spool body
-or receipt. Only REQUEST-END plus EOF permits the host, at COMMIT, to atomically
-create-new publish and fsync the spool body, consume every final
-context/member handle and append the corresponding producer receipt; partial
-consumption is impossible. Only a validated REPLY, REPLY-END, and EOF permits a
-matching agent-writable projection. A post-COMMIT reply or projection failure
-leaves the old handles invalid and stdout empty, but the complete receipt and
-spool body remain discoverable through host enumeration; it is not silently
-garbage-collected or omitted from finalization. Capture operations that create
-only successor capabilities may still leave the shared contract's private,
-agent-unaddressable orphan on a post-COMMIT reply failure. The fallback records
-provenance mode
-`operator-attestation` with reason `platform-model-metadata-unavailable`. The
-latter attests only the fixed
-`gpt-5.6-sol`/`xhigh` request; identity and lifecycle come only from the
-  host-owned response. If that response does not exist, the dispatch cannot
-produce evidence. The provenance object is byte-for-byte the shared closed
-union: both arms contain only `mode`, `context: {body, sha256}`, and
-`response: {body, sha256}`; the platform arm adds only
-`invocation: {body, sha256}`, while the attestation arm adds only `operator_id`,
-`attested_at`, fixed reason and the exact requested model/effort. Both modes
-reject missing/unhashed bodies, mixed arms, extra keys, agent/reviewer JSON, and
-CLI/environment identity, timestamp, model, effort, destination, or free-form
-reason overrides. The detached producer receipt binds the final record by
-destination, byte count, body digest, and (for an agent report) the shared
-`dispatch_id`; no host receipt ID is embedded in the provenance or record body.
-The available embedded bodies use the exact shared context,
-invocation, and response-v2 field sets/types/grammars (attestation has no
-  invocation body). Create-mode finalization uses its one injected FD for one
+Operator attestation is deferred. Missing trustworthy invocation model metadata
+cannot select a fallback formal arm or CLI in this checkpoint. The exact
+context-v2, invocation, response-v2, recorder-session, orchestration-record,
+COMMIT, receipt, and recovery rules come from the approved contract above and
+are not duplicated here.
+
+Create-mode finalization uses its one injected FD for one
   shared `seal-manifest-preimage` transaction. Its BEGIN selects only the
   evidence ID, terminal three-character attempt, and manifest kind; it contains
   no receipt IDs, candidate, count, page, digest, or omission filter. The host
@@ -691,7 +709,7 @@ root supervisor opens the first hardening-01 attempt and host-seals all three
 reports; repo-local diagnostic copies are not substitutes. Only after their
 terminal responses are captured may the writer begin the failing harness tests.
 
-Add exact Python tests `test_run_gate_preserves_child_exit`, `test_allow_failure_records_nonzero`, `test_output_is_drained_hashed_and_capped`, `test_gate_json_is_canonical_and_atomic`, `test_gate_requires_exact_json_stdout_stderr_triplet`, `test_run_gate_requires_create_new_attempt_candidate_root`, `test_run_gate_rejects_reused_attempt_or_existing_output`, `test_concurrent_attempt_marker_has_one_valid_winner`, `test_run_gate_rejects_head_or_evidence_id_drift`, `test_gate_and_review_attempts_are_three_character_strings`, `test_shared_run_binding_rejects_empty_doubled_trailing_duplicate_reordered_zero_or_unknown_components`, `test_hardening_uses_shared_per_file_orchestration_and_review_schemas`, `test_hardening_rejects_aggregate_orchestration_legacy_schema_and_numeric_attempts`, `test_hardening_host_protocol_reuses_shared_exact_frame_state_machine`, `test_hardening_provenance_uses_rotating_context_capabilities`, `test_hardening_finalizer_enumerates_complete_host_ledger_without_client_ids`, `test_platform_provenance_consumes_host_owned_invocation_and_response_handles`, `test_operator_attestation_requires_host_response_and_rejects_identity_overrides`, `test_shared_provenance_union_rejects_extra_fields_mixed_arms_or_unhashed_bodies`, `test_missing_host_response_cannot_produce_hardening_evidence`, `test_finalize_requires_supervisor_receipt_hashes_and_destination`, `test_verify_only_rehashes_embedded_envelopes_and_rejects_host_fd`, `test_finalize_embeds_every_failed_superseded_and_accepting_attempt`, `test_finalize_rejects_missing_intermediate_or_unembedded_attempt`, `test_finalize_requires_append_only_wave_a_b_c_and_five_role_closure`, `test_finalize_crosschecks_orchestrator_agent_task_and_run_ids`, `test_finalize_embeds_every_review_canonical_body_and_hash`, `test_finalize_embeds_required_gate_and_external_manifest_bodies`, `test_finalize_rejects_unbound_direct_gate_hash`, `test_finalize_requires_parent_finding_resolution_chain`, `test_resolution_ref_binds_attempt_candidate_run_file_and_body_hash`, `test_hardening_rejects_legacy_finding_ids_and_ambiguous_resolution_refs`, `test_finalize_rejects_unresolved_p0_or_p1`, `test_finalize_rejects_candidate_drift`, `test_verify_only_rejects_tampered_manifest`, `test_external_gate_requires_shared_result_manifest`, `test_external_gate_rejects_manifest_path_escape_or_symlink`, `test_external_gate_requires_exact_artifact_templates_and_rejects_extra`, `test_external_artifact_manifest_excludes_itself_and_outer_index_hashes_it`, `test_exact_runner_lists_then_executes_every_required_test`, `test_exact_runner_rejects_zero_discovered_or_executed`, `test_exact_runner_rejects_parameter_case_id_or_count_mismatch`, and `test_prior_gate_script_contains_locked_commands`. Use temporary directories, a child that writes 2 MiB per stream, fixed environment metadata, append-only multi-attempt per-file orchestration/review fixtures, and synthetic shared `tersh-external-candidate-result-v1` plus referenced-manifest fixtures. Host framing uses local `AF_UNIX/SOCK_STREAM` socketpairs and a scripted shared host state machine: first reproduce `EPIPE` for the obsolete body-then-host-half-close sequence, then exercise the exact shared frame order, end markers, final half-closes, rotating `H0 -> H1 -> H2` capabilities, atomic member consumption, and host-selected ledger enumeration. Reject client-supplied receipt IDs, early half-close, reply before COMMIT, missing/duplicate/extra/reordered frames or ledger results, wrong nonce/digest/count, trailing bytes, replay, cross-generation mixing, and partial consumption, always with empty client stdout. Socketpairs test framing only; a pure internal parser accepts synthetic peer/store/current UID triples, while a real production CLI socketpair remains same-UID and fails because production has no expected-UID, environment, or test override. Include negative fixtures for missing response handles, caller-supplied identity/lifecycle/model fields, numeric attempts, legacy hardening schema names, aggregate `orchestration.json`, path-only or hashless resolution references, self-listed artifact manifests, and unlisted payload files.
+Add exact Python tests `test_run_gate_preserves_child_exit`, `test_allow_failure_records_nonzero`, `test_output_is_drained_hashed_and_capped`, `test_gate_json_is_canonical_and_atomic`, `test_gate_requires_exact_json_stdout_stderr_triplet`, `test_run_gate_requires_create_new_attempt_candidate_root`, `test_run_gate_rejects_reused_attempt_or_existing_output`, `test_concurrent_attempt_marker_has_one_valid_winner`, `test_run_gate_rejects_head_or_evidence_id_drift`, `test_gate_and_review_attempts_are_three_character_strings`, `test_shared_run_binding_rejects_empty_doubled_trailing_duplicate_reordered_zero_or_unknown_components`, `test_hardening_uses_shared_per_file_orchestration_and_review_schemas`, `test_hardening_rejects_aggregate_orchestration_legacy_schema_and_numeric_attempts`, `test_hardening_host_protocol_reuses_shared_exact_frame_state_machine`, `test_hardening_provenance_uses_rotating_context_capabilities`, `test_hardening_finalizer_enumerates_complete_host_ledger_without_client_ids`, `test_platform_provenance_consumes_host_owned_invocation_and_response_handles`, `test_append_platform_rejects_attest_operation_and_missing_invocation_metadata`, `test_platform_provenance_rejects_extra_fields_or_unhashed_bodies`, `test_missing_host_response_cannot_produce_hardening_evidence`, `test_finalize_requires_supervisor_receipt_hashes_and_destination`, `test_verify_only_rehashes_embedded_envelopes_and_rejects_host_fd`, `test_finalize_embeds_every_failed_superseded_and_accepting_attempt`, `test_finalize_rejects_missing_intermediate_or_unembedded_attempt`, `test_finalize_requires_append_only_wave_a_b_c_and_five_role_closure`, `test_finalize_crosschecks_orchestrator_agent_task_and_run_ids`, `test_finalize_embeds_every_review_canonical_body_and_hash`, `test_finalize_embeds_required_gate_and_external_manifest_bodies`, `test_finalize_rejects_unbound_direct_gate_hash`, `test_finalize_requires_parent_finding_resolution_chain`, `test_resolution_ref_binds_attempt_candidate_run_file_and_body_hash`, `test_hardening_rejects_legacy_finding_ids_and_ambiguous_resolution_refs`, `test_finalize_rejects_unresolved_p0_or_p1`, `test_finalize_rejects_candidate_drift`, `test_verify_only_rejects_tampered_manifest`, `test_external_gate_requires_shared_result_manifest`, `test_external_gate_rejects_manifest_path_escape_or_symlink`, `test_external_gate_requires_exact_artifact_templates_and_rejects_extra`, `test_external_artifact_manifest_excludes_itself_and_outer_index_hashes_it`, `test_exact_runner_lists_then_executes_every_required_test`, `test_exact_runner_rejects_zero_discovered_or_executed`, `test_exact_runner_rejects_parameter_case_id_or_count_mismatch`, and `test_prior_gate_script_contains_locked_commands`. Use temporary directories, a child that writes 2 MiB per stream, fixed environment metadata, append-only multi-attempt per-file orchestration/review fixtures, and synthetic shared `tersh-external-candidate-result-v1` plus referenced-manifest fixtures. Host framing uses local `AF_UNIX/SOCK_STREAM` socketpairs and a scripted shared host state machine: first reproduce `EPIPE` for the obsolete body-then-host-half-close sequence, then exercise the exact shared frame order, end markers, final half-closes, rotating `H0 -> H1 -> H2` capabilities, atomic member consumption, and host-selected ledger enumeration. Reject client-supplied receipt IDs, early half-close, reply before COMMIT, missing/duplicate/extra/reordered frames or ledger results, wrong nonce/digest/count, trailing bytes, replay, cross-generation mixing, and partial consumption, always with empty client stdout. Socketpairs test framing only; a pure internal parser accepts synthetic peer/store/current UID triples, while a real production CLI socketpair remains same-UID and fails because production has no expected-UID, environment, or test override. Include negative fixtures for missing invocation/response handles, the deferred operation name, caller-supplied identity/lifecycle/model fields, numeric attempts, legacy hardening schema names, aggregate `orchestration.json`, path-only or hashless resolution references, self-listed artifact manifests, and unlisted payload files.
 
 Also add exact methods
 `test_candidate_unittest_launcher_rejects_unittest_sitecustomize_and_scripts_package_shadowing`,
@@ -885,7 +903,7 @@ their registered shared entrypoints.
 
 Run: `python3 -B -m unittest scripts.tests.test_hardening_evidence scripts.tests.test_requirement_audit -v`
 
-Expected: the full named target passes, including shared-core delegation, the 2 MiB drain case, create-new attempt/candidate roots, three-character attempt fields, shared per-file orchestration/review schemas, both host-envelope provenance modes, distinct-peer supervisor/receipt validation, rejection when the host response is unavailable, all-attempt embedding, cumulative matrix replay, exact self-excluding artifact inventory plus outer index, implementation-entry equality, external path confinement, latest-closure proof, gate-hash provenance, body-hash-bound finding closure, committed-candidate enforcement, 0-test and externally frozen parameter-case rejection, tampered manifest, and the source-contract proof that Hardening contains no second external selector/verifier or legacy orchestration/review projection.
+Expected: the full named target passes, including shared-core delegation, the 2 MiB drain case, create-new attempt/candidate roots, three-character attempt fields, shared per-file orchestration/review schemas, single platform-envelope provenance mode, rejection of the deferred attest operation or missing invocation metadata, distinct-peer supervisor/receipt validation, rejection when the Host response is unavailable, all-attempt embedding, cumulative matrix replay, exact self-excluding artifact inventory plus outer index, implementation-entry equality, external path confinement, latest-closure proof, gate-hash provenance, body-hash-bound finding closure, committed-candidate enforcement, 0-test and externally frozen parameter-case rejection, tampered manifest, and the source-contract proof that Hardening contains no second external selector/verifier or legacy orchestration/review projection.
 
 - [ ] **Step 4: Capture the immutable Cycle 1 baseline**
 
@@ -1004,7 +1022,7 @@ Expected: the record contains every existing cancel, worker-loss, exit-code, std
 
 - [ ] **Step 2: Run Wave A with three `gpt-5.6-sol` `xhigh` roles**
 
-Product checks that cancel acknowledgement is truthful, completed items remain completed, unresolved mutation prevents cwd commit, and failures remain actionable. Architecture checks first-final-wins, exactly one `Finished`, non-droppable outcomes, safe-point boundaries, and shutdown ordering. Implementation diagnosis searches deterministic schedules for cancel/success, panic/disconnect, quit/signal, and terminal-error races. Each agent create-new writes its exact draft only at the shared policy-derived agent-draft path; after the callback digest, the root sealer alone publishes the receipt-backed formal review projection. Wave A is read-only.
+Product checks that cancel acknowledgement is truthful, completed items remain completed, unresolved mutation prevents cwd commit, and failures remain actionable. Architecture checks first-final-wins, exactly one `Finished`, non-droppable outcomes, safe-point boundaries, and shutdown ordering. Implementation diagnosis searches deterministic schedules for cancel/success, panic/disconnect, quit/signal, and terminal-error races. Each agent create-new writes its exact draft only at the shared policy-derived agent-draft path; after the callback digest, the registered sealer validates it and the Host-ledger COMMIT stores and receipts it. Only the Host publishes the formal review projection. Wave A is read-only.
 
 - [ ] **Step 3: Add deterministic race and fault-reproduction tests**
 
@@ -1087,7 +1105,7 @@ Expected: injected tests always run. The zero-argument native command reads only
 
 - [ ] **Step 2: Run Wave A with three `gpt-5.6-sol` `xhigh` roles**
 
-Product checks that supported failures never lose the unique source, never overwrite a target, and produce actionable exact outcomes. Architecture checks fd-relative no-follow/no-replace operations, fixed-root trust, source claims, private staging, and EXDEV transition ownership. Implementation diagnosis builds the operation-by-fault matrix and reproduces only concrete gaps. Each agent create-new writes its read-only draft only at the shared policy-derived agent-draft path; after the callback digest, the root sealer alone publishes the receipt-backed formal review projection.
+Product checks that supported failures never lose the unique source, never overwrite a target, and produce actionable exact outcomes. Architecture checks fd-relative no-follow/no-replace operations, fixed-root trust, source claims, private staging, and EXDEV transition ownership. Implementation diagnosis builds the operation-by-fault matrix and reproduces only concrete gaps. Each agent create-new writes its read-only draft only at the shared policy-derived agent-draft path; after the callback digest, the registered sealer validates it and the Host-ledger COMMIT stores and receipts it. Only the Host publishes the formal review projection.
 
 - [ ] **Step 3: Add the complete table-driven filesystem fault matrix**
 
@@ -1240,7 +1258,7 @@ Expected: the record includes every existing crash-point, reconciliation, list/r
 
 - [ ] **Step 2: Run Wave A with three `gpt-5.6-sol` `xhigh` roles**
 
-Product checks that recovery is discoverable by ID, restore conflicts preserve user choice, corrupt state is inspect-only, and no recovery action silently deletes. Architecture checks durable receipt phases, fixed-root enumeration, exclusive bundle claims, publish/source-cleanup ordering, and reconciliation idempotence. Implementation diagnosis enumerates every protocol transition and crash seam for source claim, trash, restore, and EXDEV. Each agent create-new writes its read-only draft only at the shared policy-derived agent-draft path; after the callback digest, the root sealer alone publishes the receipt-backed formal review projection.
+Product checks that recovery is discoverable by ID, restore conflicts preserve user choice, corrupt state is inspect-only, and no recovery action silently deletes. Architecture checks durable receipt phases, fixed-root enumeration, exclusive bundle claims, publish/source-cleanup ordering, and reconciliation idempotence. Implementation diagnosis enumerates every protocol transition and crash seam for source claim, trash, restore, and EXDEV. Each agent create-new writes its read-only draft only at the shared policy-derived agent-draft path; after the callback digest, the registered sealer validates it and the Host-ledger COMMIT stores and receipts it. Only the Host publishes the formal review projection.
 
 - [ ] **Step 3: Add the crash/reconciliation matrix**
 
@@ -1367,7 +1385,7 @@ Expected: the record preserves exact q/Q/signal/terminal restoration, 40x10/60x1
 
 - [ ] **Step 2: Run Wave A with three `gpt-5.6-sol` `xhigh` roles**
 
-Product checks that narrow users can always see mode, primary state/error, cancel/back/help/quit and that low bandwidth does not hide truth. Architecture checks terminal guard ownership, suspend/resume state, process signal mapping, dirty-render invalidation, and cluster child reaping before restoration. Implementation diagnosis exercises raw PTY, tmux, screen, resizes, throttled output, and repeated signals. Each agent create-new writes its read-only draft only at the shared policy-derived agent-draft path; after the callback digest, the root sealer alone publishes the receipt-backed formal review projection.
+Product checks that narrow users can always see mode, primary state/error, cancel/back/help/quit and that low bandwidth does not hide truth. Architecture checks terminal guard ownership, suspend/resume state, process signal mapping, dirty-render invalidation, and cluster child reaping before restoration. Implementation diagnosis exercises raw PTY, tmux, screen, resizes, throttled output, and repeated signals. Each agent create-new writes its read-only draft only at the shared policy-derived agent-draft path; after the callback digest, the registered sealer validates it and the Host-ledger COMMIT stores and receipts it. Only the Host publishes the formal review projection.
 
 - [ ] **Step 3: Add deterministic terminal and rendering tests**
 
@@ -1534,7 +1552,7 @@ Expected: records expose exact MSRV/stable, advisory/license, workflow pin, targ
 
 - [ ] **Step 2: Run Wave A with three `gpt-5.6-sol` `xhigh` roles**
 
-Product checks install instructions, supported-target labels, stable/unreleased wording, and a recoverable rollback story. Architecture checks source/lock compatibility identity, installation-ID behavior, manifest schema, immutable inputs, and workflow trust boundaries. Implementation diagnosis reruns clean source installs, asset re-downloads, checksums, PTY smokes, MSRV/current stable, advisory/license policy, and action/image pins. Each agent create-new writes its draft only at the shared policy-derived agent-draft path; after the callback digest, the root sealer alone publishes the receipt-backed formal review projection. Wave A makes no release or repository mutation.
+Product checks install instructions, supported-target labels, stable/unreleased wording, and a recoverable rollback story. Architecture checks source/lock compatibility identity, installation-ID behavior, manifest schema, immutable inputs, and workflow trust boundaries. Implementation diagnosis reruns clean source installs, asset re-downloads, checksums, PTY smokes, MSRV/current stable, advisory/license policy, and action/image pins. Each agent create-new writes its draft only at the shared policy-derived agent-draft path; after the callback digest, the registered sealer validates it and the Host-ledger COMMIT stores and receipts it. Only the Host publishes the formal review projection. Wave A makes no release or repository mutation.
 
 - [ ] **Step 3: Add release-hardening and rollback tests**
 
@@ -1704,7 +1722,7 @@ blocks acceptance.
 
 - [ ] **Step 2: Run Wave A with three `gpt-5.6-sol` `xhigh` roles**
 
-Product audits both north-star tasks, discoverability, truthful wording, retry/recovery paths, 40x10 survival, and the frozen Cluster boundary. Architecture audits all intent/event/outcome, read-lane, mutation, claim, trash/restore, EXDEV, terminal, remote-launch, and cluster invariants as one system. Implementation diagnosis runs the scale/soak baseline and maps regressions to the smallest owning module. Each agent create-new writes its draft only at the shared policy-derived agent-draft path; after the callback digest, the root sealer alone publishes the receipt-backed formal review projection. No role may infer completion from earlier cycle counts.
+Product audits both north-star tasks, discoverability, truthful wording, retry/recovery paths, 40x10 survival, and the frozen Cluster boundary. Architecture audits all intent/event/outcome, read-lane, mutation, claim, trash/restore, EXDEV, terminal, remote-launch, and cluster invariants as one system. Implementation diagnosis runs the scale/soak baseline and maps regressions to the smallest owning module. Each agent create-new writes its draft only at the shared policy-derived agent-draft path; after the callback digest, the registered sealer validates it and the Host-ledger COMMIT stores and receipts it. Only the Host publishes the formal review projection. No role may infer completion from earlier cycle counts.
 
 - [ ] **Step 3: Add integrated scale and soak evidence**
 
@@ -2080,7 +2098,7 @@ is not authorization to publish a release or perform another external mutation.
 - [ ] Every cycle commits its code/test/workflow candidate before accepting gates or reviews; Wave C and all five latest closure reports bind that exact clean 40-hex SHA, and the following commit contains only the allowed evidence path(s).
 - [ ] Every formal gate/external record lives under a validated create-new evidence-ID/attempt/candidate/run binding; each orchestration/review is a candidate-root create-new per-file record with string attempt fields and an exact body `run_binding`. Retries increment attempts, finalization embeds every host-bound failed, superseded, interrupted, and accepting attempt rather than only the winner, and unreceipted diagnostics remain exclusively under `target/hardening-diagnostic`.
 - [ ] Every clean candidate runs the cumulative catalog prefix through its own cycle; Cycle 4 reruns Cycle 3 native CI, and Cycles 5-7 retain the cumulative external job/artifact floor.
-- [ ] No wave exceeds three concurrent agents; all role reports use shared `tersh-evidence-orchestration-v1` with `tersh-evidence-review-v1`, except Cycle 7's post-audit Wave C and closure reports use exact audit-bound `tersh-evidence-review-v2` while its pre-audit Wave A/B remain v1; all require `gpt-5.6-sol` and `xhigh` proven by a root-owned, root-peer-authenticated supervisor envelope or response-bound operator attestation. Create-mode finalization authenticates the host receipt over bounded `AF_UNIX/SOCK_STREAM`; a missing supervisor, receipt, or host identity/lifecycle response fails closed.
+- [ ] No wave exceeds three concurrent agents; all role reports use shared `tersh-evidence-orchestration-v1` with `tersh-evidence-review-v1`, except Cycle 7's post-audit Wave C and closure reports use exact audit-bound `tersh-evidence-review-v2` while its pre-audit Wave A/B remain v1; all require `gpt-5.6-sol` and `xhigh` proven by the root-owned, root-peer-authenticated platform envelopes. Create-mode finalization authenticates the Host receipt over bounded `AF_UNIX/SOCK_STREAM`; a missing supervisor, receipt, invocation metadata, or Host identity/lifecycle response fails closed. Operator attestation remains deferred.
 - [ ] Finding and parent IDs use the shared closed union grammar, and every resolution binds its evidence attempt, candidate, run binding, review filename, and canonical review-body SHA-256 without self-reference.
 - [ ] Every Cargo build/test/run command that resolves dependencies uses `--locked`.
 - [ ] Filtered test commands name an owning test target; final gates run the complete target and all targets.
