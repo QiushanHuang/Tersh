@@ -301,6 +301,7 @@ class AppendPlatformHostModel:
             "blobs": {},
             "receipts": [],
             "authorities": {},
+            "failure_observations": {},
             "next_id": 1,
             "next_connection_generation": 1,
         }
@@ -595,6 +596,21 @@ class AppendPlatformHostModel:
                 "next_receipt_sequence": next_receipt_sequence,
                 "previous_receipt_id": previous_receipt_id,
             }
+            self._state = shadow
+
+    def set_failure_observation(
+        self,
+        context_nonce: str,
+        reason: str,
+    ) -> None:
+        """Install one immutable test-only Host observation for a failure CAS."""
+
+        core.validate_sha256(context_nonce, "context nonce")
+        if type(reason) is not str or not reason:
+            raise core.EvidenceError("failure observation reason must be exact")
+        with self._ledger_lock:
+            shadow = copy.deepcopy(self._state)
+            shadow["failure_observations"][context_nonce] = reason
             self._state = shadow
 
     @staticmethod
@@ -1708,6 +1724,320 @@ class AppendPlatformHostModel:
             raise core.EvidenceError("injected abandon lost result")
         return copy.deepcopy(result)
 
+    def _append_failure_record(
+        self,
+        shadow: dict[str, Any],
+        *,
+        lineage: dict[str, Any],
+        session_body: dict[str, Any],
+        body: dict[str, Any],
+        entrypoint: str,
+        record_class: str,
+        record_schema: str,
+        destination: str,
+        created_at: str,
+    ) -> dict[str, Any]:
+        attempt_id = lineage["attempt_binding_id"]
+        chain = shadow["attempts"][attempt_id]["marker_receipt_chain"]
+        body_bytes = core.canonical_json_bytes(body)
+        body_sha256 = hashlib.sha256(body_bytes).hexdigest()
+        receipt_id = self._new_id(shadow, "failure-receipt")
+        receipt = {
+            "schema": "tersh-host-producer-receipt-v1",
+            "receipt_id": receipt_id,
+            "attempt_binding_id": attempt_id,
+            "producer_session_id": session_body["producer_session_id"],
+            "sequence": chain["next_receipt_sequence"],
+            "previous_receipt_id": chain["previous_receipt_id"],
+            "producer_mode": "harness",
+            "entrypoint": entrypoint,
+            "bundle_id": session_body["bundle_id"],
+            "runtime_profile_id": session_body["runtime_profile_id"],
+            "policy_entry_id": session_body["policy_entry_id"],
+            "policy_entry_sha256": session_body["policy_entry_sha256"],
+            "environment_capability": None,
+            "projection_root_class": "local",
+            "record_class": record_class,
+            "record_schema": record_schema,
+            "destination": destination,
+            "body_sha256": body_sha256,
+            "byte_count": len(body_bytes),
+            "dispatch_id": None,
+            "reported_record_sha256": None,
+            "created_at": created_at,
+        }
+        shadow["blobs"][body_sha256] = body_bytes
+        shadow["receipts"].append(copy.deepcopy(receipt))
+        shadow["records"].append(
+            {
+                "attempt_binding_id": attempt_id,
+                "lineage_id": lineage["lineage_id"],
+                "body": copy.deepcopy(body),
+                "body_bytes": body_bytes,
+                "body_sha256": body_sha256,
+                "receipt_id": receipt_id,
+            }
+        )
+        shadow["attempts"][attempt_id]["marker_receipt_chain"] = {
+            "next_receipt_sequence": receipt["sequence"] + 1,
+            "previous_receipt_id": receipt_id,
+        }
+        return receipt
+
+    def _fail_responded_dispatch(
+        self,
+        request: Any,
+        *,
+        fault_at: str | None,
+    ) -> dict[str, Any]:
+        keys = {
+            "schema",
+            "context_nonce",
+            "transition_index",
+            "recovery_generation",
+            "reason",
+        }
+        value = _require_closed_object(request, keys, "dispatch failure request")
+        _require_literal(
+            value["schema"],
+            "tersh-host-fail-responded-dispatch-request-v1",
+            "dispatch failure schema",
+        )
+        context_nonce = core.validate_sha256(value["context_nonce"], "context nonce")
+        transition_index = core.require_exact_int(
+            value["transition_index"], "transition index", minimum=0
+        )
+        recovery_generation = core.require_exact_int(
+            value["recovery_generation"], "recovery generation", minimum=0
+        )
+        reason = _require_enum(
+            value["reason"],
+            {
+                "candidate-object-missing",
+                "candidate-relation-invalid",
+                "worktree-identity-drift",
+                "attempt-policy-drift",
+                "record-construction-invalid",
+            },
+            "dispatch failure reason",
+        )
+        replay_key = f"fail-dispatch:{context_nonce}"
+        request_sha256 = self._body_sha256(dict(value))
+        existing = self._state["replays"].get(replay_key)
+        if existing is not None:
+            if existing.get("request_sha256") != request_sha256:
+                raise core.EvidenceError("dispatch failure replay conflicts")
+            return copy.deepcopy(existing["result"])
+        lineage = self._resolve_private_lineage(context_nonce)
+        if (
+            lineage["state"] != "RESPONDED_PLATFORM"
+            or transition_index != lineage["transition_index"]
+            or recovery_generation != lineage["recovery_generation"]
+        ):
+            raise core.EvidenceError("dispatch failure tuple is not current")
+        if self._state["failure_observations"].get(context_nonce) != reason:
+            raise core.EvidenceError("Host observation does not prove requested failure")
+
+        handles = {
+            kind: lineage[f"{kind}_handle"]
+            for kind in ("context", "invocation", "response")
+        }
+        rows = {kind: self._state["handles"][handle] for kind, handle in handles.items()}
+        context = rows["context"]["body"]
+        invocation = rows["invocation"]["body"]
+        response = rows["response"]["body"]
+        session_id = lineage["registered_session_ids"][0]
+        session_body = self._state["sessions"][session_id]["body"]
+        body = {
+            "schema": "tersh-host-dispatch-failure-v1",
+            "evidence_id": context["evidence_id"],
+            "evidence_attempt": context["evidence_attempt"],
+            "candidate": session_body["candidate"],
+            "context_nonce": context_nonce,
+            "dispatch_id": invocation["dispatch_id"],
+            "reason": reason,
+            "context": {
+                "body": copy.deepcopy(context),
+                "sha256": rows["context"]["body_sha256"],
+            },
+            "invocation": {
+                "body": copy.deepcopy(invocation),
+                "sha256": rows["invocation"]["body_sha256"],
+            },
+            "response": {
+                "body": copy.deepcopy(response),
+                "sha256": rows["response"]["body_sha256"],
+            },
+            "created_at": response["ended_at"],
+        }
+        destination = (
+            f"attempt-{context['evidence_attempt']}/"
+            f"candidate-{session_body['candidate']}/orchestration-failures/"
+            f"{invocation['dispatch_id']}.json"
+        )
+        shadow = copy.deepcopy(self._state)
+        shadow_lineage = shadow["lineages"][lineage["lineage_id"]]
+        for handle in handles.values():
+            shadow["handles"][handle]["live"] = False
+        receipt = self._append_failure_record(
+            shadow,
+            lineage=shadow_lineage,
+            session_body=session_body,
+            body=body,
+            entrypoint="fail-dispatch-lineage",
+            record_class="orchestration-failure",
+            record_schema="tersh-host-dispatch-failure-v1",
+            destination=destination,
+            created_at=response["ended_at"],
+        )
+        shadow_lineage["state"] = "DISPATCH_FAILED"
+        shadow_lineage["terminal_state"] = "failed"
+        shadow["attempts"][lineage["attempt_binding_id"]]["state"] = "CLOSING_FAILED"
+        result = {
+            "schema": "tersh-host-fail-responded-dispatch-result-v1",
+            "context_nonce": context_nonce,
+            "state": "failed",
+            "failure_receipt_id": receipt["receipt_id"],
+        }
+        shadow["replays"][replay_key] = {
+            "kind": "dispatch-failure",
+            "request_sha256": request_sha256,
+            "result": copy.deepcopy(result),
+        }
+        if fault_at == "fail-dispatch.before-commit":
+            raise core.EvidenceError("injected dispatch failure before commit")
+        self._state = shadow
+        if fault_at == "fail-dispatch.after-commit-before-result":
+            raise core.EvidenceError("injected dispatch failure lost result")
+        if fault_at is not None and fault_at not in {
+            "fail-dispatch.before-commit",
+            "fail-dispatch.after-commit-before-result",
+        }:
+            raise core.EvidenceError("unknown dispatch failure fault point")
+        return copy.deepcopy(result)
+
+    def _fail_agent_report_authority(
+        self,
+        request: Any,
+        *,
+        fault_at: str | None,
+    ) -> dict[str, Any]:
+        value = _require_closed_object(
+            request,
+            {"schema", "context_nonce", "reason"},
+            "agent report authority failure request",
+        )
+        _require_literal(
+            value["schema"],
+            "tersh-host-fail-agent-report-authority-request-v1",
+            "agent report authority failure schema",
+        )
+        context_nonce = core.validate_sha256(value["context_nonce"], "context nonce")
+        reason = _require_enum(
+            value["reason"],
+            {
+                "draft-missing",
+                "draft-digest-mismatch",
+                "draft-schema-invalid",
+                "draft-path-invalid",
+                "sealer-policy-invalid",
+            },
+            "agent report authority failure reason",
+        )
+        replay_key = f"fail-authority:{context_nonce}"
+        request_sha256 = self._body_sha256(dict(value))
+        existing = self._state["replays"].get(replay_key)
+        if existing is not None:
+            if existing.get("request_sha256") != request_sha256:
+                raise core.EvidenceError("authority failure replay conflicts")
+            return copy.deepcopy(existing["result"])
+        lineage = self._resolve_private_lineage(context_nonce)
+        if lineage["state"] != "APPENDED_PLATFORM":
+            raise core.EvidenceError("agent report authority is not pending")
+        if self._state["failure_observations"].get(context_nonce) != reason:
+            raise core.EvidenceError("Host observation does not prove authority failure")
+        invocation = self._state["handles"][lineage["invocation_handle"]]["body"]
+        response = self._state["handles"][lineage["response_handle"]]["body"]
+        context = self._state["handles"][lineage["context_handle"]]["body"]
+        authority = self._state["authorities"].get(invocation["dispatch_id"])
+        if authority is None:
+            raise core.EvidenceError("agent report authority is absent")
+        session_id = lineage["registered_session_ids"][0]
+        session_body = self._state["sessions"][session_id]["body"]
+        body = {
+            "schema": "tersh-host-agent-report-failure-v1",
+            "evidence_id": context["evidence_id"],
+            "evidence_attempt": context["evidence_attempt"],
+            "candidate": session_body["candidate"],
+            "context_nonce": context_nonce,
+            "dispatch_id": invocation["dispatch_id"],
+            "reason": reason,
+            "reported_record_sha256": authority["reported_record_sha256"],
+            "orchestration_receipt_id": authority["orchestration_receipt_id"],
+            "created_at": response["ended_at"],
+        }
+        destination = (
+            f"attempt-{context['evidence_attempt']}/"
+            f"candidate-{session_body['candidate']}/review-failures/"
+            f"{invocation['dispatch_id']}.json"
+        )
+        shadow = copy.deepcopy(self._state)
+        shadow_lineage = shadow["lineages"][lineage["lineage_id"]]
+        del shadow["authorities"][invocation["dispatch_id"]]
+        receipt = self._append_failure_record(
+            shadow,
+            lineage=shadow_lineage,
+            session_body=session_body,
+            body=body,
+            entrypoint="fail-agent-report-authority",
+            record_class="agent-report-failure",
+            record_schema="tersh-host-agent-report-failure-v1",
+            destination=destination,
+            created_at=response["ended_at"],
+        )
+        shadow_lineage["state"] = "REPORT_FAILED"
+        shadow_lineage["terminal_state"] = "report-failed"
+        shadow["attempts"][lineage["attempt_binding_id"]]["state"] = "CLOSING_FAILED"
+        result = {
+            "schema": "tersh-host-fail-agent-report-authority-result-v1",
+            "context_nonce": context_nonce,
+            "state": "failed",
+            "failure_receipt_id": receipt["receipt_id"],
+        }
+        shadow["replays"][replay_key] = {
+            "kind": "authority-failure",
+            "request_sha256": request_sha256,
+            "result": copy.deepcopy(result),
+        }
+        if fault_at == "fail-authority.before-commit":
+            raise core.EvidenceError("injected authority failure before commit")
+        self._state = shadow
+        if fault_at == "fail-authority.after-commit-before-result":
+            raise core.EvidenceError("injected authority failure lost result")
+        if fault_at is not None and fault_at not in {
+            "fail-authority.before-commit",
+            "fail-authority.after-commit-before-result",
+        }:
+            raise core.EvidenceError("unknown authority failure fault point")
+        return copy.deepcopy(result)
+
+    def seal_agent_report_authority(self, context_nonce: str) -> dict[str, Any]:
+        core.validate_sha256(context_nonce, "context nonce")
+        with self._ledger_lock:
+            lineage = self._resolve_private_lineage(context_nonce)
+            if lineage["state"] != "APPENDED_PLATFORM":
+                raise core.EvidenceError("agent report authority is not sealable")
+            invocation = self._state["handles"][lineage["invocation_handle"]]["body"]
+            if invocation["dispatch_id"] not in self._state["authorities"]:
+                raise core.EvidenceError("agent report authority is absent")
+            shadow = copy.deepcopy(self._state)
+            del shadow["authorities"][invocation["dispatch_id"]]
+            shadow_lineage = shadow["lineages"][lineage["lineage_id"]]
+            shadow_lineage["state"] = "REVIEW_SEALED"
+            shadow_lineage["terminal_state"] = "sealed"
+            self._state = shadow
+            return {"state": "sealed", "context_nonce": context_nonce}
+
     def enumerate_attempt(self, attempt_binding_id: str) -> dict[str, Any]:
         attempt = self._state["attempts"].get(attempt_binding_id)
         if attempt is None:
@@ -1729,6 +2059,13 @@ class AppendPlatformHostModel:
                 return self._recover_dispatch_lineage(request, fault_at=fault_at)
             if operation == "abandon-dispatch-lineage":
                 return self._abandon_dispatch_lineage(request, fault_at=fault_at)
+            if operation == "fail-responded-dispatch":
+                return self._fail_responded_dispatch(request, fault_at=fault_at)
+            if operation == "fail-agent-report-authority":
+                return self._fail_agent_report_authority(
+                    request,
+                    fault_at=fault_at,
+                )
             if operation == "enumerate-attempt":
                 if type(request) is not dict or set(request) != {"attempt_binding_id"}:
                     raise core.EvidenceError("enumerate-attempt request must be exact")

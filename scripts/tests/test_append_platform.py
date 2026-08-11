@@ -5131,5 +5131,239 @@ class AppendPlatformRecoveryTests(unittest.TestCase):
         self.assertEqual(attempt["state"], "CLOSING_FAILED")
 
 
+class AppendPlatformFailureTests(unittest.TestCase):
+    DISPATCH_REASONS = (
+        "candidate-object-missing",
+        "candidate-relation-invalid",
+        "worktree-identity-drift",
+        "attempt-policy-drift",
+        "record-construction-invalid",
+    )
+    AUTHORITY_REASONS = (
+        "draft-missing",
+        "draft-digest-mismatch",
+        "draft-schema-invalid",
+        "draft-path-invalid",
+        "sealer-policy-invalid",
+    )
+
+    def responded_model(self):
+        helper = AppendPlatformRecoveryTests(methodName="runTest")
+        return helper.lineage_at("responded-platform")
+
+    def authority_model(self):
+        helper = AppendPlatformAtomicityTests(methodName="runTest")
+        core, _, model, fixture, responded, _, connection, lease = (
+            helper.ready_model(reported_record_sha256="e" * 64)
+        )
+        model.append_platform(
+            lease,
+            connection=connection,
+            transaction_nonce="9" * 64,
+        )
+        return core, model, fixture, responded
+
+    @staticmethod
+    def dispatch_request(fixture, reason):
+        return {
+            "schema": "tersh-host-fail-responded-dispatch-request-v1",
+            "context_nonce": fixture["context"]["context_nonce"],
+            "transition_index": 2,
+            "recovery_generation": 0,
+            "reason": reason,
+        }
+
+    @staticmethod
+    def authority_request(fixture, reason):
+        return {
+            "schema": "tersh-host-fail-agent-report-authority-request-v1",
+            "context_nonce": fixture["context"]["context_nonce"],
+            "reason": reason,
+        }
+
+    def invoke(self, model, operation, request, **kwargs):
+        return model.invoke_root_internal(
+            operation,
+            request,
+            principal=model.ROOT_SUPERVISOR_PRINCIPAL,
+            **kwargs,
+        )
+
+    def test_irrecoverable_responded_dispatch_atomically_records_failure(self):
+        _, model, fixture, responded = self.responded_model()
+        reason = "candidate-object-missing"
+        model.set_failure_observation(fixture["context"]["context_nonce"], reason)
+        result = self.invoke(
+            model,
+            "fail-responded-dispatch",
+            self.dispatch_request(fixture, reason),
+        )
+        self.assertEqual(result["state"], "failed")
+        snapshot = model.snapshot()
+        self.assertEqual(len(snapshot["receipts"]), 1)
+        self.assertEqual(len(snapshot["records"]), 1)
+        self.assertEqual(snapshot["lineages"][responded["lineage_id"]]["state"], "DISPATCH_FAILED")
+        self.assertEqual(
+            snapshot["attempts"][fixture["session"]["attempt_binding_id"]]["state"],
+            "CLOSING_FAILED",
+        )
+        self.assertEqual(snapshot["authorities"], {})
+
+    def test_dispatch_failure_lost_reply_replays_one_receipt_and_finalizer_rejects_attempt(self):
+        core, model, fixture, _ = self.responded_model()
+        reason = "candidate-relation-invalid"
+        model.set_failure_observation(fixture["context"]["context_nonce"], reason)
+        request = self.dispatch_request(fixture, reason)
+        with self.assertRaises(core.EvidenceError):
+            self.invoke(
+                model,
+                "fail-responded-dispatch",
+                request,
+                fault_at="fail-dispatch.after-commit-before-result",
+            )
+        replay = self.invoke(model, "fail-responded-dispatch", request)
+        snapshot = model.snapshot()
+        self.assertEqual(replay["failure_receipt_id"], snapshot["receipts"][0]["receipt_id"])
+        self.assertEqual(len(snapshot["receipts"]), 1)
+        self.assertEqual(
+            snapshot["attempts"][fixture["session"]["attempt_binding_id"]]["state"],
+            "CLOSING_FAILED",
+        )
+
+    def test_dispatch_failure_body_receipt_and_route_source_map_is_closed(self):
+        _, model, fixture, _ = self.responded_model()
+        reason = "worktree-identity-drift"
+        model.set_failure_observation(fixture["context"]["context_nonce"], reason)
+        self.invoke(model, "fail-responded-dispatch", self.dispatch_request(fixture, reason))
+        snapshot = model.snapshot()
+        record = snapshot["records"][0]
+        body = record["body"]
+        self.assertEqual(
+            set(body),
+            {
+                "schema",
+                "evidence_id",
+                "evidence_attempt",
+                "candidate",
+                "context_nonce",
+                "dispatch_id",
+                "reason",
+                "context",
+                "invocation",
+                "response",
+                "created_at",
+            },
+        )
+        receipt = snapshot["receipts"][0]
+        expected_destination = (
+            f"attempt-{fixture['context']['evidence_attempt']}/"
+            f"candidate-{fixture['session']['candidate']}/"
+            f"orchestration-failures/{fixture['invocation']['dispatch_id']}.json"
+        )
+        self.assertEqual(receipt["destination"], expected_destination)
+        self.assertEqual(receipt["body_sha256"], record["body_sha256"])
+        self.assertIsNone(receipt["dispatch_id"])
+        self.assertIsNone(receipt["reported_record_sha256"])
+        self.assertIsNone(receipt["environment_capability"])
+
+    def test_unsealable_report_authority_atomically_records_callback_failure(self):
+        _, model, fixture, responded = self.authority_model()
+        reason = "draft-digest-mismatch"
+        model.set_failure_observation(fixture["context"]["context_nonce"], reason)
+        result = self.invoke(
+            model,
+            "fail-agent-report-authority",
+            self.authority_request(fixture, reason),
+        )
+        self.assertEqual(result["state"], "failed")
+        snapshot = model.snapshot()
+        self.assertEqual(snapshot["authorities"], {})
+        self.assertEqual(snapshot["lineages"][responded["lineage_id"]]["state"], "REPORT_FAILED")
+        self.assertEqual(len(snapshot["receipts"]), 2)
+        self.assertEqual(snapshot["records"][-1]["body"]["reported_record_sha256"], "e" * 64)
+
+    def test_report_authority_failure_lost_result_and_sealer_race_have_one_winner(self):
+        core, model, fixture, _ = self.authority_model()
+        reason = "draft-missing"
+        nonce = fixture["context"]["context_nonce"]
+        model.set_failure_observation(nonce, reason)
+        request = self.authority_request(fixture, reason)
+        with self.assertRaises(core.EvidenceError):
+            self.invoke(
+                model,
+                "fail-agent-report-authority",
+                request,
+                fault_at="fail-authority.after-commit-before-result",
+            )
+        replay = self.invoke(model, "fail-agent-report-authority", request)
+        self.assertEqual(replay["state"], "failed")
+        with self.assertRaises(core.EvidenceError):
+            model.seal_agent_report_authority(nonce)
+
+        _, race_model, race_fixture, _ = self.authority_model()
+        race_nonce = race_fixture["context"]["context_nonce"]
+        race_model.set_failure_observation(race_nonce, reason)
+        barrier = threading.Barrier(2)
+        outcomes = []
+
+        def fail():
+            barrier.wait(timeout=2)
+            try:
+                outcomes.append(
+                    self.invoke(
+                        race_model,
+                        "fail-agent-report-authority",
+                        self.authority_request(race_fixture, reason),
+                    )
+                )
+            except core.EvidenceError as error:
+                outcomes.append(error)
+
+        def seal():
+            barrier.wait(timeout=2)
+            try:
+                outcomes.append(race_model.seal_agent_report_authority(race_nonce))
+            except core.EvidenceError as error:
+                outcomes.append(error)
+
+        threads = (threading.Thread(target=fail), threading.Thread(target=seal))
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=3)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(sum(type(value) is dict for value in outcomes), 1)
+        self.assertEqual(sum(type(value) is core.EvidenceError for value in outcomes), 1)
+
+    def test_dispatch_and_report_failure_reasons_require_current_host_observation(self):
+        for reason in self.DISPATCH_REASONS:
+            with self.subTest(kind="dispatch", reason=reason):
+                core, model, fixture, _ = self.responded_model()
+                before = model.snapshot()
+                with self.assertRaises(core.EvidenceError):
+                    self.invoke(
+                        model,
+                        "fail-responded-dispatch",
+                        self.dispatch_request(fixture, reason),
+                    )
+                self.assertEqual(model.snapshot(), before)
+        for reason in self.AUTHORITY_REASONS:
+            with self.subTest(kind="authority", reason=reason):
+                core, model, fixture, _ = self.authority_model()
+                before = model.snapshot()
+                model.set_failure_observation(
+                    fixture["context"]["context_nonce"], "different-observation"
+                )
+                with self.assertRaises(core.EvidenceError):
+                    self.invoke(
+                        model,
+                        "fail-agent-report-authority",
+                        self.authority_request(fixture, reason),
+                    )
+                after = model.snapshot()
+                after["failure_observations"] = before["failure_observations"]
+                self.assertEqual(after, before)
+
+
 if __name__ == "__main__":
     unittest.main()
