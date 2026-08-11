@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import socket
+import threading
 import time
 from typing import Any
 
@@ -283,6 +284,7 @@ class AppendPlatformHostModel:
 
     def __init__(self, *, clock: Any | None = None) -> None:
         self._clock = FixtureClock() if clock is None else clock
+        self._ledger_lock = threading.RLock()
         self._receipted_finding_sources: list[dict[str, Any]] = []
         self._state: dict[str, Any] = {
             "attempts": {},
@@ -551,8 +553,49 @@ class AppendPlatformHostModel:
             "lineage_id": None,
             "active_lease_id": None,
         }
+        matching_lineages = [
+            row
+            for row in shadow["lineages"].values()
+            if row["attempt_binding_id"] == binding_id
+            and row["context_nonce"] == context["context_nonce"]
+        ]
+        if len(matching_lineages) == 1:
+            lineage = matching_lineages[0]
+            shadow["sessions"][session_id]["lineage_id"] = lineage["lineage_id"]
+            lineage["registered_session_ids"].append(session_id)
         self._state = shadow
         return copy.deepcopy(self._state["attempts"][binding_id])
+
+    def force_receipt_chain_head(
+        self,
+        attempt_binding_id: str,
+        *,
+        next_receipt_sequence: int,
+        previous_receipt_id: str | None,
+    ) -> None:
+        """Test-only injection of a concurrently advanced Host receipt chain."""
+
+        core.validate_sha256(attempt_binding_id, "attempt binding ID")
+        core.require_exact_int(
+            next_receipt_sequence,
+            "next receipt sequence",
+            minimum=1,
+        )
+        if next_receipt_sequence == 1:
+            if previous_receipt_id is not None:
+                raise core.EvidenceError("sequence one requires null predecessor")
+        else:
+            core.validate_sha256(previous_receipt_id, "previous receipt ID")
+        with self._ledger_lock:
+            attempt = self._state["attempts"].get(attempt_binding_id)
+            if attempt is None:
+                raise core.EvidenceError("attempt binding is unknown")
+            shadow = copy.deepcopy(self._state)
+            shadow["attempts"][attempt_binding_id]["marker_receipt_chain"] = {
+                "next_receipt_sequence": next_receipt_sequence,
+                "previous_receipt_id": previous_receipt_id,
+            }
+            self._state = shadow
 
     @staticmethod
     def _lineage_result(lineage: dict[str, Any]) -> dict[str, Any]:
@@ -1339,108 +1382,90 @@ class AppendPlatformHostModel:
         *,
         connection: Any,
         transaction_nonce: str,
+        fault_at: str | None = None,
+        start_barrier: Any = None,
     ) -> dict[str, Any]:
-        if getattr(connection, "peer_principal", None) != self.ROOT_SUPERVISOR_PRINCIPAL:
-            raise core.EvidenceError("root supervisor peer authentication failed")
-        lease_id = lease_value.get("lease_id") if type(lease_value) is dict else None
-        lease = self._state["leases"].get(lease_id)
-        if lease is None:
-            raise core.EvidenceError("recorder session lease is unknown")
-        if not lease["valid"]:
-            if lease["invalid_reason"] == "consumed":
-                raise core.EvidenceError("recorder session replay rejected")
-            raise core.EvidenceError("recorder session lease is permanently invalid")
-        session = self._state["sessions"].get(lease["producer_session_id"])
-        if (
-            session is None
-            or not session["live"]
-            or session["active_lease_id"] != lease_id
-            or getattr(connection, "producer_session_id", None)
-            != lease["producer_session_id"]
-        ):
-            self._invalidate_lease(lease_id, "session")
-            raise core.EvidenceError("recorder session authentication failed")
-        object_id, numeric_fd, kernel_identity = self._connection_identity(connection)
-        connection_row = self._state["connections"].get(str(object_id))
-        if (
-            object_id != lease["connection_object_id"]
-            or numeric_fd != lease["numeric_fd"]
-            or kernel_identity != lease["kernel_identity"]
-            or connection_row is None
-            or connection_row["generation"] != lease["connection_generation"]
-        ):
-            self._invalidate_lease(lease_id, "connection-generation")
-            raise core.EvidenceError("connection generation changed before handle lookup")
-        if self._clock() >= lease["launch_deadline"]:
-            self._invalidate_lease(lease_id, "launch-expired")
-            raise core.EvidenceError("launch lease expired before handle lookup")
-        core.validate_sha256(transaction_nonce, "transaction nonce")
-
-        handles = lease["handles"]
-        context_row, lineage = self._current_handle(
-            handles["context_handle"], kind="context"
-        )
-        invocation_row, _ = self._current_handle(
-            handles["invocation_handle"], kind="invocation"
-        )
-        response_row, _ = self._current_handle(
-            handles["response_handle"], kind="response"
-        )
-        if (
-            lineage["state"] != "RESPONDED_PLATFORM"
-            or {context_row["lineage_id"], invocation_row["lineage_id"], response_row["lineage_id"]}
-            != {lineage["lineage_id"]}
-        ):
-            raise core.EvidenceError("append handle tuple is no longer current")
-        context = context_row["body"]
-        invocation = invocation_row["body"]
-        response = response_row["body"]
-        session_body = session["body"]
-        self._validate_candidate_facts(context, session_body)
-        record = self.build_host_orchestration_record(
-            context, invocation, response, session_body
-        )
-
-        shadow = copy.deepcopy(self._state)
-        shadow_lease = shadow["leases"][lease_id]
-        shadow_lease.update(
-            {
-                "transaction_nonce": transaction_nonce,
-                "transaction_deadline": self._clock() + 5.0,
-                "valid": False,
-                "invalid_reason": "consumed",
-            }
-        )
-        for handle_id in (
-            handles["context_handle"],
-            handles["invocation_handle"],
-            handles["response_handle"],
-        ):
-            shadow["handles"][handle_id]["live"] = False
-        shadow_lineage = shadow["lineages"][lineage["lineage_id"]]
-        shadow_lineage["state"] = "APPENDED_PLATFORM"
-        shadow_lineage["terminal_state"] = "appended-platform"
-        shadow_session = shadow["sessions"][lease["producer_session_id"]]
-        shadow_session["live"] = False
-        shadow_session["active_lease_id"] = None
-        replay_key = (
-            f"{lease['producer_session_id']}:{lease['connection_generation']}:"
-            f"{transaction_nonce}"
-        )
-        shadow["replays"][replay_key] = {
-            "lease_id": lease_id,
-            "lineage_id": lineage["lineage_id"],
+        pre_linearization_faults = {
+            "wire.after-begin",
+            "wire.after-body-context",
+            "wire.after-body-invocation",
+            "wire.after-body-response",
+            "wire.after-body-session",
+            "wire.after-body-record",
+            "wire.after-body-end",
+            "wire.after-commit",
+            "wire.after-request-end",
+            "wire.after-client-eof",
+            "linearize.after-session-consume",
+            "linearize.after-handle-consume",
+            "linearize.after-blob-insert",
+            "linearize.after-receipt-append",
+            "linearize.after-authority-insert",
+            "linearize.before-commit",
         }
-        shadow["records"].append(
-            {
-                "attempt_binding_id": lineage["attempt_binding_id"],
-                "lineage_id": lineage["lineage_id"],
-                "body": copy.deepcopy(record),
-                "body_sha256": self._body_sha256(record),
-            }
-        )
-        self._state = shadow
-        return copy.deepcopy(record)
+        post_linearization_faults = {
+            "linearize.after-commit",
+            "reply.after-reply",
+            "reply.after-reply-end",
+            "reply.before-eof",
+        }
+        if fault_at is not None and fault_at not in (
+            pre_linearization_faults | post_linearization_faults
+        ):
+            raise core.EvidenceError("unknown append fault point")
+        if start_barrier is not None:
+            try:
+                start_barrier.wait(timeout=2)
+            except threading.BrokenBarrierError as error:
+                raise core.EvidenceError("append concurrency barrier broke") from error
+
+        core.validate_sha256(transaction_nonce, "transaction nonce")
+        lease_id = lease_value.get("lease_id") if type(lease_value) is dict else None
+        committed = False
+        with self._ledger_lock:
+            try:
+                lease, session = self._bound_append_lease_before_handles(
+                    lease_value,
+                    connection,
+                )
+                shadow = copy.deepcopy(self._state)
+                shadow["leases"][lease_id]["transaction_nonce"] = transaction_nonce
+                shadow["leases"][lease_id]["transaction_deadline"] = self._clock() + 5.0
+                self._state = shadow
+                lease = self._state["leases"][lease_id]
+                session = self._state["sessions"][lease["producer_session_id"]]
+                bodies = self._append_body_tuple(lease, session)
+                frozen_record = core.canonical_json_bytes(bodies[4])
+                if not 1 <= len(frozen_record) <= core.ORCHESTRATION_RECORD_MAX_BYTES:
+                    raise core.EvidenceError("Host record is outside 1..61440 bytes")
+
+                if fault_at in pre_linearization_faults:
+                    raise core.EvidenceError(
+                        f"injected pre-linearization fault at {fault_at}"
+                    )
+                receipt = self._linearize_append_happy_path(
+                    lease,
+                    transaction_nonce,
+                    bodies,
+                    frozen_record,
+                )
+                committed = True
+                if fault_at in post_linearization_faults:
+                    raise core.EvidenceError(
+                        f"injected post-commit fault at {fault_at}"
+                    )
+                return receipt
+            except BaseException:
+                if (
+                    not committed
+                    and lease_id in self._state["leases"]
+                    and self._state["leases"][lease_id]["valid"]
+                ):
+                    self._invalidate_lease(
+                        lease_id,
+                        "pre-linearization-failure",
+                    )
+                raise
 
     def enumerate_attempt(self, attempt_binding_id: str) -> dict[str, Any]:
         attempt = self._state["attempts"].get(attempt_binding_id)

@@ -4219,6 +4219,15 @@ class AppendPlatformWireTests(unittest.TestCase):
                         },
                         deadline,
                     )
+                    if ordinal == 5 and scenario in {
+                        "record-frame",
+                        "mutated-record",
+                    }:
+                        try:
+                            host.shutdown(socket.SHUT_WR)
+                        except OSError:
+                            pass
+                        return
                 core.send_host_frame(
                     host,
                     {
@@ -4230,8 +4239,12 @@ class AppendPlatformWireTests(unittest.TestCase):
                     },
                     deadline,
                 )
-                if scenario in {"record-frame", "hash-only", "mutated-record"}:
-                    host.shutdown(socket.SHUT_WR)
+                if scenario == "hash-only":
+                    try:
+                        host.shutdown(socket.SHUT_WR)
+                    except OSError:
+                        # A rejecting client may already have closed its peer.
+                        pass
                     return
 
                 commit = core.recv_host_frame(host, deadline)
@@ -4286,7 +4299,10 @@ class AppendPlatformWireTests(unittest.TestCase):
                 }
                 core.send_host_frame(host, reply, deadline)
                 if scenario in {"receipt-drift", "private-result"}:
-                    host.shutdown(socket.SHUT_WR)
+                    try:
+                        host.shutdown(socket.SHUT_WR)
+                    except OSError:
+                        pass
                     return
                 core.send_host_frame(
                     host,
@@ -4589,6 +4605,260 @@ class AppendPlatformWireTests(unittest.TestCase):
         finally:
             client.close()
             peer.close()
+
+
+class AppendPlatformAtomicityTests(unittest.TestCase):
+    PRE_LINEARIZATION_FAULTS = (
+        "wire.after-begin",
+        "wire.after-body-context",
+        "wire.after-body-invocation",
+        "wire.after-body-response",
+        "wire.after-body-session",
+        "wire.after-body-record",
+        "wire.after-body-end",
+        "wire.after-commit",
+        "wire.after-request-end",
+        "wire.after-client-eof",
+        "linearize.after-session-consume",
+        "linearize.after-handle-consume",
+        "linearize.after-blob-insert",
+        "linearize.after-receipt-append",
+        "linearize.after-authority-insert",
+        "linearize.before-commit",
+    )
+    POST_LINEARIZATION_FAULTS = (
+        "linearize.after-commit",
+        "reply.after-reply",
+        "reply.after-reply-end",
+        "reply.before-eof",
+    )
+
+    def ready_model(self, *, reported_record_sha256="e" * 64):
+        host_module = importlib.import_module(
+            "scripts.tests.append_platform_host_model"
+        )
+        core = importlib.import_module("scripts.evidence_core")
+        clock = host_module.FixtureClock()
+        model = host_module.AppendPlatformHostModel(clock=clock)
+        fixture = AppendPlatformStateTests.fixture()
+        fixture["response"]["reported_record_sha256"] = reported_record_sha256
+        helpers = AppendPlatformStateTests(methodName="runTest")
+        helpers.install_facts(model, fixture)
+        _, _, responded, handles = helpers.ready_lineage(model, fixture)
+        connection = _AppendStateConnection(
+            90,
+            "atomic-connection",
+            fixture["session"]["producer_session_id"],
+        )
+        lease = model.bind_append_connection(handles, connection=connection)
+        return core, clock, model, fixture, responded, handles, connection, lease
+
+    @staticmethod
+    def ledger_vector(snapshot):
+        live_handles = {
+            handle_id: row["live"] for handle_id, row in snapshot["handles"].items()
+        }
+        chains = {
+            binding_id: copy.deepcopy(row["marker_receipt_chain"])
+            for binding_id, row in snapshot["attempts"].items()
+        }
+        return {
+            "live_handles": live_handles,
+            "chains": chains,
+            "blobs": copy.deepcopy(snapshot["blobs"]),
+            "receipts": copy.deepcopy(snapshot["receipts"]),
+            "authorities": copy.deepcopy(snapshot["authorities"]),
+            "records": copy.deepcopy(snapshot["records"]),
+        }
+
+    def test_append_platform_atomic_handle_blob_receipt_authority_fault_matrix(self):
+        for index, fault_id in enumerate(
+            (
+                "linearize.after-session-consume",
+                "linearize.after-handle-consume",
+                "linearize.after-blob-insert",
+                "linearize.after-receipt-append",
+                "linearize.after-authority-insert",
+                "linearize.before-commit",
+            )
+        ):
+            with self.subTest(fault_id=fault_id):
+                core, _, model, fixture, _, handles, connection, lease = (
+                    self.ready_model()
+                )
+                before = self.ledger_vector(model.snapshot())
+                with self.assertRaises(core.EvidenceError):
+                    model.append_platform(
+                        lease,
+                        connection=connection,
+                        transaction_nonce=f"{index + 1:x}" * 64,
+                        fault_at=fault_id,
+                    )
+                self.assertEqual(self.ledger_vector(model.snapshot()), before)
+                retry_connection = _AppendStateConnection(
+                    100 + index,
+                    f"atomic-retry-{index}",
+                    fixture["session"]["producer_session_id"],
+                )
+                retry_lease = model.bind_append_connection(
+                    handles, connection=retry_connection
+                )
+                receipt = model.append_platform(
+                    retry_lease,
+                    connection=retry_connection,
+                    transaction_nonce=f"{index + 7:x}" * 64,
+                )
+                self.assertEqual(
+                    receipt["sequence"],
+                    fixture["session"]["next_receipt_sequence"],
+                )
+                self.assertEqual(len(model.snapshot()["authorities"]), 1)
+
+    def test_append_platform_deadline_after_commit_before_request_end_or_eof_is_prelinearization(self):
+        for fault_id in (
+            "wire.after-commit",
+            "wire.after-request-end",
+            "wire.after-client-eof",
+        ):
+            with self.subTest(fault_id=fault_id):
+                core, clock, model, _, _, handles, connection, lease = (
+                    self.ready_model()
+                )
+                before = self.ledger_vector(model.snapshot())
+                clock.advance(4.999)
+                with self.assertRaises(core.EvidenceError):
+                    model.append_platform(
+                        lease,
+                        connection=connection,
+                        transaction_nonce="a" * 64,
+                        fault_at=fault_id,
+                    )
+                self.assertEqual(self.ledger_vector(model.snapshot()), before)
+                self.assertTrue(
+                    all(model.snapshot()["handles"][handle]["live"] for handle in (
+                        handles["context_handle"],
+                        handles["invocation_handle"],
+                        handles["response_handle"],
+                    ))
+                )
+
+    def test_append_platform_concurrent_calls_create_one_receipt_and_authority(self):
+        core, _, model, _, _, _, connection, lease = self.ready_model()
+        barrier = threading.Barrier(2)
+        outcomes = []
+
+        def append_once(nonce):
+            try:
+                outcomes.append(
+                    model.append_platform(
+                        lease,
+                        connection=connection,
+                        transaction_nonce=nonce,
+                        start_barrier=barrier,
+                    )
+                )
+            except core.EvidenceError as error:
+                outcomes.append(error)
+
+        threads = [
+            threading.Thread(target=append_once, args=(digit * 64,))
+            for digit in ("b", "c")
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=3)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(sum(type(value) is dict for value in outcomes), 1)
+        self.assertEqual(sum(type(value) is core.EvidenceError for value in outcomes), 1)
+        snapshot = model.snapshot()
+        self.assertEqual(len(snapshot["blobs"]), 1)
+        self.assertEqual(len(snapshot["receipts"]), 1)
+        self.assertEqual(len(snapshot["authorities"]), 1)
+
+    def test_append_platform_chain_head_drift_fails_before_linearization_and_retries(self):
+        core, _, model, fixture, _, handles, connection, lease = self.ready_model()
+        model.force_receipt_chain_head(
+            fixture["session"]["attempt_binding_id"],
+            next_receipt_sequence=2,
+            previous_receipt_id="f" * 64,
+        )
+        with self.assertRaises(core.EvidenceError):
+            model.append_platform(
+                lease,
+                connection=connection,
+                transaction_nonce="d" * 64,
+            )
+        self.assertEqual(model.snapshot()["receipts"], [])
+
+        refreshed = copy.deepcopy(fixture["session"])
+        refreshed.update(
+            {
+                "producer_session_id": "8" * 64,
+                "next_receipt_sequence": 2,
+                "previous_receipt_id": "f" * 64,
+            }
+        )
+        model.open_attempt({"context": fixture["context"], "session": refreshed})
+        retry_handles = copy.deepcopy(handles)
+        retry_handles["producer_session_id"] = refreshed["producer_session_id"]
+        retry_connection = _AppendStateConnection(
+            91, "chain-retry", refreshed["producer_session_id"]
+        )
+        retry_lease = model.bind_append_connection(
+            retry_handles, connection=retry_connection
+        )
+        receipt = model.append_platform(
+            retry_lease,
+            connection=retry_connection,
+            transaction_nonce="e" * 64,
+        )
+        self.assertEqual(receipt["sequence"], 2)
+        self.assertEqual(receipt["previous_receipt_id"], "f" * 64)
+
+    def test_every_prelinearization_failure_preserves_exact_state_vector(self):
+        for index, fault_id in enumerate(self.PRE_LINEARIZATION_FAULTS):
+            with self.subTest(fault_id=fault_id):
+                core, _, model, _, _, _, connection, lease = self.ready_model()
+                before = self.ledger_vector(model.snapshot())
+                with self.assertRaises(core.EvidenceError):
+                    model.append_platform(
+                        lease,
+                        connection=connection,
+                        transaction_nonce=f"{index + 1:064x}",
+                        fault_at=fault_id,
+                    )
+                after = model.snapshot()
+                self.assertEqual(self.ledger_vector(after), before)
+                self.assertFalse(after["leases"][lease["lease_id"]]["valid"])
+                self.assertIsNone(
+                    after["sessions"][lease["producer_session_id"]][
+                        "active_lease_id"
+                    ]
+                )
+
+    def test_every_postcommit_reply_fault_preserves_one_durable_state_vector(self):
+        for index, fault_id in enumerate(self.POST_LINEARIZATION_FAULTS):
+            with self.subTest(fault_id=fault_id):
+                core, _, model, _, _, _, connection, lease = self.ready_model()
+                with self.assertRaises(core.EvidenceError):
+                    model.append_platform(
+                        lease,
+                        connection=connection,
+                        transaction_nonce=f"{index + 33:064x}",
+                        fault_at=fault_id,
+                    )
+                committed = model.snapshot()
+                self.assertEqual(len(committed["blobs"]), 1)
+                self.assertEqual(len(committed["receipts"]), 1)
+                self.assertEqual(len(committed["authorities"]), 1)
+                with self.assertRaises(core.EvidenceError):
+                    model.append_platform(
+                        lease,
+                        connection=connection,
+                        transaction_nonce=f"{index + 33:064x}",
+                    )
+                self.assertEqual(model.snapshot(), committed)
 
 
 if __name__ == "__main__":
