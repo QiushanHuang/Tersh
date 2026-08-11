@@ -634,10 +634,10 @@ def _validate_response_body(value: Any) -> dict[str, Any]:
         "schema", "context_nonce", "harness_bundle_revision",
         "harness_bundle_sha256", "dispatch_id", "agent_id",
         "canonical_task_path", "agent_run_id", "started_at", "ended_at",
-        "terminal_status", "reported_result_commit",
+        "terminal_status", "reported_result_commit", "reported_record_sha256",
     }
     body = _require_closed_object(value, keys, "response body")
-    _require_literal(body["schema"], "tersh-host-spawn-response-v1", "response schema")
+    _require_literal(body["schema"], "tersh-host-spawn-response-v2", "response schema")
     validate_sha256(body["context_nonce"], "response context nonce")
     validate_candidate(body["harness_bundle_revision"])
     validate_sha256(body["harness_bundle_sha256"], "harness bundle sha256")
@@ -655,6 +655,8 @@ def _validate_response_body(value: Any) -> dict[str, Any]:
         "response terminal status",
     )
     _require_nullable_candidate(body["reported_result_commit"], "reported result commit")
+    if body["reported_record_sha256"] is not None:
+        validate_sha256(body["reported_record_sha256"], "reported record sha256")
     return body
 
 

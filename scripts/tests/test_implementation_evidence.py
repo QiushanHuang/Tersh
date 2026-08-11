@@ -65,7 +65,7 @@ class ScriptedCaptureStore:
     def __init__(self):
         self.contexts = {}
         self.invocations = set()
-        self.responses = set()
+        self.responses = {}
         self.next_handle = 1
 
     def new_handle(self):
@@ -88,10 +88,11 @@ class ScriptedCaptureStore:
             return [("context", current), ("response", copy.deepcopy(response_body))]
         raise AssertionError(f"unexpected scripted capture operation {operation}")
 
-    def commit(self, operation, context_handle, context_body):
+    def commit(self, operation, context_handle, bodies):
+        committed = {kind: copy.deepcopy(body) for kind, body in bodies}
         if operation == "capture-context":
             successor = self.new_handle()
-            self.contexts[successor] = copy.deepcopy(context_body)
+            self.contexts[successor] = committed["context"]
             return {"schema": "tersh-host-capture-context-result-v1", "context_handle": successor}
         if context_handle not in self.contexts:
             raise AssertionError("scripted host committed an invalid context handle")
@@ -108,7 +109,7 @@ class ScriptedCaptureStore:
             }
         if operation == "capture-response":
             member = self.new_handle()
-            self.responses.add(member)
+            self.responses[member] = committed["response"]
             return {
                 "schema": "tersh-host-capture-response-result-v1",
                 "context_handle": successor,
@@ -304,7 +305,7 @@ class ImplementationEvidenceTests(unittest.TestCase):
             "dispatched_at": "2026-08-10T00:00:01.000000001Z",
         }
         response = {
-            "schema": "tersh-host-spawn-response-v1",
+            "schema": "tersh-host-spawn-response-v2",
             "context_nonce": context_nonce,
             "dispatch_id": dispatch_id,
             "harness_bundle_revision": harness_bundle_revision,
@@ -316,6 +317,7 @@ class ImplementationEvidenceTests(unittest.TestCase):
             "ended_at": "2026-08-10T00:00:03.000000001Z",
             "terminal_status": "completed",
             "reported_result_commit": self.candidate_b,
+            "reported_record_sha256": None,
         }
         return context, invocation, response
 
@@ -486,7 +488,7 @@ class ImplementationEvidenceTests(unittest.TestCase):
                     raise AssertionError(f"client REQUEST-END is not exact: {request_end!r}")
                 if host.recv(1) != b"":
                     raise AssertionError("client did not half-close after REQUEST-END")
-                result = store.commit(operation, context_handle, context_body)
+                result = store.commit(operation, context_handle, bodies)
                 reply = {
                     "schema": "tersh-host-transaction-reply-v1",
                     "transaction_nonce": nonce,
@@ -2178,7 +2180,11 @@ class ImplementationEvidenceTests(unittest.TestCase):
 
         for operation in ("capture-invocation", "capture-response"):
             with self.subTest(replayed_operation=operation):
-                before = (copy.deepcopy(store.contexts), set(store.invocations), set(store.responses))
+                before = (
+                    copy.deepcopy(store.contexts),
+                    set(store.invocations),
+                    copy.deepcopy(store.responses),
+                )
                 result, replay_error, _ = self.run_scripted_capture(store, operation, h0)
                 self.assertIsNone(result)
                 self.assertIsInstance(replay_error, pre_error)
@@ -2204,7 +2210,11 @@ class ImplementationEvidenceTests(unittest.TestCase):
         self.assertIn(h2, store.contexts)
         self.assertIn(hr, store.responses)
 
-        before_precommit = (copy.deepcopy(store.contexts), set(store.invocations), set(store.responses))
+        before_precommit = (
+            copy.deepcopy(store.contexts),
+            set(store.invocations),
+            copy.deepcopy(store.responses),
+        )
         result, error, _ = self.run_scripted_capture(
             store,
             "capture-response",
@@ -2289,7 +2299,7 @@ class ImplementationEvidenceTests(unittest.TestCase):
             return bodies
 
         def wrong_response_schema(bodies):
-            bodies[1][1]["schema"] = "tersh-host-spawn-response-v0"
+            bodies[1][1]["schema"] = "tersh-host-spawn-response-v1"
             return bodies
 
         def wrong_response_type(bodies):
@@ -2355,6 +2365,189 @@ class ImplementationEvidenceTests(unittest.TestCase):
         )
         self.assertIn(response_result["context_handle"], store.contexts)
         self.assertIn(response_result["response_handle"], store.responses)
+
+    def test_capture_response_v2_accepts_null_or_exact_report_digest(self):
+        for reported_record_sha256 in (None, "a" * 64):
+            with self.subTest(reported_record_sha256=reported_record_sha256):
+                store = ScriptedCaptureStore()
+                context_result, error, _ = self.run_scripted_capture(store, "capture-context")
+                self.assertIsNone(error)
+                predecessor = context_result["context_handle"]
+
+                def set_reported_record_sha256(bodies):
+                    bodies[1][1]["reported_record_sha256"] = reported_record_sha256
+                    return bodies
+
+                response_result, error, _ = self.run_scripted_capture(
+                    store,
+                    "capture-response",
+                    predecessor,
+                    body_mutator=set_reported_record_sha256,
+                )
+                self.assertIsNone(error)
+                self.assertNotIn(predecessor, store.contexts)
+                self.assertIn(response_result["context_handle"], store.contexts)
+                response_handle = response_result["response_handle"]
+                expected_response = self.host_envelope_bodies()[2]
+                expected_response["reported_record_sha256"] = reported_record_sha256
+                self.assertEqual(store.responses[response_handle], expected_response)
+
+    def test_scripted_capture_surfaces_host_connection_reset_before_commit(self):
+        store = ScriptedCaptureStore()
+        context_result, error, _ = self.run_scripted_capture(store, "capture-context")
+        self.assertIsNone(error)
+        predecessor = context_result["context_handle"]
+        original_recv_frame = fixture_recv_frame
+        host_recv_count = 0
+
+        def inject_host_connection_reset(sock):
+            nonlocal host_recv_count
+            host_recv_count += 1
+            if host_recv_count == 2:
+                raise ConnectionResetError("injected Host reset before COMMIT")
+            return original_recv_frame(sock)
+
+        with mock.patch.object(
+            sys.modules[__name__],
+            "fixture_recv_frame",
+            new=inject_host_connection_reset,
+        ):
+            with self.assertRaisesRegex(
+                AssertionError,
+                r"scripted host errors.*injected Host reset before COMMIT",
+            ):
+                self.run_scripted_capture(
+                    store,
+                    "capture-response",
+                    predecessor,
+                )
+        self.assertEqual(host_recv_count, 2)
+
+    def test_capture_response_v2_rejects_legacy_missing_malformed_or_extra_report_digest_without_consuming_context(self):
+        core = importlib.import_module("scripts.evidence_core")
+
+        def mutate_response(name, value=None):
+            def mutator(bodies):
+                response = bodies[1][1]
+                if name == "missing":
+                    response.pop("reported_record_sha256")
+                elif name == "extra":
+                    response["reported_record_sha256_alias"] = response[
+                        "reported_record_sha256"
+                    ]
+                elif name == "legacy-v1-exact":
+                    response["schema"] = "tersh-host-spawn-response-v1"
+                    response.pop("reported_record_sha256")
+                elif name == "legacy-v1-with-v2-field":
+                    response["schema"] = "tersh-host-spawn-response-v1"
+                else:
+                    response["reported_record_sha256"] = value
+                return bodies
+
+            return mutator
+
+        invalid_cases = (
+            ("missing", None),
+            ("extra", None),
+            ("legacy-v1-exact", None),
+            ("legacy-v1-with-v2-field", None),
+            ("integer", 1),
+            ("bool", True),
+            ("list", []),
+            ("dict", {}),
+            ("empty", ""),
+            ("uppercase", "A" * 64),
+            ("lowercase-nonhex", "g" * 64),
+            ("short", "a" * 63),
+            ("overlong", "a" * 65),
+        )
+        for name, value in invalid_cases:
+            with self.subTest(invalid_report_digest=name):
+                store = ScriptedCaptureStore()
+                context_result, error, _ = self.run_scripted_capture(
+                    store,
+                    "capture-context",
+                )
+                self.assertIsNone(error)
+                predecessor = context_result["context_handle"]
+                before = (
+                    copy.deepcopy(store.contexts),
+                    set(store.invocations),
+                    copy.deepcopy(store.responses),
+                )
+                result, validation_error, _ = self.run_scripted_capture(
+                    store,
+                    "capture-response",
+                    predecessor,
+                    body_mutator=mutate_response(name, value),
+                )
+                self.assertIsNone(result)
+                self.assertIsInstance(validation_error, core.EvidenceError)
+                self.assertEqual(
+                    (store.contexts, store.invocations, store.responses),
+                    before,
+                    f"invalid {name} report digest partially consumed the context",
+                )
+
+    def test_capture_response_v2_postcommit_reply_failure_consumes_context_and_retains_immutable_response(self):
+        core = importlib.import_module("scripts.evidence_core")
+        store = ScriptedCaptureStore()
+        context_result, error, _ = self.run_scripted_capture(store, "capture-context")
+        self.assertIsNone(error)
+        h0 = context_result["context_handle"]
+        invocation_result, error, _ = self.run_scripted_capture(
+            store,
+            "capture-invocation",
+            h0,
+        )
+        self.assertIsNone(error)
+        h1 = invocation_result["context_handle"]
+        invocation_handle = invocation_result["invocation_handle"]
+        self.assertNotIn(h0, store.contexts)
+        self.assertIn(h1, store.contexts)
+        self.assertEqual(store.invocations, {invocation_handle})
+        reported_record_sha256 = "b" * 64
+
+        def set_reported_record_sha256(bodies):
+            bodies[1][1]["reported_record_sha256"] = reported_record_sha256
+            return bodies
+
+        result, error, _ = self.run_scripted_capture(
+            store,
+            "capture-response",
+            h1,
+            scenario="wrong-reply-nonce",
+            body_mutator=set_reported_record_sha256,
+        )
+        self.assertIsNone(result)
+        self.assertIsInstance(error, core.EvidenceError)
+        self.assertNotIn(h1, store.contexts)
+        self.assertEqual(len(store.contexts), 1)
+        self.assertEqual(store.invocations, {invocation_handle})
+        self.assertEqual(len(store.responses), 1)
+        response_handle = next(iter(store.responses))
+        expected_response = self.host_envelope_bodies()[2]
+        expected_response["reported_record_sha256"] = reported_record_sha256
+        self.assertEqual(store.responses[response_handle], expected_response)
+
+        committed_snapshot = (
+            copy.deepcopy(store.contexts),
+            set(store.invocations),
+            copy.deepcopy(store.responses),
+        )
+        replay_result, replay_error, _ = self.run_scripted_capture(
+            store,
+            "capture-response",
+            h1,
+            body_mutator=set_reported_record_sha256,
+        )
+        self.assertIsNone(replay_result)
+        self.assertIsInstance(replay_error, core.EvidenceError)
+        self.assertEqual(
+            (store.contexts, store.invocations, store.responses),
+            committed_snapshot,
+            "replay changed the committed response body or capability generation",
+        )
 
     def test_host_context_binds_root_owned_harness_bundle_revision_and_digest(self):
         core = importlib.import_module("scripts.evidence_core")
@@ -2572,7 +2765,7 @@ class ImplementationEvidenceTests(unittest.TestCase):
                     before = (
                         copy.deepcopy(store.contexts),
                         set(store.invocations),
-                        set(store.responses),
+                        copy.deepcopy(store.responses),
                         store.next_handle,
                     )
                     result, error, _ = self.run_scripted_capture(
@@ -2610,7 +2803,7 @@ class ImplementationEvidenceTests(unittest.TestCase):
                     before = (
                         copy.deepcopy(store.contexts),
                         set(store.invocations),
-                        set(store.responses),
+                        copy.deepcopy(store.responses),
                         store.next_handle,
                     )
                     result, error, _ = self.run_scripted_capture(
