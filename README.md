@@ -2,6 +2,11 @@
 
 # Tersh
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/brand/tersh-logo-dark.svg">
+  <img src="docs/brand/tersh-logo-light.svg" width="360" alt="Tersh — a terminal file workbench">
+</picture>
+
 [![English](https://img.shields.io/badge/Language-English-24292f)](#english)
 [![简体中文](https://img.shields.io/badge/语言-简体中文-1677ff)](#中文)
 
@@ -10,24 +15,69 @@
 [![Rust 1.88+](https://img.shields.io/badge/Rust-1.88%2B-orange)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**A lightweight terminal file workbench for local and SSH sessions.**
-Browse, preview and organize files where you already work. Open `tersh --c` to
-check host health and launch a shell or Tersh on a selected machine.
+**Files, host health and recoverable actions — in the terminal you already use.**
+
+When a quick check turns into `ls` → `cd` → `cat` → `cp` → another SSH session,
+the friction is keeping track of paths, targets and what finished. Tersh brings
+that everyday interactive work into a visible, keyboard-driven workflow.
+
+## Why choose Tersh?
+
+**Choose Tersh when you spend more time inspecting and organizing remote files
+than you want to spend retyping paths or switching tools.** Its advantage is the
+combination: a file workbench, an SSH host overview and explicit operation results,
+with the same controls available in a laptop terminal or a phone's SSH session.
+
+| Friction in a familiar workflow | What Tersh changes | What you gain |
+| --- | --- | --- |
+| Repeated shell commands mean re-entering paths and tracking selected targets yourself. | Browse, filter, preview, select and act in one view. | Less repetitive typing during interactive file work. |
+| A desktop file manager may require another connection or workflow when you are already in an SSH-only session. | Run Tersh where the files live, through your existing terminal connection. | A visual file workflow without leaving that session. |
+| Host-health checks and file inspection are often separate steps in separate tools. | `tersh --c` shows hosts and routes; `t` opens Tersh on the selected host. | A direct path from choosing a machine to inspecting its files. |
+| Ad-hoc copies and cleanup leave you checking what completed and where deleted items went. | Background jobs report partial results; managed trash records the original location. | Clearer outcomes, cancellation and no-overwrite recovery. |
+| Long shortcut lists and dense views are awkward on a small SSH screen. | `o` searches actions; hints adapt to the page and effective keymap. | More discoverable controls across different keyboards and widths. |
+
+### Useful in the moments that matter
+
+- **Checking a development or research server:** filter hosts, open the chosen
+  workbench, inspect output directories and search a log without downloading it.
+- **Handling an urgent check from a phone:** connect with your SSH client, run
+  `tersh` on the server, and use compact hints or the action menu to reach a file.
+- **Organizing a local project or remote workspace:** preview before acting,
+  select several files, watch a copy job, or recover a managed trash entry later.
+
+### A quick tour
+
+| Need to… | Start with… |
+| --- | --- |
+| Inspect a file before opening an editor | `tersh`, then Enter for preview and `/` to search |
+| Keep browsing during a copy | Copy/paste, `J` for progress, Ctrl+X to request cancellation |
+| Recover an item you trashed with Tersh | `u`, review its original path, confirm restore |
+| Pick a host and get to work | `tersh --c`, `/` to filter, `l` for detail, `t` for its workbench |
+| Find an unfamiliar action | `o`, type its name, then select and execute |
+
+**A small footprint by design:** one executable, bounded caches and host history,
+change-driven redraws, and no resident monitoring agent. Prebuilt macOS/Linux
+packages do not need a Rust toolchain to run. Health checks need SSH;
+opening the remote file workbench also needs Tersh installed there. File operations
+run on the host where that workbench is running.
+
+<details>
+<summary>How it fits alongside other tools</summary>
+
+Shell commands remain a strong choice for scripts and repeatable automation.
+[Yazi](https://yazi-rs.github.io/features/) offers a broader file-preview and plugin
+ecosystem; [btop](https://github.com/aristocratos/btop) focuses on detailed system
+resource monitoring. Tersh focuses on the path from host selection to file
+inspection, controlled operations and recovery. These are workflow tradeoffs,
+not claims that Tersh is universally faster or more feature-complete. Directory
+listing and preview reads are still synchronous; cancellation preserves completed
+work rather than undoing it.
+
+</details>
 
 ![Tersh file workbench with preview, selection and contextual shortcuts](docs/images/workbench.png)
 
 *Screenshots use synthetic demo data and a representative terminal color palette.*
-
-## Why Tersh
-
-| What you need | What Tersh provides |
-| --- | --- |
-| Quick file inspection | Filterable, sortable files; inline/fullscreen preview; search; editor handoff |
-| Long-running file work | One cancellable background worker, progress and explicit partial results |
-| Recoverable cleanup | Managed trash receipts, original-location confirmation and no-overwrite recovery |
-| Several remote machines | SSH health probes, jump-host routes, host filtering/sorting and bounded trends |
-| A phone, laptop or SSH client | Adaptive layouts, searchable actions, configurable keys and ASCII fallback |
-| A small tool that stays quiet | One binary, bounded caches/history, no resident agent, redraws driven by changes |
 
 ## Install
 
@@ -185,24 +235,61 @@ See [contributors and attribution](CONTRIBUTORS.md). Tersh is licensed under the
 [![English](https://img.shields.io/badge/Language-English-24292f)](#english)
 [![简体中文](https://img.shields.io/badge/语言-简体中文-1677ff)](#中文)
 
-**面向本地终端和 SSH 会话的轻量文件工作台。**
-在当前终端里浏览、预览和整理文件，用 `tersh --c` 查看多台主机的健康状态，
-并进入选中主机的 shell 或文件工作台。
+**文件、主机状态与可恢复的操作，都在你正在使用的终端里。**
+
+一次简单检查，经常变成 `ls` → `cd` → `cat` → `cp` → 切换另一台服务器。
+反复输入路径、确认操作对象、核对任务结果，才是这些日常工作中容易累积的成本。
+Tersh 把它们组织成一个可见、可搜索、可用键盘完成的操作流程。
+
+### 为什么选 Tersh？
+
+**如果你经常在本地或 SSH 中检查和整理文件，希望少输路径、少切工具、看清操作结果，
+Tersh 就是为这类工作准备的。** 它的优势在于把文件工作台、SSH 主机概览和明确的任务反馈
+放在一起，并让这套操作能适应笔记本终端与手机 SSH 会话。
+
+| 现有工作方式容易遇到的问题 | Tersh 的做法 | 直接收益 |
+| --- | --- | --- |
+| 用一串命令交互式浏览文件，要反复输入路径、自己记住操作对象。 | 在同一视图中浏览、筛选、预览、选择并操作。 | 减少重复输入，让当前目标更直观。 |
+| 已经连上 SSH，却还要为桌面文件管理器切换连接或另起一套操作流程。 | 在文件所在的机器上运行，沿用现有终端连接。 | 留在当前会话中完成可视化文件操作。 |
+| 看主机状态和处理文件往往分散在不同工具、不同步骤里。 | `tersh --c` 查看主机与路由，按 `t` 进入选中主机的文件工作台。 | 从选机器到看文件衔接起来。 |
+| 临时复制、清理后，还要重新核对哪些完成了、删掉的文件原来在哪里。 | 后台任务报告部分完成结果；受管理的回收站记录原位置。 | 结果可见，任务可取消，恢复不覆盖同名目标。 |
+| 手机 SSH 屏幕窄、键盘不全，长快捷键列表难记又难用。 | `o` 搜索操作；底部提示跟随页面和实际键位变化。 | 更容易找到操作，适配不同设备。 |
+
+#### 什么时候特别有用？
+
+- **检查开发或科研服务器**：筛选主机、进入工作台、查看输出目录、搜索日志，不必先把文件下载回来。
+- **用手机临时处理问题**：通过常用 SSH 客户端连接，在服务器上运行 `tersh`，用紧凑提示或操作菜单找到文件。
+- **整理本地项目或远端工作目录**：先预览再操作，多选复制时继续浏览，需要时查看进度或恢复之前移入回收站的项目。
+
+#### 半分钟了解主要功能
+
+| 你想做什么 | 从这里开始 |
+| --- | --- |
+| 打开编辑器前先确认文件内容 | `tersh`，Enter 预览，`/` 查找 |
+| 复制时继续浏览，并掌握进度 | 复制/粘贴，`J` 查看任务，Ctrl+X 请求取消 |
+| 恢复用 Tersh 移入回收站的项目 | `u`，查看原路径后确认恢复 |
+| 找到目标服务器并开始处理文件 | `tersh --c`，`/` 筛选，`l` 查看详情，`t` 进入工作台 |
+| 不记得某项操作的快捷键 | `o` 搜索名称，再选择执行 |
+
+**轻量有具体设计支撑**：单个可执行文件、有界缓存与主机历史、按变化重绘，没有常驻监控代理。
+预编译的 macOS/Linux 程序无需 Rust 工具链即可运行。健康检查需要 SSH；打开远端文件工作台还需要在目标机器安装 Tersh。
+文件操作发生在该工作台所在的主机上。
+
+<details>
+<summary>与其他工具如何搭配、各自适合什么</summary>
+
+脚本和重复自动化仍适合直接用 shell 命令。
+[Yazi](https://yazi-rs.github.io/features/) 提供更丰富的文件预览与插件生态，
+[btop](https://github.com/aristocratos/btop) 专注于详细的系统资源监控。
+Tersh 聚焦“选主机 → 检查文件 → 有明确反馈的操作 → 必要时恢复”这条工作路径。
+这里比较的是使用侧重点，没有宣称 Tersh 在速度或功能数量上全面领先。
+目录枚举和预览读取目前仍是同步的；取消保留已完成操作，不等于撤销。
+
+</details>
 
 ![文件工作台、预览与上下文快捷键](docs/images/workbench.png)
 
 *截图使用模拟数据；实际颜色由终端配色决定。*
-
-### 能做什么
-
-| 使用场景 | 功能 |
-| --- | --- |
-| 快速检查文件 | 筛选、排序、内嵌/全屏预览、全文查找、外部编辑器 |
-| 批量文件操作 | 单个后台工作线程，进度、取消与明确的部分完成结果 |
-| 清理后恢复 | 持久化回收站记录、原位置确认、同名文件不覆盖 |
-| 多台服务器 | SSH 探测、跳板路由、主机筛选排序、有限长度的趋势历史 |
-| 手机与不同终端 | 自适应布局、可搜索操作菜单、自定义键位、ASCII 降级 |
-| 保持轻量 | 单个可执行文件，有界缓存与历史，无常驻代理，按变化重绘 |
 
 ### 安装
 

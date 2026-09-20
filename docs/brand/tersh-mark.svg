@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc" viewBox="0 0 256 256">
+<title id="title">Tersh</title>
+<desc id="desc">A folder-shaped terminal window containing a prompt and cursor.</desc>
+<rect x="8" y="8" width="240" height="240" rx="52" fill="#101c29"/>
+<path d="M51 91V72a17 17 0 0 1 17-17h39l23 23h58a17 17 0 0 1 17 17v90a17 17 0 0 1-17 17H68a17 17 0 0 1-17-17V91Z" fill="none" stroke="#71d9d0" stroke-width="10" stroke-linejoin="round"/>
+<path d="M52 105h151" stroke="#315466" stroke-width="7"/>
+<path d="m79 129 25 23-25 23" fill="none" stroke="#71d9d0" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M129 175h34" stroke="#c5b6ee" stroke-width="12" stroke-linecap="round"/>
+</svg>
