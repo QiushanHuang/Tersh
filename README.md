@@ -1,774 +1,174 @@
 # Tersh
 
-[![简体中文](https://img.shields.io/badge/语言-简体中文-1677ff)](#中文)
-[![English](https://img.shields.io/badge/Language-English-24292f)](#english)
+[English](README.md) · [简体中文](README.zh-CN.md)
 
-[![Rust](https://img.shields.io/badge/Rust-2024-000000?logo=rust&logoColor=white)](https://www.rust-lang.org/)
-[![Terminal UI](https://img.shields.io/badge/TUI-ratatui-1f2937)](https://ratatui.rs/)
-[![Shell Workflow](https://img.shields.io/badge/Workflow-Local%20%7C%20SSH%20Shell-0f766e)](#local-and-ssh-shell-sessions)
-[![Mobile Friendly](https://img.shields.io/badge/Focus-Mobile--Friendly-2563eb)](#mobile-friendly-terminal-workflow)
-[![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Linux-475569)](#installation)
-[![Status](https://img.shields.io/badge/Status-v1.1.1-16a34a)](#project-status)
-[![License](https://img.shields.io/badge/License-MIT-16a34a)](#license)
+[![Release](https://img.shields.io/github/v/release/QiushanHuang/Tersh)](https://github.com/QiushanHuang/Tersh/releases)
+[![CI](https://github.com/QiushanHuang/Tersh/actions/workflows/ci.yml/badge.svg)](https://github.com/QiushanHuang/Tersh/actions/workflows/ci.yml)
+[![Rust 1.88+](https://img.shields.io/badge/Rust-1.88%2B-orange)](https://www.rust-lang.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-<a id="english"></a>
+**A lightweight terminal file workbench for local and SSH sessions.**
+Browse, preview and organize files where you already work. Open `tersh --c` to
+check host health and launch a shell or Tersh on a selected machine.
 
-**Tersh** is a lightweight, mobile-friendly terminal file workbench for local and SSH shell sessions.
+![Tersh file workbench with preview, selection and contextual shortcuts](docs/images/workbench.png)
 
-It is built for the moment when you are already inside a terminal, locally or after SSH, and need a fast way to inspect files, preview content, move around directories, and perform basic file operations without bouncing between `ls`, `cd`, `cat`, `cp`, and `rm`.
+*Screenshots use synthetic demo data and a representative terminal color palette.*
 
 ## Why Tersh
 
-- Built for terminal-first workflows, locally or inside an SSH shell
-- Comfortable on narrow terminals, remote shells, and lightweight setups
-- Lightweight enough for multi-terminal and low-friction setups
-- Keyboard-first, with safe file operations and inline preview
-- Useful on tablets and phones where a full desktop file manager is unavailable
+| What you need | What Tersh provides |
+| --- | --- |
+| Quick file inspection | Filterable, sortable files; inline/fullscreen preview; search; editor handoff |
+| Long-running file work | One cancellable background worker, progress and explicit partial results |
+| Recoverable cleanup | Managed trash receipts, original-location confirmation and no-overwrite recovery |
+| Several remote machines | SSH health probes, jump-host routes, host filtering/sorting and bounded trends |
+| A phone, laptop or SSH client | Adaptive layouts, searchable actions, configurable keys and ASCII fallback |
+| A small tool that stays quiet | One binary, bounded caches/history, no resident agent, redraws driven by changes |
 
-## Local And SSH Shell Sessions
+## Install
 
-The default Tersh file workbench is not an SSH client and is not a multi-host session manager.
+Download a binary for your platform from [Releases](https://github.com/QiushanHuang/Tersh/releases),
+or build from source with **Rust 1.88 or newer**:
 
-Its role is narrower and more practical: run the `tersh` CLI in any local directory, or connect to a server through your preferred SSH app and launch `tersh` there for remote file inspection and lightweight operations.
-
-For read-only multi-host health checks, `tersh --c` opens a separate cluster status TUI. It reads a JSON inventory, uses non-interactive SSH probes, and shows connection, CPU load, memory, storage, task count, GPU availability, and recent probe errors without installing an agent on remote hosts.
-
-That makes it a good fit for:
-
-- remote content checks
-- quick server-side file triage
-- path copying during ops workflows
-- working across multiple hosts from lightweight terminal clients
-
-## Mobile-Friendly Terminal Workflow
-
-The product direction is intentionally simple:
-
-- open a local terminal or enter a host over SSH
-- launch one command
-- browse, filter, preview, copy, move, rename, and clean up files
-- stay inside the terminal the whole time
-
-This matters when your working environment is:
-
-- an iPad with an SSH app
-- a phone handling urgent remote checks
-- a lightweight laptop in a multi-terminal setup
-- a server environment where GUI tools are irrelevant
-
-## Features
-
-- Full-screen terminal file workbench
-- btop-inspired status header, sortable file list, and inspector panel
-- Shared btop-style semantic theme system for workbench and cluster views, with optional aurora, contrast, no-color, and border modes
-- Context-aware shortcut footer that recommends actions for the focused item, active selection, and copy/cut buffer
-- File rows mark cursor, selection, and copy/cut buffer state in one compact status prefix
-- Directory navigation with keyboard-first controls
-- Optional shell wrapper for visual `cd` from the terminal
-- Inline file preview
-- Enter fullscreen preview for files with full-content scrolling/search/jump
-- Filter the current directory
-- Quick file edit with `$VISUAL`, `$EDITOR`, or `nano` fallback (`e`)
-- Copy, cut, paste, rename, and move workflows
-- Copy conflict handling with explicit `replace` / `skip` confirmation before overwriting existing targets
-- Safe trash flow before permanent deletion
-- Copy file name, relative path, and absolute path
-- Compact info pane and operation log
-- Dirty-driven rendering, bounded preview LRU cache, and cached filter/sort keys for lighter idle and browsing performance
-- Optional `TERSH_CLIPBOARD=off` mode for terminals where OSC52 clipboard writes are unwanted
-- Optional `TERSH_THEME`, `TERSH_BORDER`, and `TERSH_FOOTER` settings for high-contrast, no-color, polished Unicode, or mobile-oriented terminals
-- Hidden file toggle
-- `tersh --cluster` / `tersh --c` multi-server health dashboard for local, jump, and remote hosts
-
-## v1.1.1 Release Highlights
-
-Tersh v1.1.1 strengthens the everyday file workflow without expanding Tersh
-into a general remote-control product.
-
-- Added selectable btop, aurora, high-contrast, and no-color themes, plus ASCII,
-  rounded, and thick border styles.
-- Added context-aware shortcut recommendations and compact layouts for narrow
-  terminals, phones, and tablets.
-- Added explicit `replace` / `skip` handling when a copy target already exists.
-- Added direct file startup: `tersh <file>` opens the parent directory, focuses
-  the file, and enters preview.
-- Reduced idle work with dirty-driven rendering, a bounded preview LRU cache,
-  cached filter/sort keys, and in-memory filtering.
-- Hardened delayed copy, cut, rename, trash, delete, edit, and preview operations
-  against files being replaced after the user selected them.
-- Hardened cluster inventory and probes with stricter SSH input validation,
-  bounded output, known-host enforcement, timeout cleanup, and generation-safe
-  refresh results.
-- Added repository-side exact-test and evidence validation tooling so internal
-  release results are harder to confuse, duplicate, or silently lose.
-
-## v1.1.0 Release Highlights
-
-Tersh v1.1.0 is a small product-quality release focused on a denser, btop-inspired terminal interface and safer day-to-day remote file work.
-
-- Added a status header that keeps path, item count, selection size, copy/cut buffer state, hidden-file state, filter text, and sort mode visible.
-- Changed the file list into a denser operational table with selection, file kind, permission, size, name, and active sort context.
-- Added sortable browsing with `s` to cycle sort modes and `S` to reverse the current sort.
-- Reworked the side info pane into an Inspector with target, buffer, search/sort, and log sections.
-- Reworked cluster dashboard status into colored `OK` / `OLD` / `FAIL` / `CHK` tokens and added per-host latency, memory, and disk columns.
-- Added `Esc` as a cancel key alongside `Ctrl+G` for prompts, overlays, and cluster detail.
-- Strengthened terminal display safety by escaping control characters in rendered paths and prompt input.
-- Editing now refuses symlinks and special files, matching the safe preview model; `$VISUAL` and `$EDITOR` are respected before falling back to `nano`.
-- Multi-target delete/trash confirmations now show whether the operation comes from the focused item or selection and list the first affected paths.
-- Directory reloads skip transient metadata failures for individual entries instead of clearing the entire view.
-
-## V1 Release Highlights
-
-Tersh V1 is the first product baseline for the local file workbench and read-only cluster status dashboard.
-
-- Mode-aware shortcut footers now match the current screen: normal browsing, preview, search, prompts, delete confirmation, help, cluster list, and cluster detail no longer advertise inactive actions.
-- Narrow and mobile terminals get compact footer/status variants, so key actions and selected/copy context stay visible instead of being squeezed out.
-- Preview navigation is more predictable: `j` / `k` and `PageUp` / `PageDown` move by page, while arrow keys and `Ctrl+F` / `Ctrl+B` move by line.
-- File preview is safer: symlinks are not followed, directories and special files show safe messages, and preview content is capped by bytes, line length, and line count.
-- Trash and permanent delete now show target context before confirmation and reject unsafe targets such as filesystem roots, `$HOME`, the active work root, and `.tersh-trash` itself.
-- Cluster inventory loading now rejects duplicate aliases, invalid SSH fields, unresolved `proxy_jump` references, and control characters; refreshes are capped and rotated across hosts.
-
-## Installation
-
-Product name: **Tersh**. CLI tool name and crate name: `tersh`.
-
-### New Computer Install From GitHub
-
-Run this on a new macOS or Linux machine:
-
-```bash
-set -eu
-
-if ! command -v cargo >/dev/null 2>&1; then
-  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-  . "$HOME/.cargo/env"
-fi
-
-export PATH="$HOME/.cargo/bin:$PATH"
-if command -v rustup >/dev/null 2>&1; then
-  rustup update stable
-fi
-cargo install --locked --git https://github.com/QiushanHuang/Tersh.git --bin tersh --force
-
-tersh --help
-tersh
+```sh
+cargo install --locked --git https://github.com/QiushanHuang/Tersh.git --tag v1.2.0 --bin tersh
 ```
 
-Run this same block on a remote server after SSH if you want the `t` action inside the `tersh --cluster` dashboard to open the Tersh workbench on that remote host.
+To update an existing Cargo installation, add `--force`. For a local checkout:
 
-Tersh requires Rust 1.88 or newer.
-
-### Clone And Install From Source
-
-Use this when you want the local source repository too:
-
-```bash
+```sh
 git clone https://github.com/QiushanHuang/Tersh.git
 cd Tersh
 ./scripts/install.sh
-tersh
 ```
 
-The install script builds `target/release/tersh` and installs it as the `tersh` command. Set `TERSH_INSTALL_DIR` to choose another install directory.
+The installer uses an existing Tersh location or a writable user bin directory.
+Set `TERSH_INSTALL_DIR` to choose a location. For remote file work, install Tersh
+on the remote host and run it after connecting through your SSH client.
 
-### Local Development Build
+## Start here
 
-```bash
-cargo build --release --bin tersh
-./target/release/tersh
+```sh
+tersh                                  # Browse the current directory
+tersh /path/to/project                 # Browse another directory
+tersh README.md                        # Preview a file
+tersh --c                              # Host health dashboard
+tersh --ui-profile desktop             # Rounded borders and Unicode trends
+tersh --ui-profile mobile --theme contrast
+tersh --ui-profile ssh                 # ASCII, adaptive hints, no animation
 ```
 
-## Quick Start
+Press **`o`** for searchable actions or **`?`** for the current keymap.
+Type an action name, select it with arrows/Tab, and press Enter. Escape returns
+to the previous view. The following are defaults; custom bindings also update
+menus, help and footer hints.
 
-Run `tersh` in the current directory:
+| Task | Keys |
+| --- | --- |
+| Move / open / parent | `j`/`k` or arrows · Enter · `h` or Backspace |
+| Filter / hidden files / sort | `/` · `.` · `s`/`S` |
+| Select / copy / cut / paste | Space · `yy` · `x` · `p` |
+| Copy to / move to / rename | `c` · `m` · `n` |
+| Jobs / request cancellation | `J` · Ctrl+X |
+| Trash / recover / permanent delete | `d` · `u` · `D` |
+| Preview search / next match / edit | `/` · `n`/`N` · `e` |
+| Copy name / relative path / absolute path | `yf` · `yr` · `ya` |
+| Quit / cancel / safe emergency exit | `q` · Esc or Ctrl+G · Ctrl+C |
 
-```bash
-tersh
+Tersh uses `$VISUAL`, `$EDITOR`, then `nano` for editing. For a visual `cd`, source
+[scripts/tersh-cd.sh](scripts/tersh-cd.sh) in your shell and use `tersh-cd`.
+
+## File jobs and recovery
+
+Copy, move, trash, permanent delete and restore run in one background worker.
+Browsing remains available while a job runs; overlapping writes are refused.
+`J` shows progress, completed items, failures, skips and remaining work.
+
+Cancellation keeps completed items and removes this copy's incomplete output.
+Replacement copies are staged before commit; existing directories cannot be
+replaced. Delayed operations recheck the source and approved target identities.
+Ctrl+C during a job requests cancellation and waits for cleanup before exiting.
+A blocked filesystem syscall cannot be interrupted, and completed deletion
+cannot be undone.
+
+`u` opens the current work root's managed trash. Enter shows the original
+location before restoring. Existing destinations are never overwritten. Bad
+receipts are reported while other valid records remain available. Recovery
+works across restarts, requires same-filesystem rename and recorded UTF-8 paths;
+legacy unrecorded trash remains untouched.
+
+## Hosts and trends
+
+![Cluster detail with current metrics and bounded observation trends](docs/images/cluster.png)
+
+```sh
+tersh --c --cluster-config examples/servers.json
 ```
 
-Open a specific path:
+Edit a copy of [the example inventory](examples/servers.json) with your own
+hosts. Its `.example` addresses are placeholders. Health probes use
+non-interactive SSH with already trusted host keys and existing credentials.
 
-```bash
-tersh /var/www
+| Task | Keys |
+| --- | --- |
+| Filter alias, address or role / clear filter | `/` · Backspace |
+| Cycle sort / reverse | `v` · `V` |
+| Refresh all / refresh selected | `r` · Enter |
+| Expand detail / scroll detail | `l` · PageUp/PageDown |
+| Open shell or SSH / open Tersh | `s` · `t` |
+
+Filtering and sorting change the view, not the probe scope. Selection follows
+the host alias; unknown metrics stay last in either sort direction. Remote `t`
+requires Tersh on that host. Returning from the session restores the dashboard.
+
+History keeps at most 60 observations per host in memory. Gaps mean missing or
+failed observations. Load is the 1-minute load average, memory is used percent,
+and probe duration covers the full collection operation. Samples are spaced by
+observation, with the actual elapsed span shown. No extra probe is run for a graph.
+
+## Make it yours
+
+```sh
+tersh --theme aurora
+tersh --theme mono
+tersh --no-motion
+tersh --dump-keymap > keymap.json
+tersh --keymap keymap.json
 ```
 
-Open a file directly, focusing its parent directory and entering preview:
+Themes: `btop`, `aurora`, `contrast`, `mono`. `NO_COLOR` disables colors.
+Device presets choose border, graph glyphs, footer density and motion without
+changing bindings or writing configuration files.
 
-```bash
-tersh README.md
-```
-
-Open the read-only multi-server health dashboard:
-
-```bash
-tersh --cluster
-```
-
-The short compatibility alias also works:
-
-```bash
-tersh --c
-```
-
-Use a specific JSON inventory:
-
-```bash
-tersh --cluster --cluster-config /path/to/servers.json
-```
-
-The dashboard also checks `TERSH_SERVERS_JSON`, `./ssh/servers.json`, and `~/.config/tersh/servers.json`. The campus access layout from the companion runbook is supported: a local host, a Tailscale jump host, and campus servers reached through `ProxyJump`. Health probes require SSH host keys to already be trusted; run a normal `ssh user@host` first for new hosts.
-
-Inside the dashboard, select a host and press `s` to leave the status screen temporarily and open a local shell or interactive `ssh` session. Press `t` to open the Tersh file workbench on that host instead; remote hosts use `ssh -t` so the remote TUI has a real terminal. When that shell or workbench exits, Tersh returns to the dashboard and refreshes the selected host.
-
-Inventory entries may set `workdir` (also accepted as `directory` or `tersh_dir`) to choose where `t` starts:
+Custom bindings use a partial JSON map:
 
 ```json
 {
-  "alias": "school-star",
-  "ssh_user": "star",
-  "campus_ip": "10.13.7.138",
-  "proxy_jump": "campus-mac",
-  "workdir": "/srv/app"
+  "files": {
+    "copy": ["Ctrl+y"],
+    "open_jobs": ["F5", "J"],
+    "open_trash": ["F6", "u"]
+  }
 }
 ```
 
-Remote `t` mode requires `tersh` to be installed on the target host and available in that host's `PATH`.
+This replaces `yy` with Ctrl+Y and keeps single-letter alternatives for devices
+without function keys. See [configuration](docs/configuration.md) for all ten
+contexts, file precedence, chords, environment variables and inventory fields.
 
-Typical remote flow:
+## Develop and contribute
 
-```bash
-ssh user@host
-cd /srv/app
-tersh
+```sh
+cargo fmt --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked --all-targets
+python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 ```
 
-Use Tersh as a visual `cd` by defining a shell function:
-
-```bash
-tersh-cd() {
-  local target_dir
-  target_dir="$(tersh --print-cwd "$@")" || return
-  [ -n "$target_dir" ] && cd -- "$target_dir"
-}
-alias tcd=tersh-cd
-```
-
-Then run `tcd`, browse from directory A to directory B, and quit. Your shell will return in directory B. This works through a shell wrapper because a child process cannot directly change its parent shell directory.
-
-Disable terminal clipboard writes when OSC52 is unsupported or undesirable:
-
-```bash
-TERSH_CLIPBOARD=off tersh
-```
-
-Copy helpers still update Tersh's in-app copy state; they just skip writing OSC52 escape sequences to the terminal.
-
-Tune visual density and color for different devices:
-
-```bash
-TERSH_THEME=aurora TERSH_BORDER=rounded tersh
-TERSH_THEME=contrast tersh
-TERSH_THEME=contrast TERSH_BORDER=thick tersh --cluster
-TERSH_THEME=mono TERSH_FOOTER=compact tersh
-TERSH_FOOTER=full tersh --cluster
-```
-
-`TERSH_THEME` accepts `btop`, `aurora`, `contrast`, or `mono`. `TERSH_COLOR=off` also selects no-color mode. `TERSH_BORDER` accepts `ascii`, `rounded`, or `thick`; ASCII remains the default for maximum SSH and fallback-terminal compatibility. `TERSH_FOOTER` accepts `auto`, `compact`, or `full`.
-
-## Keybindings
-
-### Navigation
-
-- `j` / `k` or arrow keys: move
-- `PageUp` / `PageDown`: move by page
-- `Home` / `End` or `gg` / `G`: jump to first / last item
-- `h`: parent directory
-- `l` or `Enter`: open
-- `/`: filter current directory
-- `:`: go to directory
-- `.`: toggle hidden files
-- `r`: refresh
-- `s`: cycle sort mode
-- `S`: reverse current sort
-
-### Preview Mode
-
-- `Enter` on a file: open fullscreen preview
-- `j` / `k`: scroll preview by page
-- `↑` / `↓` / `Ctrl+F` / `Ctrl+B`: scroll preview line by line
-- `PageUp` / `PageDown`: scroll preview by page
-- `Home` or `gg`: jump to top
-- `End` or `G`: jump to bottom
-- `/`: find in preview
-- `n` / `N`: next / previous match
-- `e`: open current regular file in `$VISUAL`, `$EDITOR`, or `nano`
-
-### File Operations
-
-- `Space`: mark selection
-- `yy`: copy
-- `x`: cut
-- `p`: paste
-- `c`: copy to directory
-- `m`: move to directory
-- `n`: rename focused item
-- `d`: move to `.tersh-trash`
-- `D`: permanently delete
-
-### Copy Helpers
-
-- `yf`: copy file name
-- `yr`: copy relative path
-- `ya`: copy absolute path
-
-### Exit and Help
-
-- `?`: help
-- `Esc` or `Ctrl+G`: cancel
-- `q`: quit
-- `Q` or `Ctrl+C`: force quit
-
-## Typical Use Cases
-
-- Review deployment artifacts on a remote machine
-- Inspect logs, config files, and generated output from a phone or tablet
-- Clean up directories during lightweight ops work
-- Copy paths and move files across multiple SSH-connected environments
-- Use one consistent terminal workflow across many hosts
-
-## Product Positioning
-
-Tersh sits between raw shell commands and a full remote file manager.
-
-It aims to keep the speed and portability of terminal work while removing repetitive friction from everyday remote file handling.
-
-## Project Status
-
-This repository is at v1.1.1.
-
-The current implementation focuses on a stable terminal workflow:
-
-- browse
-- preview
-- filter
-- sort
-- copy and move
-- rename
-- trash and delete
-- path handling
-- read-only cluster health checks
-
-The current scope does not try to be:
-
-- an SSH client
-- a background sync tool
-- a desktop GUI file manager
-- a full remote-control platform
-
-## Architecture
-
-The codebase is organized around a small Rust TUI core:
-
-- `src/app.rs`: application state and interaction flow
-- `src/ui.rs`: terminal layout and rendering
-- `src/fs_core.rs`: file listing and metadata helpers
-- `src/fs_ops.rs`: copy, rename, trash, delete, and path operations
-- `src/preview.rs`: file preview logic
-- `src/clipboard.rs`: clipboard integration helpers
-- `src/cluster.rs`: cluster inventory, probing, and state handling
-- `src/cluster_ui.rs`: cluster status dashboard rendering
-
-## Roadmap
-
-- Better preview coverage for more file types
-- Tighter small-screen behavior for narrow mobile terminals
-- More remote-friendly copy and batch workflows
-- Configurable keymaps and behavior
-- Packaging for easier install beyond local builds
-
-## License
-
-MIT
-
----
-
-<a id="中文"></a>
-
-# Tersh
-
-[![简体中文](https://img.shields.io/badge/语言-简体中文-1677ff)](#中文)
-[![English](https://img.shields.io/badge/Language-English-24292f)](#english)
-
-**Tersh** 是一个面向本地目录和 SSH shell 会话的轻量、移动端友好的终端文件工作台。
-
-它适合这样的场景：你已经在本地终端里，或者已经通过 SSH 连上远程主机，这时你需要一种比反复敲 `ls`、`cd`、`cat`、`cp`、`rm` 更顺手的方式来查阅文件、预览内容、切换目录并完成基础文件操作。
-
-## 为什么是 Tersh
-
-- 面向终端场景，既能本地用，也能在 SSH shell 里用
-- 更适合窄终端、远程 shell 和轻量环境
-- 足够轻，适合多终端办公和低负担接入
-- 键盘优先，带安全删除与内联预览
-- 在平板和手机上也能提供可用的远程文件工作流
-
-## 本地与 SSH Shell 会话
-
-默认的 Tersh 文件工作台不是 SSH 客户端，也不是多主机会话管理器。
-
-它的角色更聚焦，也更实用：你可以在本地目录直接运行 `tersh`，也可以先通过自己习惯的 SSH 工具进入服务器，然后在服务器目录里启动 `tersh`，完成文件查阅和轻量操作。
-
-如果只是做只读的多主机健康检查，可以用 `tersh --c` 打开独立的集群状态 TUI。它读取 JSON 主机清单，使用非交互 SSH 探测，展示连接、CPU load、内存、存储、任务数量、GPU 可用性和最近探测错误，不需要在远端安装 agent。
-
-它适合这些工作：
-
-- 远程内容检查
-- 服务器侧文件快速排查
-- 运维流程里的路径复制
-- 在多个主机之间保持一致的轻量终端工作方式
-
-## 面向移动端的终端工作流
-
-这个产品方向刻意保持简单：
-
-- 打开本地终端，或通过 SSH 进入主机
-- 启动一个命令
-- 浏览、筛选、预览、复制、移动、重命名和清理文件
-- 全程停留在终端里完成操作
-
-这对以下环境尤其重要：
-
-- 在 iPad 上通过 SSH App 远程工作
-- 用手机做紧急检查和快速处理
-- 在轻量笔记本上同时管理多个终端
-- 运行在不需要 GUI 的服务器环境里
-
-## 功能特性
-
-- 全屏终端文件工作台
-- 参考 btop 的状态栏、可排序文件列表和 Inspector 信息面板
-- workbench 与 cluster 共用 btop 风格语义主题系统，可切换 aurora、高对比、无色和边框模式
-- 根据当前文件、目录、选区和复制/剪切缓冲区自动推荐快捷键的底部提示栏
-- 文件行用紧凑前缀同时标记当前行、选中状态和复制/剪切缓冲区状态
-- 键盘优先的目录浏览
-- 可选 shell 包装函数，让 `tersh` 作为可视化 `cd` 使用
-- 文件内联预览
-- 回车进入全文预览，可快速滚动、跳转与查找
-- 当前目录筛选
-- 可在预览中用 `e` 调用 `$VISUAL`、`$EDITOR` 或 `nano` 进行编辑
-- 复制、剪切、粘贴、重命名与移动
-- 复制遇到已有目标时，会先进入 `replace` / `skip` 冲突确认，再决定是否覆盖
-- 先入回收站再永久删除的安全流程
-- 复制文件名、相对路径和绝对路径
-- 紧凑的信息面板和操作日志
-- 按需重绘、带大小预算的预览 LRU 缓存，以及筛选/排序 lowercase 缓存，降低空闲和浏览时的开销
-- 可用 `TERSH_CLIPBOARD=off` 关闭 OSC52 终端剪贴板写入
-- 可用 `TERSH_THEME`、`TERSH_BORDER` 和 `TERSH_FOOTER` 适配高对比、无色、Unicode 美化或移动端紧凑终端
-- 隐藏文件开关
-- `tersh --cluster` / `tersh --c` 多服务器健康状态面板，可查看本机、跳板机和远端服务器
-
-## v1.1.1 更新重点
-
-Tersh v1.1.1 在不扩大产品边界的前提下，重点提升日常文件操作的安全性、
-终端响应速度和远程服务器检查的可解释性。
-
-- 新增 btop、aurora、高对比和无色主题，以及 ASCII、圆角和粗线边框。
-- 新增根据当前文件、目录、选区和复制/剪切状态自动变化的快捷键提示，
-  并优化手机、平板和窄屏终端布局。
-- 复制遇到已有目标时，新增明确的 `replace` / `skip` 冲突处理。
-- 支持直接执行 `tersh <文件>`，自动进入所在目录、定位文件并打开预览。
-- 通过按需重绘、有限容量的多文件预览缓存、筛选/排序缓存和内存筛选，
-  降低空闲和浏览时的开销。
-- 复制、剪切、重命名、回收站、删除、编辑和预览会在执行前重新确认
-  文件身份，防止用户确认后目标被其他程序替换。
-- 收紧服务器清单和 SSH 检查：限制输出、清理超时进程、要求已知主机密钥，
-  并阻止旧检查结果覆盖新状态。
-- 新增仓库侧精确测试和结果记录校验，降低内部测试空跑、结果混用、重复写入
-  或失败历史丢失的风险。
-
-## v1.1.0 更新重点
-
-Tersh v1.1.0 是一次小版本产品质量更新，重点是更接近 btop 的高密度终端界面，以及更安全、更稳定的远程文件工作流。
-
-- 新增顶部状态栏，持续展示路径、条目数量、已选大小、复制/剪切缓冲区、隐藏文件状态、筛选文本和排序模式。
-- 文件列表改为更紧凑的操作表格，显示选择状态、文件类型、权限、大小、名称和当前排序上下文。
-- 新增 `s` 循环排序模式，`S` 反转当前排序。
-- 侧边信息区改为 Inspector，分块展示目标、缓冲区、搜索/排序和日志。
-- 集群状态栏改为彩色 `OK` / `OLD` / `FAIL` / `CHK` 指标，并在主机列表中增加延迟、内存和磁盘列。
-- 新增 `Esc` 作为取消键，与 `Ctrl+G` 一起用于输入框、弹层和集群详情页。
-- 渲染路径和输入内容时会转义控制字符，避免异常文件名污染终端界面。
-- 编辑功能会拒绝符号链接和特殊文件，与安全预览模型保持一致；编辑器优先使用 `$VISUAL` 和 `$EDITOR`，最后回退到 `nano`。
-- 多目标删除/回收站确认会显示操作来源是当前焦点还是多选，并列出前几个目标路径。
-- 目录刷新遇到单个条目的临时 metadata 失败时会跳过该条目，不再清空整个列表。
-
-## V1 更新重点
-
-Tersh V1 是本地文件工作台和只读多主机状态面板的第一个产品基线版本。
-
-- 底部快捷键现在会随模式变化：普通浏览、预览、查找、输入框、删除确认、帮助、集群列表和集群详情页只展示当前真正可用的动作。
-- 窄屏和移动端终端增加了紧凑版 footer 与状态区，关键快捷键、已选数量和复制队列状态不会被挤掉。
-- 预览区滚动逻辑更清楚：`j` / `k` 与 `PageUp` / `PageDown` 按页滚动，方向键和 `Ctrl+F` / `Ctrl+B` 按行滚动。
-- 文件预览更安全：不跟随符号链接，目录和特殊文件只显示安全提示，并同时限制字节数、单行长度和总行数。
-- 回收站和永久删除会在确认前展示目标数量和首个目标路径，并拒绝文件系统根目录、`$HOME`、当前工作根目录和 `.tersh-trash` 自身等高风险目标。
-- 集群主机清单会校验重复 alias、非法 SSH 字段、无法解析的 `proxy_jump` 和控制字符；刷新任务会限制并发并轮转主机，避免一次性压满。
-
-## 安装
-
-产品展示名：**Tersh**。CLI 命令名和 crate 名：`tersh`。
-
-### 新电脑从 GitHub 安装
-
-在新的 macOS 或 Linux 机器上运行：
-
-```bash
-set -eu
-
-if ! command -v cargo >/dev/null 2>&1; then
-  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-  . "$HOME/.cargo/env"
-fi
-
-export PATH="$HOME/.cargo/bin:$PATH"
-if command -v rustup >/dev/null 2>&1; then
-  rustup update stable
-fi
-cargo install --locked --git https://github.com/QiushanHuang/Tersh.git --bin tersh --force
-
-tersh --help
-tersh
-```
-
-如果你已经 SSH 到服务器上，就在服务器终端里运行同一段命令；这样在 `tersh --cluster` 状态面板里按 `t` 时，才能在那台远端主机上打开 Tersh 文件工作台。
-
-Tersh 需要 Rust 1.88 或更新版本。
-
-### 克隆源码并安装
-
-需要把源码仓库也下载到本地时，用这一段：
-
-```bash
-git clone https://github.com/QiushanHuang/Tersh.git
-cd Tersh
-./scripts/install.sh
-tersh
-```
-
-安装脚本会构建 `target/release/tersh`，并把它安装成 `tersh` 命令。你也可以设置 `TERSH_INSTALL_DIR` 指定安装目录。
-
-### 本地开发构建
-
-```bash
-cargo build --release --bin tersh
-./target/release/tersh
-```
-
-## 快速开始
-
-在当前目录启动 `tersh`：
-
-```bash
-tersh
-```
-
-打开指定目录：
-
-```bash
-tersh /var/www
-```
-
-直接打开文件，并聚焦其父目录、进入预览：
-
-```bash
-tersh README.md
-```
-
-打开只读的多服务器健康状态面板：
-
-```bash
-tersh --cluster
-```
-
-也可以继续使用短兼容别名：
-
-```bash
-tersh --c
-```
-
-指定 JSON 主机清单：
-
-```bash
-tersh --cluster --cluster-config /path/to/servers.json
-```
-
-状态面板也会检查 `TERSH_SERVERS_JSON`、`./ssh/servers.json` 和 `~/.config/tersh/servers.json`。之前运行指南里的校园网布局可以直接使用：本机、Tailscale 跳板机，以及通过 `ProxyJump` 访问的校园服务器。健康探测要求 SSH host key 已经受信任；新主机请先手动运行一次 `ssh user@host`。
-
-在状态面板里选中主机后按 `s`，会临时离开状态页并打开本地 shell 或交互式 `ssh` 会话。按 `t` 则是在这台主机上打开 Tersh 文件工作台；远端主机会使用 `ssh -t`，这样远端 TUI 有真实终端。退出 shell 或工作台后，Tersh 会回到状态面板并刷新当前主机。
-
-主机清单里可以设置 `workdir`（也兼容 `directory` 或 `tersh_dir`）来决定 `t` 从哪个目录启动：
-
-```json
-{
-  "alias": "school-star",
-  "ssh_user": "star",
-  "campus_ip": "10.13.7.138",
-  "proxy_jump": "campus-mac",
-  "workdir": "/srv/app"
-}
-```
-
-远端 `t` 模式要求目标主机已经安装 `tersh`，并且远端 `PATH` 中可以找到 `tersh`。
-
-典型远程使用方式：
-
-```bash
-ssh user@host
-cd /srv/app
-tersh
-```
-
-把 Tersh 当作可视化 `cd` 使用时，先在 shell 里定义函数：
-
-```bash
-tersh-cd() {
-  local target_dir
-  target_dir="$(tersh --print-cwd "$@")" || return
-  [ -n "$target_dir" ] && cd -- "$target_dir"
-}
-alias tcd=tersh-cd
-```
-
-之后运行 `tcd`，从 A 目录浏览到 B 目录并退出，回到终端后当前目录就是 B。这里必须通过 shell 函数实现，因为子进程不能直接修改父 shell 的当前目录。
-
-当终端不支持 OSC52，或者你不希望 Tersh 写入终端剪贴板时：
-
-```bash
-TERSH_CLIPBOARD=off tersh
-```
-
-复制辅助功能仍会更新 Tersh 内部复制状态，只是不向终端输出 OSC52 escape sequence。
-
-针对不同终端设备调整视觉密度和配色：
-
-```bash
-TERSH_THEME=aurora TERSH_BORDER=rounded tersh
-TERSH_THEME=contrast tersh
-TERSH_THEME=contrast TERSH_BORDER=thick tersh --cluster
-TERSH_THEME=mono TERSH_FOOTER=compact tersh
-TERSH_FOOTER=full tersh --cluster
-```
-
-`TERSH_THEME` 支持 `btop`、`aurora`、`contrast` 和 `mono`。`TERSH_COLOR=off` 也会启用无色模式。`TERSH_BORDER` 支持 `ascii`、`rounded` 和 `thick`；默认仍使用 ASCII 边框，保证 SSH 和兼容性较弱的终端也能稳定显示。`TERSH_FOOTER` 支持 `auto`、`compact` 和 `full`。
-
-## 快捷键
-
-### 导航
-
-- `j` / `k` 或方向键：移动
-- `PageUp` / `PageDown`：按页移动
-- `Home` / `End` 或 `gg` / `G`：跳到第一项 / 最后一项
-- `h`：返回上级目录
-- `l` 或 `Enter`：打开
-- `/`：筛选当前目录
-- `:`：跳转目录
-- `.`：切换隐藏文件显示
-- `r`：刷新
-- `s`：循环排序模式
-- `S`：反转当前排序
-
-### 全屏预览
-
-- `Enter`：对当前文件进入全文预览
-- `j` / `k`：按页滚动
-- `↑` / `↓` / `Ctrl+F` / `Ctrl+B`：按行上下滚动
-- `PageUp` / `PageDown`：按页滚动
-- `Home` 或 `gg`：跳到顶部
-- `End` 或 `G`：跳到底部
-- `/`：在预览中查找
-- `n` / `N`：下一个 / 上一个匹配
-- `e`：使用 `$VISUAL`、`$EDITOR` 或 `nano` 打开当前普通文件编辑
-
-### 文件操作
-
-- `Space`：标记选择
-- `yy`：复制
-- `x`：剪切
-- `p`：粘贴
-- `c`：复制到目标目录
-- `m`：移动到目标目录
-- `n`：重命名当前项
-- `d`：移动到 `.tersh-trash`
-- `D`：永久删除
-
-### 复制辅助
-
-- `yf`：复制文件名
-- `yr`：复制相对路径
-- `ya`：复制绝对路径
-
-### 退出与帮助
-
-- `?`：帮助
-- `Esc` 或 `Ctrl+G`：取消
-- `q`：退出
-- `Q` 或 `Ctrl+C`：强制退出
-
-## 典型使用场景
-
-- 在远程主机上检查部署产物
-- 用平板或手机查看日志、配置和生成文件
-- 在轻量运维工作中清理目录
-- 在多个 SSH 环境之间复制路径和整理文件
-- 在不同主机上保持一致的终端文件工作流
-
-## 产品定位
-
-Tersh 处在原始 shell 命令和完整远程文件管理器之间。
-
-它希望保留终端工作的速度和便携性，同时去掉日常远程文件处理中的重复摩擦。
-
-## 项目状态
-
-项目目前已进入 v1.1.1。
-
-当前实现聚焦在一条稳定的终端工作流上：
-
-- 浏览
-- 预览
-- 筛选
-- 排序
-- 复制与移动
-- 重命名
-- 回收站与删除
-- 路径处理
-- 只读多主机健康检查
-
-当前范围不包含：
-
-- SSH 客户端
-- 后台同步工具
-- 桌面 GUI 文件管理器
-- 完整远程控制平台
-
-## 架构说明
-
-代码目前围绕一个小而清晰的 Rust TUI 核心组织：
-
-- `src/app.rs`：应用状态和交互流程
-- `src/ui.rs`：终端布局和渲染
-- `src/fs_core.rs`：文件枚举与元数据辅助
-- `src/fs_ops.rs`：复制、重命名、回收站、删除与路径操作
-- `src/preview.rs`：文件预览逻辑
-- `src/clipboard.rs`：剪贴板集成辅助
-- `src/cluster.rs`：集群清单、探测和状态处理
-- `src/cluster_ui.rs`：集群状态面板渲染
-
-## 路线图
-
-- 扩展更多文件类型的预览能力
-- 进一步优化窄屏和移动端终端体验
-- 增强面向远程环境的复制与批量工作流
-- 支持可配置快捷键和行为选项
-- 提供更容易安装的分发方式
-
-## 许可证
-
-MIT
+[Contributing](CONTRIBUTING.md) · [Changelog](CHANGELOG.md) ·
+[v1.2.0 release notes](docs/releases/v1.2.0.md)
+
+Maintained by [QiushanHuang](https://github.com/QiushanHuang).
+See [contributors and attribution](CONTRIBUTORS.md). Tersh is licensed under the
+[MIT License](LICENSE); the existing copyright notice is preserved.

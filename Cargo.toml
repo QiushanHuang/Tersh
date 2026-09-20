@@ -1,10 +1,11 @@
 [package]
 name = "tersh"
-version = "1.1.1"
+version = "1.2.0"
 edition = "2024"
 rust-version = "1.88"
 description = "A lightweight terminal file workbench for local and SSH shell sessions."
 license = "MIT"
+authors = ["Qiushan Huang"]
 repository = "https://github.com/QiushanHuang/Tersh"
 homepage = "https://github.com/QiushanHuang/Tersh"
 

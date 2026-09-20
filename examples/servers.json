@@ -1,0 +1,19 @@
+{
+  "main_machine": { "alias": "workstation", "role": "Local machine" },
+  "jump_host": {
+    "alias": "bastion",
+    "device_name": "bastion.example",
+    "ssh_user": "ops",
+    "role": "SSH jump host"
+  },
+  "servers": [
+    {
+      "alias": "compute",
+      "campus_ip": "compute.example",
+      "ssh_user": "research",
+      "proxy_jump": "bastion",
+      "workdir": "/srv/project",
+      "role": "Compute server"
+    }
+  ]
+}

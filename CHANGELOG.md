@@ -4,6 +4,50 @@
 
 No unreleased changes.
 
+## v1.2.0 - 2026-09-20
+
+A workflow release for local and SSH terminals: cancellable file jobs,
+persistent recovery, searchable actions and configurable controls.
+
+### Added
+
+- Background copy, move, trash, delete and restore jobs, with `J` progress/results and `Ctrl+X` cancellation.
+- Managed trash receipts and `u` recovery across restarts, with original-location confirmation and no-overwrite restores.
+- Per-context JSON keymaps, up to four-key chords, conflict validation and `--dump-keymap` export.
+- Searchable `o` action menus with effective shortcut labels.
+- Cluster filtering by alias/address/role and stable inventory, alias, state and resource sorting.
+- Bounded, timestamped load/memory/disk/probe trends with explicit missing-observation gaps.
+- Desktop, mobile and SSH presentation presets; optional Unicode graphs, reduced motion and `NO_COLOR` support.
+- Reproducible offline UI gallery and native terminal workflow smoke checks.
+
+### Changed
+
+- Fit whole shortcut hints to the available width and prioritize filenames on narrow screens.
+- Separate long paths from header status and improve badge contrast and selected-row visibility.
+- Limit probe activity animation to four frames per second and stop animation at idle.
+- Generate action/help/footer hints from the effective keymap.
+- Refresh the bilingual documentation, configuration examples and contribution guidance.
+
+### Fixed
+
+- Preserve clipboard generations when an older move finishes after a new cut selection.
+- Keep existing replacement targets until staging completes and clean partial read-only copy trees on cancellation.
+- Traverse Unix directory deletion through pinned descriptors to resist ancestor symlink replacement.
+- Revalidate delayed operation identities and approved replacement targets through background execution.
+- Keep valid trash receipts usable alongside per-entry corruption warnings.
+- Use consistent used-memory semantics in host lists, resource bars and trends.
+- Preserve printable text when a configurable chord fails to match.
+- Keep restore filenames visible in narrow confirmation dialogs and prevent host launch dispatch for empty filter results.
+- Keep probe deadlines and pipe-resource lifetimes bounded when background descendants retain output pipes.
+
+### Compatibility
+
+- Rust 1.88 or newer; macOS and Linux.
+- Existing shortcuts remain the defaults. Custom bindings replace an action's previous shortcuts; Ctrl+C remains a safe-exit key.
+- Cancellation is cooperative and retains completed work. It cannot undo completed deletion or interrupt a blocked filesystem syscall.
+- Trash recovery requires managed receipts and same-filesystem rename. Existing unrecorded trash remains untouched.
+- Source builds and all existing v1.1.1 safety fixes are retained.
+
 ## v1.1.1 - 2026-08-11
 
 Tersh v1.1.1 is a trust-and-usability release focused on safer file operations,

@@ -2,7 +2,7 @@ use std::process::Command;
 
 #[test]
 fn help_separates_product_name_from_cli_tool_name() {
-    let binary = std::env::var("CARGO_BIN_EXE_tersh").expect("tersh binary target exists");
+    let binary = env!("CARGO_BIN_EXE_tersh");
     let output = Command::new(binary)
         .arg("--help")
         .output()
@@ -18,7 +18,7 @@ fn help_separates_product_name_from_cli_tool_name() {
 
 #[test]
 fn help_documents_print_cwd_for_shell_cd_wrappers() {
-    let binary = std::env::var("CARGO_BIN_EXE_tersh").expect("tersh binary target exists");
+    let binary = env!("CARGO_BIN_EXE_tersh");
     let output = Command::new(binary)
         .arg("--help")
         .output()
@@ -33,7 +33,7 @@ fn help_documents_print_cwd_for_shell_cd_wrappers() {
 
 #[test]
 fn help_documents_cluster_status_manager_flag() {
-    let binary = std::env::var("CARGO_BIN_EXE_tersh").expect("tersh binary target exists");
+    let binary = env!("CARGO_BIN_EXE_tersh");
     let output = Command::new(binary)
         .arg("--help")
         .output()
@@ -51,7 +51,7 @@ fn help_documents_cluster_status_manager_flag() {
 
 #[test]
 fn cluster_long_alias_keeps_existing_cluster_mode_contracts() {
-    let binary = std::env::var("CARGO_BIN_EXE_tersh").expect("tersh binary target exists");
+    let binary = env!("CARGO_BIN_EXE_tersh");
     let output = Command::new(binary)
         .args(["--cluster", "--print-cwd"])
         .output()
@@ -65,7 +65,7 @@ fn cluster_long_alias_keeps_existing_cluster_mode_contracts() {
 
 #[test]
 fn version_reports_minor_release() {
-    let binary = std::env::var("CARGO_BIN_EXE_tersh").expect("tersh binary target exists");
+    let binary = env!("CARGO_BIN_EXE_tersh");
     let output = Command::new(binary)
         .arg("--version")
         .output()
@@ -74,12 +74,12 @@ fn version_reports_minor_release() {
     assert!(output.status.success());
 
     let stdout = String::from_utf8(output.stdout).expect("version output is utf-8");
-    assert!(stdout.contains("tersh 1.1.1"));
+    assert!(stdout.contains("tersh 1.2.0"));
 }
 
 #[test]
 fn cluster_status_conflicts_with_print_cwd_wrapper_mode() {
-    let binary = std::env::var("CARGO_BIN_EXE_tersh").expect("tersh binary target exists");
+    let binary = env!("CARGO_BIN_EXE_tersh");
     let output = Command::new(binary)
         .args(["--c", "--print-cwd"])
         .output()
@@ -93,7 +93,7 @@ fn cluster_status_conflicts_with_print_cwd_wrapper_mode() {
 
 #[test]
 fn cluster_status_conflicts_with_file_workbench_path_argument() {
-    let binary = std::env::var("CARGO_BIN_EXE_tersh").expect("tersh binary target exists");
+    let binary = env!("CARGO_BIN_EXE_tersh");
     let output = Command::new(binary)
         .args(["--c", "/tmp"])
         .output()
@@ -103,4 +103,39 @@ fn cluster_status_conflicts_with_file_workbench_path_argument() {
 
     let stderr = String::from_utf8(output.stderr).expect("stderr is utf-8");
     assert!(stderr.contains("cannot be used with"));
+}
+#[test]
+fn help_exposes_device_profiles_and_rejects_unknown_profile() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tersh"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&output.stdout).contains("--ui-profile"));
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tersh"))
+        .args(["--ui-profile", "unknown"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+}
+
+#[test]
+fn keymap_dump_and_invalid_config_are_headless() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tersh"))
+        .arg("--dump-keymap")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(json["files"]["copy"].is_array());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("keymap.json");
+    std::fs::write(&path, r#"{"files":{"copy":["q"]}}"#).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tersh"))
+        .arg("--keymap")
+        .arg(path)
+        .arg("--dump-keymap")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!output.stdout.contains(&0x1b));
 }

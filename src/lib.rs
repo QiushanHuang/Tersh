@@ -1,9 +1,15 @@
+pub mod actions;
 pub mod app;
+pub mod bindings;
 pub mod clipboard;
 pub mod cluster;
 pub mod cluster_ui;
 pub mod fs_core;
 pub mod fs_ops;
+pub mod jobs;
+pub mod keymap;
+pub mod metrics;
 pub mod preview;
 pub mod theme;
+pub mod trash;
 pub mod ui;

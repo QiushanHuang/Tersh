@@ -19,6 +19,44 @@ fn render_app(app: &App, width: u16, height: u16) -> String {
 }
 
 #[test]
+fn action_menu_opens_and_searches_without_typing_into_file_filter() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("rename-me.txt"), "keep").unwrap();
+    let mut app = App::new(dir.path().into()).unwrap();
+    app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+    for ch in "rename".chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+    }
+    let buffer = render_app(&app, 80, 24);
+    assert!(buffer.contains("Actions"));
+    assert!(buffer.contains("Rename"));
+    assert_eq!(app.filter(), "");
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(app.mode(), tersh::app::Mode::Rename);
+}
+
+#[test]
+fn narrow_file_panel_preserves_long_filename() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("experiment-results-2026.csv"), "x").unwrap();
+    let app = App::new(dir.path().into()).unwrap();
+    let buffer = render_app(&app, 40, 12);
+    assert!(buffer.contains("experiment-results-2026.csv"));
+}
+
+#[test]
+fn long_directory_path_does_not_displace_header_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("long-directory-name-".repeat(6));
+    std::fs::create_dir(&path).unwrap();
+    let app = App::new(path).unwrap();
+    let buffer = render_app(&app, 120, 24);
+    assert!(buffer.contains("items 0"));
+    assert!(buffer.contains("sel 0"));
+    assert!(buffer.contains("buf EMPTY 0"));
+}
+
+#[test]
 fn wide_layout_contains_compact_info_pane_and_quit_keys() {
     let app = App::for_test();
 
@@ -245,7 +283,9 @@ fn render_escapes_paths_and_prompt_input() {
 fn destructive_confirmation_escapes_typed_control_characters() {
     let mut app = App::for_test();
     app.apply(Command::PermanentDelete);
-    app.handle_key(KeyEvent::new(KeyCode::Char('\u{1b}'), KeyModifiers::NONE));
+    // The key input layer rejects controls; inject at the command boundary to
+    // verify the renderer still escapes stored input independently.
+    app.handle_command(Command::Input('\u{1b}'));
 
     let buffer = render_app(&app, 100, 30);
 
@@ -307,14 +347,15 @@ fn compact_header_keeps_selection_and_buffer_visible() {
 }
 
 #[test]
-fn compact_help_uses_readable_fullscreen_summary() {
+fn compact_help_shows_live_bindings_and_close_key() {
     let mut app = App::for_test();
     app.apply(Command::OpenHelp);
 
     let buffer = render_app(&app, 40, 10);
 
-    assert!(buffer.contains("Ops:"));
-    assert!(buffer.contains("Exit:"));
+    assert!(buffer.contains("Help: files"));
+    assert!(buffer.contains("copy"));
+    assert!(buffer.contains("Esc"));
 }
 
 #[test]
@@ -382,11 +423,22 @@ fn file_rows_truncate_long_names_in_narrow_layout() {
 #[test]
 fn file_rows_truncate_wide_unicode_names_by_display_width() {
     let dir = tempfile::tempdir().unwrap();
-    let wide_name = format!("{}.txt", "界".repeat(12));
+    // Longer than the actual name column, independently of the platform's temp path.
+    let wide_name = format!("{}.txt", "界".repeat(24));
     std::fs::write(dir.path().join(wide_name), "x").unwrap();
     let app = App::new(dir.path().to_path_buf()).unwrap();
 
-    let buffer = render_app(&app, 50, 10);
-
-    assert!(buffer.contains("..."));
+    let mut terminal = Terminal::new(TestBackend::new(50, 10)).unwrap();
+    terminal.draw(|frame| draw(frame, &app)).unwrap();
+    let row = terminal
+        .backend()
+        .buffer()
+        .content()
+        .chunks(50)
+        .find(|row| row.iter().any(|cell| cell.symbol() == "界"))
+        .expect("file row is visible");
+    let text = row.iter().map(|cell| cell.symbol()).collect::<String>();
+    assert!(text.contains("..."), "filename itself must be truncated");
+    assert!(row.iter().filter(|cell| cell.symbol() == "界").count() < 24);
+    assert_eq!(row.last().unwrap().symbol(), "|");
 }
