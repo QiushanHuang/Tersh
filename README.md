@@ -65,13 +65,12 @@ run on the host where that workbench is running.
 <summary>How it fits alongside other tools</summary>
 
 Shell commands remain a strong choice for scripts and repeatable automation.
-[Yazi](https://yazi-rs.github.io/features/) offers a broader file-preview and plugin
+[Yazi](https://yazi-rs.github.io/features/) offers a rich file-preview and plugin
 ecosystem; [btop](https://github.com/aristocratos/btop) focuses on detailed system
-resource monitoring. Tersh focuses on the path from host selection to file
-inspection, controlled operations and recovery. These are workflow tradeoffs,
-not claims that Tersh is universally faster or more feature-complete. Directory
-listing and preview reads are still synchronous; cancellation preserves completed
-work rather than undoing it.
+resource monitoring. Tersh connects host selection, file inspection, operations,
+results and recovery in one familiar terminal workflow. Use it for everyday
+checks and file organization, and keep these tools alongside it for automation,
+additional previews or deeper resource analysis.
 
 </details>
 
@@ -134,22 +133,20 @@ Tersh uses `$VISUAL`, `$EDITOR`, then `nano` for editing. For a visual `cd`, sou
 
 ## File jobs and recovery
 
-Copy, move, trash, permanent delete and restore run in one background worker.
-Browsing remains available while a job runs; overlapping writes are refused.
-`J` shows progress, completed items, failures, skips and remaining work.
+File jobs such as copying and moving run in the background while you continue
+browsing. Press `J` to see progress and find out which items finished or need
+attention. Use Ctrl+X when you need to stop a job. Tersh runs one file job at a
+time to keep its progress and results easy to follow.
 
-Cancellation keeps completed items and removes this copy's incomplete output.
-Replacement copies are staged before commit; existing directories cannot be
-replaced. Delayed operations recheck the source and approved target identities.
-Ctrl+C during a job requests cancellation and waits for cleanup before exiting.
-A blocked filesystem syscall cannot be interrupted, and completed deletion
-cannot be undone.
+For everyday cleanup, use `d` to move items to trash and `u` to browse recovery
+records. Select an item, review its original location and confirm the restore.
+If that location already contains an item with the same name, Tersh reports the
+conflict so you can handle the existing file first. Records remain available
+when you reopen Tersh in the same work directory.
 
-`u` opens the current work root's managed trash. Enter shows the original
-location before restoring. Existing destinations are never overwritten. Bad
-receipts are reported while other valid records remain available. Recovery
-works across restarts, requires same-filesystem rename and recorded UTF-8 paths;
-legacy unrecorded trash remains untouched.
+Copy conflicts offer skip or confirmed file replacement, and permanent deletion
+requires a typed confirmation. See [configuration](docs/configuration.md#file-operation-boundaries)
+for detailed file-operation and recovery behavior.
 
 ## Hosts and trends
 
@@ -171,14 +168,13 @@ non-interactive SSH with already trusted host keys and existing credentials.
 | Expand detail / scroll detail | `l` · PageUp/PageDown |
 | Open shell or SSH / open Tersh | `s` · `t` |
 
-Filtering and sorting change the view, not the probe scope. Selection follows
-the host alias; unknown metrics stay last in either sort direction. Remote `t`
-requires Tersh on that host. Returning from the session restores the dashboard.
+Use filtering and sorting to find the hosts you care about while health checks
+continue across your inventory. Install Tersh on a remote host, press `t` to open
+its file workbench, and return to the dashboard when you finish.
 
-History keeps at most 60 observations per host in memory. Gaps mean missing or
-failed observations. Load is the 1-minute load average, memory is used percent,
-and probe duration covers the full collection operation. Samples are spaced by
-observation, with the actual elapsed span shown. No extra probe is run for a graph.
+See the latest 60 observations for each host to follow changes in load, memory,
+storage and probe duration. Graphs show the elapsed span and gaps for missing
+data, reusing existing probe results to keep monitoring lightweight.
 
 ## Make it yours
 
@@ -191,8 +187,8 @@ tersh --keymap keymap.json
 ```
 
 Themes: `btop`, `aurora`, `contrast`, `mono`. `NO_COLOR` disables colors.
-Device presets choose border, graph glyphs, footer density and motion without
-changing bindings or writing configuration files.
+Use the desktop, mobile and SSH presets to quickly choose borders, graph glyphs,
+shortcut density and motion that suit your current terminal.
 
 Custom bindings use a partial JSON map:
 
@@ -224,7 +220,7 @@ python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 
 Maintained by [QiushanHuang](https://github.com/QiushanHuang).
 See [contributors and attribution](CONTRIBUTORS.md). Tersh is licensed under the
-[MIT License](LICENSE); the existing copyright notice is preserved.
+[MIT License](LICENSE).
 
 ---
 
@@ -279,11 +275,11 @@ Tersh 就是为这类工作准备的。** 它的优势在于把文件工作台�
 <summary>与其他工具如何搭配、各自适合什么</summary>
 
 脚本和重复自动化仍适合直接用 shell 命令。
-[Yazi](https://yazi-rs.github.io/features/) 提供更丰富的文件预览与插件生态，
+[Yazi](https://yazi-rs.github.io/features/) 提供丰富的文件预览与插件生态，
 [btop](https://github.com/aristocratos/btop) 专注于详细的系统资源监控。
-Tersh 聚焦“选主机 → 检查文件 → 有明确反馈的操作 → 必要时恢复”这条工作路径。
-这里比较的是使用侧重点，没有宣称 Tersh 在速度或功能数量上全面领先。
-目录枚举和预览读取目前仍是同步的；取消保留已完成操作，不等于撤销。
+Tersh 把“选主机 → 检查文件 → 执行操作 → 查看结果与恢复”串成一条连贯的工作路径。
+日常检查和整理文件时，你可以在熟悉的终端里完成这些步骤，减少来回切换和重复输入；
+需要编写自动化脚本、扩展预览或深入分析资源时，也可以继续搭配这些工具使用。
 
 </details>
 
@@ -346,18 +342,17 @@ tersh --ui-profile ssh
 
 ### 后台任务与恢复
 
-复制、移动、回收站、永久删除和恢复由单个后台线程执行。运行期间仍能浏览，
-新的写操作会被拒绝，直到当前任务结束。`J` 显示进度及完成、失败、跳过、剩余项目。
+复制、移动等文件任务在后台进行，你可以继续浏览和查找文件。
+按 `J` 查看进度，了解哪些项目已经完成、哪些需要处理；需要中途停止时，按 Ctrl+X。
+Tersh 每次执行一项文件任务，让进度和结果更容易跟踪。
 
-取消保留已经完成的操作，并清理本次未完成的复制。替换先完成暂存再提交，
-不允许覆盖已有目录；延迟执行前会重新检查源文件和已确认目标的身份。
-任务期间 Ctrl+C 会请求取消、等待清理后退出。协作取消无法中断阻塞的系统调用，
-也不能撤销已经完成的永久删除。
+整理文件时，可以先用 `d` 移入回收站，之后按 `u` 查看记录。
+选择一项后，Tersh 会显示它的原位置，确认后即可恢复。
+如果原位置已有同名项目，界面会提示冲突，方便你先处理现有文件。
+关闭应用后，回到同一工作目录仍可查看这些恢复记录。
 
-`u` 打开当前工作根目录的回收站记录，Enter 在显示原位置后确认恢复。
-同名目标不会覆盖；损坏记录会跳过并提示，其他有效记录仍可使用。
-恢复记录跨重启保留，要求同一文件系统内重命名和可记录的 UTF-8 路径。
-旧版没有原位置记录的垃圾文件不会被猜测或改动。
+同名文件复制时可选择跳过或确认替换，永久删除需要输入确认词。
+更多文件处理与恢复规则见[配置说明](docs/configuration.md#file-operation-boundaries)。
 
 ### 主机与趋势
 
@@ -378,12 +373,11 @@ tersh --c --cluster-config examples/servers.json
 | 展开详情 / 滚动详情 | `l` · PageUp/PageDown |
 | 打开 shell/SSH / 打开远端 Tersh | `s` · `t` |
 
-筛选排序只改变视图，不改变完整清单的探测范围。选择按主机别名保留；
-未知指标在正反排序中都放在末尾。远端 `t` 要求目标已安装 Tersh，退出后返回主机面板。
+用筛选和排序快速找到关注的主机，完整清单的健康检查会继续进行。
+在目标主机安装 Tersh 后，按 `t` 即可进入它的文件工作台，退出后回到主机面板。
 
-每台主机最多在内存保留 60 次观测。缺口表示失败或缺失；CPU load 是 1 分钟负载，
-内存统一为已用百分比，Probe 包含整个探测过程的耗时。横向按观测顺序排列并标明实际时间跨度，
-不会为了画图增加探测。
+每台主机展示最近 60 次观测，帮助你快速了解负载、内存、磁盘和探测耗时的变化。
+图中标明时间跨度，并用缺口区分缺失数据；趋势直接使用已有探测结果，保持轻量。
 
 ### 配色与键位
 
@@ -396,7 +390,7 @@ tersh --keymap keymap.json
 ```
 
 主题包括 `btop`、`aurora`、`contrast`、`mono`；`NO_COLOR` 关闭颜色。
-桌面、移动端、SSH 预设调整边框、图形字符、提示密度和动效，不改按键，也不写入配置。
+通过桌面、移动端、SSH 预设，可以快速选择适合当前设备的边框、图形字符、提示密度和动效。
 
 自定义键位只需覆盖需要的部分：
 
@@ -426,4 +420,4 @@ python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 [v1.2.0 说明](docs/releases/v1.2.0.md)
 
 维护者：[QiushanHuang](https://github.com/QiushanHuang)。
-贡献署名见 [CONTRIBUTORS.md](CONTRIBUTORS.md)。采用 [MIT 许可](LICENSE)，保留原有版权声明。
+贡献署名见 [CONTRIBUTORS.md](CONTRIBUTORS.md)。采用 [MIT 许可](LICENSE)。
