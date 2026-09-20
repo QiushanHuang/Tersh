@@ -1888,8 +1888,7 @@ fn drain_probe_pipe(
         };
         if bytes.len().saturating_add(read) > MAX_PROBE_OUTPUT_BYTES as usize {
             anyhow::bail!(
-                "probe output too large: {stream} exceeded {} bytes",
-                MAX_PROBE_OUTPUT_BYTES
+                "probe output too large: {stream} exceeded {MAX_PROBE_OUTPUT_BYTES} bytes"
             );
         }
         bytes.extend_from_slice(&buffer[..read]);
