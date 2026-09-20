@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-No unreleased changes.
+- Stabilize the Python CI process-readiness fixture with atomic PID publication; no runtime behavior changes.
 
 ## v1.2.0 - 2026-09-20
 
