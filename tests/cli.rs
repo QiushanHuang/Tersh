@@ -2,7 +2,7 @@ use std::process::Command;
 
 #[test]
 fn help_separates_product_name_from_cli_tool_name() {
-    let binary = std::env::var("CARGO_BIN_EXE_tersh").expect("tersh binary target exists");
+    let binary = env!("CARGO_BIN_EXE_tersh");
     let output = Command::new(binary)
         .arg("--help")
         .output()
@@ -18,7 +18,7 @@ fn help_separates_product_name_from_cli_tool_name() {
 
 #[test]
 fn help_documents_print_cwd_for_shell_cd_wrappers() {
-    let binary = std::env::var("CARGO_BIN_EXE_tersh").expect("tersh binary target exists");
+    let binary = env!("CARGO_BIN_EXE_tersh");
     let output = Command::new(binary)
         .arg("--help")
         .output()
@@ -33,7 +33,7 @@ fn help_documents_print_cwd_for_shell_cd_wrappers() {
 
 #[test]
 fn help_documents_cluster_status_manager_flag() {
-    let binary = std::env::var("CARGO_BIN_EXE_tersh").expect("tersh binary target exists");
+    let binary = env!("CARGO_BIN_EXE_tersh");
     let output = Command::new(binary)
         .arg("--help")
         .output()
@@ -51,7 +51,7 @@ fn help_documents_cluster_status_manager_flag() {
 
 #[test]
 fn cluster_long_alias_keeps_existing_cluster_mode_contracts() {
-    let binary = std::env::var("CARGO_BIN_EXE_tersh").expect("tersh binary target exists");
+    let binary = env!("CARGO_BIN_EXE_tersh");
     let output = Command::new(binary)
         .args(["--cluster", "--print-cwd"])
         .output()
@@ -65,7 +65,7 @@ fn cluster_long_alias_keeps_existing_cluster_mode_contracts() {
 
 #[test]
 fn version_reports_minor_release() {
-    let binary = std::env::var("CARGO_BIN_EXE_tersh").expect("tersh binary target exists");
+    let binary = env!("CARGO_BIN_EXE_tersh");
     let output = Command::new(binary)
         .arg("--version")
         .output()
@@ -79,7 +79,7 @@ fn version_reports_minor_release() {
 
 #[test]
 fn cluster_status_conflicts_with_print_cwd_wrapper_mode() {
-    let binary = std::env::var("CARGO_BIN_EXE_tersh").expect("tersh binary target exists");
+    let binary = env!("CARGO_BIN_EXE_tersh");
     let output = Command::new(binary)
         .args(["--c", "--print-cwd"])
         .output()
@@ -93,7 +93,7 @@ fn cluster_status_conflicts_with_print_cwd_wrapper_mode() {
 
 #[test]
 fn cluster_status_conflicts_with_file_workbench_path_argument() {
-    let binary = std::env::var("CARGO_BIN_EXE_tersh").expect("tersh binary target exists");
+    let binary = env!("CARGO_BIN_EXE_tersh");
     let output = Command::new(binary)
         .args(["--c", "/tmp"])
         .output()
