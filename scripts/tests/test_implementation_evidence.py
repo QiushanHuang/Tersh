@@ -1236,7 +1236,10 @@ class ImplementationEvidenceTests(unittest.TestCase):
             def ignore_term(signum, frame):
                 term_marker.write_bytes(b"TERM")
             signal.signal(signal.SIGTERM, ignore_term)
-            pid_file.write_text(str(os.getpid()), encoding="ascii")
+            # Publish readiness only after the complete PID is available.
+            pending_pid = pid_file.with_suffix(".pending")
+            pending_pid.write_text(str(os.getpid()), encoding="ascii")
+            pending_pid.replace(pid_file)
             while True:
                 time.sleep(1)
             """
