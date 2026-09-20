@@ -34,7 +34,10 @@ fn main() {
         .unwrap_or("target/ui-gallery".into());
     let out = Path::new(&out);
     fs::create_dir_all(out).unwrap();
-    let fixture = tempfile::tempdir().unwrap();
+    let fixture = tempfile::Builder::new()
+        .prefix("tersh-demo-")
+        .tempdir_in("/tmp")
+        .unwrap();
     for name in ["analysis", "logs", "results"] {
         fs::create_dir(fixture.path().join(name)).unwrap();
     }
@@ -54,6 +57,7 @@ fn main() {
     app.handle_command(Command::ToggleSelect);
     app.handle_command(Command::Copy);
     for (name, w, h) in [
+        ("readme-workbench", 120, 28),
         ("workbench-wide", 160, 38),
         ("workbench-tablet", 100, 28),
         ("workbench-phone", 40, 18),
@@ -130,6 +134,9 @@ fn main() {
         tersh::cluster_ui::draw(f, &cluster)
     });
     cluster.apply(ClusterCommand::OpenDetail);
+    export("readme-cluster", 100, 34, out, |f| {
+        tersh::cluster_ui::draw(f, &cluster)
+    });
     export("cluster-trends", 100, 38, out, |f| {
         tersh::cluster_ui::draw(f, &cluster)
     });

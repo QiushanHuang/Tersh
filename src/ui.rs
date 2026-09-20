@@ -1,7 +1,10 @@
 use crate::{
     app::{App, Mode},
     fs_core::{FileKind, display_path, escape_display, format_size},
-    theme::{Theme, base_block, chip, footer_compact, footer_height, footer_rows, panel_title},
+    theme::{
+        Theme, Tone, base_block, chip, footer_compact, footer_height, footer_rows, kv_line,
+        modal_block, panel_block, panel_title, section_line,
+    },
 };
 use ratatui::{
     Frame,
@@ -321,12 +324,7 @@ fn draw_files(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
             app.sort_label()
         )
     };
-    let paragraph = Paragraph::new(lines).block(
-        base_block()
-            .title(panel_title(theme, title))
-            .border_style(theme.fg(palette.accent))
-            .borders(Borders::ALL),
-    );
+    let paragraph = Paragraph::new(lines).block(panel_block(theme, title, Tone::Active));
     frame.render_widget(paragraph, area);
 }
 
@@ -389,11 +387,7 @@ fn draw_fullscreen_preview(frame: &mut Frame, area: Rect, app: &App, theme: Them
     }
 
     let paragraph = Paragraph::new(rendered)
-        .block(
-            base_block()
-                .title(panel_title(theme, "Preview"))
-                .borders(Borders::ALL),
-        )
+        .block(panel_block(theme, "Preview", Tone::Active))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
@@ -446,11 +440,7 @@ fn draw_preview(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
     ))];
     lines.extend(app.preview().lines.iter().cloned().map(Line::from));
     let paragraph = Paragraph::new(lines)
-        .block(
-            base_block()
-                .title(panel_title(theme, "Preview"))
-                .borders(Borders::ALL),
-        )
+        .block(panel_block(theme, "Preview", Tone::Inactive))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
@@ -513,11 +503,7 @@ fn draw_info(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
         )));
     }
     let paragraph = Paragraph::new(lines)
-        .block(
-            base_block()
-                .title(panel_title(theme, "Inspector"))
-                .borders(Borders::ALL),
-        )
+        .block(panel_block(theme, "Inspector", Tone::Inactive))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
@@ -528,20 +514,16 @@ fn draw_compact_info(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
         .map(|entry| format!("{} {}", entry.kind_marker(), entry.name))
         .unwrap_or_else(|| "no item".to_string());
     let text = format!(
-        "{target} | selected {} | copy {}",
+        "{target} | selected {} | buf {}",
         app.selected_len(),
-        app.copy_buffer_len()
+        app.copy_buffer_label()
     );
     let paragraph = Paragraph::new(truncate_display_width(
         &text,
         area.width.saturating_sub(2) as usize,
     ))
     .style(theme.fg(theme.palette().muted))
-    .block(
-        base_block()
-            .title(panel_title(theme, "Status"))
-            .borders(Borders::ALL),
-    );
+    .block(panel_block(theme, "Status", Tone::Inactive));
     frame.render_widget(paragraph, area);
 }
 
@@ -870,26 +852,21 @@ fn draw_help(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
         .collect::<Vec<_>>();
     let paragraph = Paragraph::new(lines)
         .scroll((app.help_offset().min(u16::MAX as usize) as u16, 0))
-        .block(
-            base_block()
-                .title(panel_title(
-                    theme,
-                    format!(
-                        "Help: {} | {} close",
-                        app.help_context(),
-                        action_key(app, "help", "cancel")
-                    ),
-                ))
-                .borders(Borders::ALL)
-                .border_style(theme.fg(theme.palette().panel_title)),
-        )
+        .block(panel_block(
+            theme,
+            format!(
+                "Help: {} | {} close",
+                app.help_context(),
+                action_key(app, "help", "cancel")
+            ),
+            Tone::Active,
+        ))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
 
 fn draw_input_modal(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
     frame.render_widget(Clear, area);
-    let palette = theme.palette();
     let prompt = match app.mode() {
         Mode::Filter => "Filter current directory",
         Mode::Goto => "Go to directory",
@@ -935,14 +912,12 @@ fn draw_input_modal(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
             _ => "",
         };
         lines.push(Line::from(format!("required: {required}")));
-        lines.push(Line::from(format!(
-            "typed: {}",
-            if app.input().is_empty() {
-                "-"
-            } else {
-                app.input()
-            }
-        )));
+        let typed = if app.input().is_empty() {
+            "-".to_string()
+        } else {
+            escape_display(app.input())
+        };
+        lines.push(Line::from(format!("typed: {typed}")));
         lines.push(Line::from(format!(
             "targets: {} {}",
             app.operation_target_count(),
@@ -983,42 +958,15 @@ fn draw_input_modal(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
         _ => "Command",
     };
     let block = match app.mode() {
-        Mode::ConfirmDelete => base_block()
-            .title(panel_title(theme, title))
-            .borders(Borders::ALL)
-            .border_style(theme.border_danger())
-            .style(theme.danger()),
-        Mode::ConfirmTrash => base_block()
-            .title(panel_title(theme, title))
-            .borders(Borders::ALL)
-            .border_style(theme.fg(palette.warn)),
-        Mode::Conflict => base_block()
-            .title(panel_title(theme, title))
-            .borders(Borders::ALL)
-            .border_style(theme.fg(palette.warn)),
-        _ => base_block()
-            .title(panel_title(theme, title))
-            .borders(Borders::ALL),
+        Mode::ConfirmDelete => modal_block(theme, title, Tone::Danger).style(theme.danger()),
+        Mode::ConfirmTrash => modal_block(theme, title, Tone::Warn),
+        Mode::Conflict => modal_block(theme, title, Tone::Warn),
+        _ => modal_block(theme, title, Tone::Active),
     };
     let paragraph = Paragraph::new(lines)
         .block(block)
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
-}
-
-fn section_line(theme: Theme, label: &'static str) -> Line<'static> {
-    Line::from(Span::styled(
-        label,
-        theme.fg_bold(theme.palette().panel_title),
-    ))
-}
-
-fn kv_line(theme: Theme, key: &'static str, value: impl Into<String>) -> Line<'static> {
-    let palette = theme.palette();
-    Line::from(vec![
-        Span::styled(format!("{key}: "), theme.fg(palette.key)),
-        Span::styled(value.into(), theme.fg(palette.value)),
-    ])
 }
 
 fn buffer_style(theme: Theme, label: &str) -> Style {

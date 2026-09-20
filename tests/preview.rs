@@ -27,6 +27,20 @@ fn binary_preview_never_emits_raw_control_bytes() {
 }
 
 #[test]
+fn binary_preview_detects_control_bytes_after_initial_probe_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("late-bin.dat");
+    let mut bytes = vec![b'a'; 70 * 1024];
+    bytes.push(0);
+    std::fs::write(&path, bytes).unwrap();
+
+    let preview = preview_file(&path).unwrap();
+
+    assert_eq!(preview.kind, PreviewKind::Binary);
+    assert!(preview.lines.join("\n").contains("Binary file"));
+}
+
+#[test]
 fn long_unicode_lines_truncate_without_panicking() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("unicode.txt");

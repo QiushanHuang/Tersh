@@ -293,6 +293,69 @@ fn cut_paste_retains_failed_cut_items_for_retry() {
     assert_eq!(app.copy_buffer_len(), 1);
 }
 
+#[test]
+fn paste_skips_source_replaced_after_copy_buffer_capture() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let target_dir = tempfile::tempdir().unwrap();
+    let source = source_dir.path().join("item.txt");
+    std::fs::write(&source, "original").unwrap();
+    let mut app = App::new(source_dir.path().to_path_buf()).unwrap();
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    std::fs::remove_file(&source).unwrap();
+    std::fs::write(&source, "replacement").unwrap();
+    app.force_cwd_for_test(target_dir.path().to_path_buf());
+    app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+
+    wait_for_job(&mut app);
+    assert!(!target_dir.path().join("item.txt").exists());
+    assert!(app.logs().iter().any(|log| log.contains("changed")));
+}
+
+#[test]
+fn copy_to_skips_source_replaced_while_destination_prompt_is_open() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let target_dir = tempfile::tempdir().unwrap();
+    let source = source_dir.path().join("item.txt");
+    std::fs::write(&source, "original").unwrap();
+    let mut app = App::new(source_dir.path().to_path_buf()).unwrap();
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+    std::fs::remove_file(&source).unwrap();
+    std::fs::write(&source, "replacement").unwrap();
+    for ch in target_dir.path().to_string_lossy().chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+    }
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    wait_for_job(&mut app);
+    assert!(!target_dir.path().join("item.txt").exists());
+    assert!(app.logs().iter().any(|log| log.contains("changed")));
+}
+
+#[test]
+fn move_to_skips_source_replaced_while_destination_prompt_is_open() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let target_dir = tempfile::tempdir().unwrap();
+    let source = source_dir.path().join("item.txt");
+    std::fs::write(&source, "original").unwrap();
+    let mut app = App::new(source_dir.path().to_path_buf()).unwrap();
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+    std::fs::remove_file(&source).unwrap();
+    std::fs::write(&source, "replacement").unwrap();
+    for ch in target_dir.path().to_string_lossy().chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+    }
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    wait_for_job(&mut app);
+    assert!(!target_dir.path().join("item.txt").exists());
+    assert!(source.exists());
+    assert!(app.logs().iter().any(|log| log.contains("changed")));
+}
+
 fn restore_env(name: &str, value: Option<std::ffi::OsString>) {
     unsafe {
         if let Some(value) = value {
@@ -494,6 +557,33 @@ fn yy_paste_existing_target_replace_overwrites() {
 }
 
 #[test]
+fn copy_replace_skips_target_replaced_while_conflict_prompt_is_open() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let target_dir = tempfile::tempdir().unwrap();
+    let source = source_dir.path().join("item.txt");
+    let target = target_dir.path().join("item.txt");
+    std::fs::write(&source, "new").unwrap();
+    std::fs::write(&target, "old").unwrap();
+    let mut app = App::new(source_dir.path().to_path_buf()).unwrap();
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    app.force_cwd_for_test(target_dir.path().to_path_buf());
+    app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+    assert_eq!(app.mode(), Mode::Conflict);
+
+    std::fs::write(&target, "changed").unwrap();
+    for ch in "replace".chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+    }
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "changed");
+    wait_for_job(&mut app);
+    assert!(app.logs().iter().any(|log| log.contains("changed")));
+}
+
+#[test]
 fn yy_paste_existing_target_skip_preserves_existing() {
     let source_dir = tempfile::tempdir().unwrap();
     let target_dir = tempfile::tempdir().unwrap();
@@ -625,4 +715,29 @@ fn copy_to_existing_target_enters_conflict_mode_and_replace_overwrites() {
         std::fs::read_to_string(target_dir.path().join("copy.txt")).unwrap(),
         "new"
     );
+}
+
+#[test]
+fn destructive_confirmation_keeps_replaced_source_untouched() {
+    for (command, confirmation) in [
+        (Command::Trash, "trash"),
+        (Command::PermanentDelete, "delete"),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("item.txt");
+        std::fs::write(&source, "original").unwrap();
+        let mut app = App::new(root.path().into()).unwrap();
+        app.handle_command(command);
+        std::fs::rename(&source, root.path().join("original-retained")).unwrap();
+        std::fs::write(&source, "replacement").unwrap();
+        for ch in confirmation.chars() {
+            app.handle_command(Command::Input(ch));
+        }
+        app.handle_command(Command::Submit);
+        wait_for_job(&mut app);
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), "replacement");
+        assert!(root.path().join("original-retained").exists());
+        assert_eq!(app.last_job().unwrap().failed.len(), 1);
+        assert!(app.last_job().unwrap().failed[0].error.contains("changed"));
+    }
 }

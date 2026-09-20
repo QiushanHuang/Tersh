@@ -67,27 +67,35 @@ fn replace_path(
     target: &Path,
     observer: &mut dyn FnMut(&Path, u64) -> Result<()>,
 ) -> Result<()> {
-    let target_identity = capture_path_identity(target)?;
+    let target_metadata = fs::symlink_metadata(target)?;
+    let target_identity = FileIdentity::from_metadata(&target_metadata);
+    if target_metadata.is_dir() && !target_metadata.file_type().is_symlink() {
+        bail!("refusing to replace directory: {}", target.display());
+    }
     let temp = temp_sibling_path(target)?;
+    // Failed copies already clean only their own output. A second unconditional
+    // cleanup here could remove an unrelated replacement at the staging path.
+    copy_path_no_replace(source, &temp, observer)?;
+    let temp_identity = capture_path_identity(&temp)?;
     let staged = (|| {
-        copy_path_no_replace(source, &temp, observer)?;
         observer(source, 0)?;
+        ensure_path_identity(&temp, &temp_identity)?;
         ensure_path_identity(target, &target_identity)
     })();
     if let Err(err) = staged {
-        let _ = remove_copy_output(&temp);
+        remove_copy_output_if_identity_matches(&temp, &temp_identity);
         return Err(err);
     }
     // Commit is one non-cancellable section. Keep the old target until the new
     // complete copy is installed, with a no-clobber rollback if installation fails.
     let backup = temp_sibling_path(target)?;
     if let Err(err) = rename_no_replace(target, &backup) {
-        let _ = remove_copy_output(&temp);
+        remove_copy_output_if_identity_matches(&temp, &temp_identity);
         return Err(err).context("failed to preserve replacement target");
     }
     if let Err(err) = rename_no_replace(&temp, target) {
         let rollback = rename_no_replace(&backup, target);
-        let _ = remove_copy_output(&temp);
+        remove_copy_output_if_identity_matches(&temp, &temp_identity);
         return match rollback {
             Ok(()) => Err(err).context("failed to install replacement; original restored"),
             Err(rollback) => Err(anyhow!(
@@ -203,11 +211,17 @@ fn copy_regular_file(
     if FileIdentity::from_metadata(&opened_metadata) != *identity {
         bail!("source changed during copy: {}", source.display());
     }
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
+    let mut output_options = OpenOptions::new();
+    output_options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        output_options.mode(metadata.permissions().mode() & 0o7777);
+    }
+    let mut output = output_options
         .open(target)
         .with_context(|| format!("failed to create {}", target.display()))?;
+    let target_identity = FileIdentity::from_metadata(&output.metadata()?);
     let copied = (|| {
         let mut buffer = [0_u8; 128 * 1024];
         loop {
@@ -224,7 +238,7 @@ fn copy_regular_file(
     })();
     if let Err(err) = copied {
         drop(output);
-        let _ = fs::remove_file(target);
+        remove_copy_output_if_identity_matches(target, &target_identity);
         return Err(err);
     }
     fs::set_permissions(target, metadata.permissions()).ok();
@@ -241,6 +255,7 @@ fn copy_dir_recursive(
     create_parent_dir(target)?;
     fs::create_dir(target)
         .with_context(|| format!("failed to create directory {}", target.display()))?;
+    let target_identity = capture_path_identity(target)?;
     let result = (|| {
         ensure_path_identity(source, identity)?;
         for entry in fs::read_dir(source)? {
@@ -254,7 +269,7 @@ fn copy_dir_recursive(
         Ok(())
     })();
     if result.is_err() {
-        let _ = remove_copy_output(target);
+        remove_copy_output_if_identity_matches(target, &target_identity);
     } else {
         fs::set_permissions(target, metadata.permissions()).ok();
     }
@@ -324,6 +339,20 @@ impl FileIdentity {
             ino: metadata.ino(),
         }
     }
+
+    fn same_path_object(&self, other: &Self) -> bool {
+        let same_kind = self.is_dir == other.is_dir
+            && self.is_file == other.is_file
+            && self.is_symlink == other.is_symlink;
+        #[cfg(unix)]
+        {
+            same_kind && self.dev == other.dev && self.ino == other.ino
+        }
+        #[cfg(not(unix))]
+        {
+            same_kind
+        }
+    }
 }
 
 pub(crate) fn capture_path_identity(path: &Path) -> Result<FileIdentity> {
@@ -342,14 +371,7 @@ pub(crate) fn ensure_path_identity(path: &Path, expected: &FileIdentity) -> Resu
 
 pub(crate) fn ensure_same_object(path: &Path, expected: &FileIdentity) -> Result<()> {
     let actual = capture_path_identity(path)?;
-    #[cfg(unix)]
-    let same = actual.dev == expected.dev
-        && actual.ino == expected.ino
-        && actual.is_dir == expected.is_dir
-        && actual.is_symlink == expected.is_symlink;
-    #[cfg(not(unix))]
-    let same = actual.is_dir == expected.is_dir && actual.is_symlink == expected.is_symlink;
-    if !same {
+    if !expected.same_path_object(&actual) {
         bail!("path changed during operation: {}", path.display());
     }
     Ok(())
@@ -366,7 +388,7 @@ pub fn permanent_delete_cancellable(
     ensure_path_identity(path, &guarded.identity)?;
     #[cfg(unix)]
     {
-        delete_unix_cancellable(path, &guarded.identity, observer)
+        delete_unix_cancellable(path, &guarded.identity, observer, false)
     }
     #[cfg(not(unix))]
     {
@@ -406,6 +428,7 @@ fn delete_unix_cancellable(
     path: &Path,
     identity: &FileIdentity,
     observer: &mut dyn FnMut(&Path, u64) -> Result<()>,
+    make_writable: bool,
 ) -> Result<()> {
     use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
     let parent = path
@@ -429,6 +452,7 @@ fn delete_unix_cancellable(
         path,
         Some(identity),
         observer,
+        make_writable,
     )
 }
 
@@ -439,6 +463,7 @@ fn delete_at(
     display: &Path,
     expected: Option<&FileIdentity>,
     observer: &mut dyn FnMut(&Path, u64) -> Result<()>,
+    make_writable: bool,
 ) -> Result<()> {
     use std::os::{
         fd::{AsRawFd, FromRawFd},
@@ -446,10 +471,14 @@ fn delete_at(
     };
     observer(display, 0)?;
     let before = stat_at(parent, name)?;
-    if let Some(expected) = expected {
-        if before.st_dev as u64 != expected.dev || before.st_ino != expected.ino {
-            bail!("delete target changed while opening");
-        }
+    #[cfg(test)]
+    if make_writable {
+        cleanup_race_hook(display);
+    }
+    if let Some(expected) = expected
+        && (before.st_dev as u64 != expected.dev || before.st_ino != expected.ino)
+    {
+        bail!("delete target changed while opening");
     }
     if before.st_mode & libc::S_IFMT == libc::S_IFDIR {
         let raw = unsafe {
@@ -466,6 +495,15 @@ fn delete_at(
         let opened = FileIdentity::from_metadata(&directory.metadata()?);
         if opened.dev != before.st_dev as u64 || opened.ino != before.st_ino {
             bail!("directory changed while opening: {}", display.display());
+        }
+        // Cleanup may need to remove children of a copied read-only directory.
+        // Apply permissions only through the verified descriptor: chmod(path)
+        // can follow a symlink swapped in after the identity inspection.
+        if make_writable
+            && unsafe { libc::fchmod(directory.as_raw_fd(), (before.st_mode & 0o7777) | 0o700) }
+                != 0
+        {
+            return Err(io::Error::last_os_error().into());
         }
         let duplicate = unsafe { libc::dup(directory.as_raw_fd()) };
         if duplicate < 0 {
@@ -518,6 +556,7 @@ fn delete_at(
                 &child_display,
                 None,
                 observer,
+                make_writable,
             )?;
         }
         observer(display, 0)?;
@@ -593,7 +632,7 @@ fn open_regular_source(path: &Path) -> Result<File> {
 
     OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
         .with_context(|| format!("failed to open {}", path.display()))
 }
@@ -623,19 +662,12 @@ fn symlink_target_is_dir_for_creation(source: &Path, link_target: &Path) -> Resu
     }
 }
 
-// Only use this for staging trees created by this copy. A completed child may
-// already have inherited read-only source permissions when a later step aborts.
+// Non-Unix platforms lack the descriptor-relative cleanup primitive below.
+// Keep their conservative symlink-aware fallback without changing permissions.
+#[cfg(not(unix))]
 fn remove_copy_output(path: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.is_dir() && !metadata.file_type().is_symlink() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(
-                path,
-                fs::Permissions::from_mode(metadata.permissions().mode() | 0o700),
-            )?;
-        }
         for child in fs::read_dir(path)? {
             remove_copy_output(&child?.path())?;
         }
@@ -654,6 +686,18 @@ fn remove_existing(path: &Path) -> Result<()> {
         fs::remove_file(path)?;
     }
     Ok(())
+}
+
+fn remove_copy_output_if_identity_matches(path: &Path, expected: &FileIdentity) {
+    // Only staging trees created by this copy may be made writable. Carry the
+    // original root identity into descriptor-relative traversal, and pin every
+    // descendant before touching its permissions or reading its children.
+    #[cfg(unix)]
+    let _ = delete_unix_cancellable(path, expected, &mut |_, _| Ok(()), true);
+    #[cfg(not(unix))]
+    if ensure_same_object(path, expected).is_ok() {
+        let _ = remove_copy_output(path);
+    }
 }
 
 pub(crate) struct GuardedDeleteTarget {
@@ -683,6 +727,9 @@ pub(crate) fn guard_delete_target(path: &Path, work_root: &Path) -> Result<Guard
         .with_context(|| format!("failed to resolve work root {}", work_root.display()))?;
     if target == work_root {
         bail!("refusing to delete active work root");
+    }
+    if work_root.starts_with(&target) {
+        bail!("refusing to delete ancestor of active work root");
     }
     let trash_root = work_root.join(".tersh-trash");
     if path == trash_root || path.starts_with(&trash_root) {
@@ -790,4 +837,76 @@ fn create_symlink(source: &Path, target: &Path, is_dir: bool) -> Result<()> {
         std::os::windows::fs::symlink_file(source, target)
     }
     .with_context(|| format!("failed to create symlink {}", target.display()))
+}
+
+#[cfg(test)]
+type CleanupRaceHook = Box<dyn FnMut(&Path)>;
+
+#[cfg(test)]
+thread_local! {
+    static CLEANUP_RACE_HOOK: std::cell::RefCell<Option<CleanupRaceHook>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn cleanup_race_hook(path: &Path) {
+    CLEANUP_RACE_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(path);
+        }
+    });
+}
+
+#[cfg(all(test, unix))]
+mod cleanup_tests {
+    use super::*;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    #[test]
+    fn cleanup_never_follows_staging_child_swapped_after_inspection() {
+        let root = tempfile::tempdir().unwrap();
+        let staging = root.path().join("staging");
+        let child = staging.join("child");
+        let displaced = root.path().join("displaced");
+        let outside = root.path().join("outside");
+        fs::create_dir_all(&child).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(child.join("copied"), "discard").unwrap();
+        let sentinel = outside.join("sentinel");
+        fs::write(&sentinel, "external precious bytes").unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o500)).unwrap();
+        fs::set_permissions(&sentinel, fs::Permissions::from_mode(0o400)).unwrap();
+        let identity = capture_path_identity(&staging).unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let attack_child = child.clone();
+        let attack_outside = outside.clone();
+        let attacker = std::thread::spawn(move || {
+            ready_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            fs::rename(&attack_child, &displaced).unwrap();
+            symlink(attack_outside, attack_child).unwrap();
+            done_tx.send(()).unwrap();
+        });
+        CLEANUP_RACE_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |path| {
+                if path == child {
+                    ready_tx.send(()).unwrap();
+                    done_rx
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                }
+            }));
+        });
+        remove_copy_output_if_identity_matches(&staging, &identity);
+        CLEANUP_RACE_HOOK.with(|hook| *hook.borrow_mut() = None);
+        attacker.join().unwrap();
+        let contents = fs::read_to_string(&sentinel);
+        let directory_mode = fs::metadata(&outside).unwrap().permissions().mode() & 0o777;
+        let file_mode = fs::metadata(&sentinel).map(|m| m.permissions().mode() & 0o777);
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(contents.ok().as_deref(), Some("external precious bytes"));
+        assert_eq!(directory_mode, 0o500);
+        assert_eq!(file_mode.unwrap(), 0o400);
+    }
 }

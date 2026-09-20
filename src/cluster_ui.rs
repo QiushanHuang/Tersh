@@ -1,6 +1,9 @@
 use crate::{
     cluster::{ClusterApp, ClusterMode, ConnectionState, HostKind, HostSnapshot},
-    theme::{Theme, base_block, chip, footer_compact, footer_height, footer_rows, panel_title},
+    theme::{
+        Theme, Tone, base_block, chip, footer_compact, footer_height, footer_rows, kv_line,
+        panel_block, panel_title, resource_bar, section_line,
+    },
 };
 use ratatui::{
     Frame,
@@ -25,7 +28,7 @@ pub fn draw(frame: &mut Frame, app: &ClusterApp) {
 
     draw_header(frame, rows[0], app, theme);
     if app.mode() == ClusterMode::Detail {
-        draw_dashboard(frame, rows[1], app, theme);
+        draw_dashboard(frame, rows[1], app, theme, true);
     } else {
         draw_body(frame, rows[1], app, theme);
     }
@@ -154,14 +157,14 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
             .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
             .split(area);
         draw_hosts(frame, columns[0], app, theme);
-        draw_dashboard(frame, columns[1], app, theme);
+        draw_dashboard(frame, columns[1], app, theme, false);
     } else if area.width >= 72 {
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
             .split(area);
         draw_hosts(frame, rows[0], app, theme);
-        draw_dashboard(frame, rows[1], app, theme);
+        draw_dashboard(frame, rows[1], app, theme, false);
     } else {
         draw_hosts(frame, area, app, theme);
     }
@@ -252,22 +255,17 @@ fn draw_hosts(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
             format!(" | /{}", crate::fs_core::escape_display(app.filter()))
         }
     );
-    let paragraph = Paragraph::new(lines).block(
-        base_block()
-            .title(panel_title(theme, title))
-            .border_style(theme.fg(theme.palette().accent))
-            .borders(Borders::ALL),
-    );
+    let paragraph = Paragraph::new(lines).block(panel_block(theme, title, Tone::Active));
     frame.render_widget(paragraph, area);
 }
 
-fn draw_dashboard(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
+fn draw_dashboard(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme, active: bool) {
     if app.mode() == ClusterMode::Detail && area.height < 14 {
-        draw_detail_panel(frame, area, app, theme);
+        draw_detail_panel(frame, area, app, theme, active);
         return;
     }
     if area.height < 14 {
-        draw_compact_dashboard(frame, area, app, theme);
+        draw_compact_dashboard(frame, area, app, theme, active);
         return;
     }
 
@@ -280,22 +278,25 @@ fn draw_dashboard(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme)
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(route_height), Constraint::Min(5)])
         .split(area);
-    draw_route(frame, rows[0], app, theme);
-    draw_detail_panel(frame, rows[1], app, theme);
+    draw_route(frame, rows[0], app, theme, active);
+    draw_detail_panel(frame, rows[1], app, theme, active);
 }
 
-fn draw_compact_dashboard(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
+fn draw_compact_dashboard(
+    frame: &mut Frame,
+    area: Rect,
+    app: &ClusterApp,
+    theme: Theme,
+    active: bool,
+) {
     let mut lines = match app.selected_host() {
         Some(host) => compact_route_lines(host, theme),
         None => vec![Line::from("No cluster hosts available"), Line::from("")],
     };
     lines.extend(compact_status_lines(app, theme));
 
-    let paragraph = Paragraph::new(lines).block(
-        base_block()
-            .title(panel_title(theme, "Route / Detail"))
-            .borders(Borders::ALL),
-    );
+    let tone = if active { Tone::Active } else { Tone::Inactive };
+    let paragraph = Paragraph::new(lines).block(panel_block(theme, "Route / Detail", tone));
     frame.render_widget(paragraph, area);
 }
 
@@ -399,16 +400,13 @@ fn compact_status_lines(app: &ClusterApp, theme: Theme) -> Vec<Line<'static>> {
     ]
 }
 
-fn draw_route(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
+fn draw_route(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme, active: bool) {
+    let tone = if active { Tone::Active } else { Tone::Inactive };
     let paragraph = Paragraph::new(match app.selected_host() {
         Some(host) => route_lines(host, theme),
         None => vec![Line::from("No route available")],
     })
-    .block(
-        base_block()
-            .title(panel_title(theme, "Route"))
-            .borders(Borders::ALL),
-    )
+    .block(panel_block(theme, "Route", tone))
     .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
@@ -463,7 +461,7 @@ fn route_lines(host: &crate::cluster::HostConfig, theme: Theme) -> Vec<Line<'sta
     }
 }
 
-fn draw_detail_panel(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
+fn draw_detail_panel(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme, active: bool) {
     let mut lines = detail_lines(app, true, theme);
     let trends = if app.mode() == ClusterMode::Detail
         && app
@@ -486,27 +484,22 @@ fn draw_detail_panel(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: The
         .saturating_sub(area.height.saturating_sub(2) as usize)
         .min(u16::MAX as usize) as u16;
     app.set_detail_limit(max_offset);
+    let title = if app.mode() == ClusterMode::Detail {
+        format!(
+            "Detail | {}/{} scroll",
+            cluster_key(app, "cluster_detail", "detail_up"),
+            cluster_key(app, "cluster_detail", "detail_down")
+        )
+    } else {
+        format!(
+            "Detail | {} expand",
+            cluster_key(app, "cluster", "open_detail")
+        )
+    };
+    let tone = if active { Tone::Active } else { Tone::Inactive };
     let paragraph = Paragraph::new(lines)
         .scroll((app.detail_offset().min(max_offset), 0))
-        .block(
-            base_block()
-                .title(panel_title(
-                    theme,
-                    if app.mode() == ClusterMode::Detail {
-                        format!(
-                            "Detail | {}/{} scroll",
-                            cluster_key(app, "cluster_detail", "detail_up"),
-                            cluster_key(app, "cluster_detail", "detail_down")
-                        )
-                    } else {
-                        format!(
-                            "Detail | {} expand",
-                            cluster_key(app, "cluster", "open_detail")
-                        )
-                    },
-                ))
-                .borders(Borders::ALL),
-        );
+        .block(panel_block(theme, title, tone));
     frame.render_widget(paragraph, area);
 }
 
@@ -766,10 +759,9 @@ fn resource_line(
         MetricKind::Memory => memory_metric(raw),
         MetricKind::Storage => percent_from_token(raw).map(|percent| (percent, "used")),
         MetricKind::Gpu if raw.eq_ignore_ascii_case("none") => None,
-        MetricKind::Gpu => percent_from_token(raw).map(|percent| (percent, "")),
+        MetricKind::Gpu => gpu_metric(raw),
     };
     let bar_percent = metric.map(|(percent, _)| percent);
-    let (filled, empty) = ascii_bar_parts(bar_percent);
     let percent_text = metric
         .map(|(value, suffix)| {
             if suffix.is_empty() {
@@ -779,51 +771,47 @@ fn resource_line(
             }
         })
         .unwrap_or_else(|| " --".to_string());
-    let style = bar_percent
-        .map(|percent| metric_style(theme, percent))
-        .unwrap_or_else(|| theme.fg(theme.palette().muted));
     let palette = theme.palette();
 
-    Line::from(vec![
-        Span::styled(format!("{label}: "), theme.fg(palette.key)),
-        Span::raw("["),
-        Span::styled(filled, style),
-        Span::styled(empty, theme.fg(palette.inactive)),
-        Span::raw("]"),
+    let mut spans = vec![Span::styled(format!("{label}: "), theme.fg(palette.key))];
+    spans.extend(resource_bar(theme, bar_percent, 10));
+    spans.extend([
         Span::styled(format!(" {percent_text}"), theme.fg(palette.value)),
         Span::styled("  ", theme.fg(palette.separator)),
         Span::styled(ascii_safe(raw), theme.fg(palette.muted)),
-    ])
+    ]);
+    Line::from(spans)
 }
 
 fn memory_metric(raw: &str) -> Option<(u16, &'static str)> {
     crate::metrics::memory_used(raw).map(|value| (value, "used"))
 }
 
-fn ascii_bar_parts(percent: Option<u16>) -> (String, String) {
-    const WIDTH: usize = 10;
-    let filled = percent
-        .map(|value| ((clamp_percent(value) as usize * WIDTH) + 50) / 100)
-        .unwrap_or(0)
-        .min(WIDTH);
-    ("#".repeat(filled), "-".repeat(WIDTH - filled))
+fn gpu_metric(raw: &str) -> Option<(u16, &'static str)> {
+    if let Some(percent) = percent_from_token(raw) {
+        return Some((percent, ""));
+    }
+    raw.split(';').find_map(|gpu| {
+        let mut fields = gpu.split(',').map(str::trim);
+        fields.next()?;
+        fields
+            .next()
+            .and_then(parse_percent_number)
+            .map(|percent| (percent, ""))
+    })
 }
 
 fn percent_from_token(input: &str) -> Option<u16> {
     crate::metrics::percent(input)
 }
 
-fn clamp_percent(value: u16) -> u16 {
-    value.min(100)
+fn parse_percent_number(value: &str) -> Option<u16> {
+    let value = value.trim().parse::<f64>().ok()?;
+    Some(clamp_percent(value.round().max(0.0) as u16))
 }
 
-fn metric_style(theme: Theme, percent: u16) -> Style {
-    let palette = theme.palette();
-    match clamp_percent(percent) {
-        0..=69 => theme.fg(palette.ok),
-        70..=89 => theme.fg(palette.warn),
-        _ => theme.fg(palette.danger),
-    }
+fn clamp_percent(value: u16) -> u16 {
+    value.min(100)
 }
 
 fn cluster_key(app: &ClusterApp, context: &str, action: &str) -> String {
@@ -975,21 +963,6 @@ fn route_arrow(theme: Theme) -> Span<'static> {
     Span::styled(" => ", theme.fg(theme.palette().separator))
 }
 
-fn section_line(theme: Theme, label: &'static str) -> Line<'static> {
-    Line::from(Span::styled(
-        label,
-        theme.fg_bold(theme.palette().panel_title),
-    ))
-}
-
-fn kv_line(theme: Theme, key: &'static str, value: impl Into<String>) -> Line<'static> {
-    let palette = theme.palette();
-    Line::from(vec![
-        Span::styled(format!("{key}: "), theme.fg(palette.key)),
-        Span::styled(value.into(), theme.fg(palette.value)),
-    ])
-}
-
 fn draw_help(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
     frame.render_widget(Clear, area);
     let lines = crate::bindings::help_lines(app.keymap(), app.help_context())
@@ -999,14 +972,15 @@ fn draw_help(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
     frame.render_widget(
         Paragraph::new(lines)
             .scroll((app.help_offset().min(u16::MAX as usize) as u16, 0))
-            .block(base_block().borders(Borders::ALL).title(panel_title(
+            .block(panel_block(
                 theme,
                 format!(
                     "Help: {} | {} close",
                     app.help_context(),
                     cluster_key(app, "help", "cancel")
                 ),
-            ))),
+                Tone::Active,
+            )),
         area,
     );
 }

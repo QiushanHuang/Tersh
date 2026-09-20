@@ -83,6 +83,34 @@ pub struct JobHandle {
 
 impl JobHandle {
     pub fn spawn(request: JobRequest) -> Result<Self> {
+        let identities: Vec<_> = request
+            .sources
+            .iter()
+            .map(|path| {
+                (
+                    path.clone(),
+                    fs_ops::capture_path_identity(path).map_err(|error| format!("{error:#}")),
+                )
+            })
+            .collect();
+        Self::spawn_validated(request, move |source, _| {
+            let (_, identity) = identities
+                .iter()
+                .find(|(path, _)| path == source)
+                .context("source identity unavailable")?;
+            match identity {
+                Ok(identity) => fs_ops::ensure_path_identity(source, identity),
+                Err(error) => bail!("{error}"),
+            }
+        })
+    }
+
+    /// Carries the UI's captured source and approved-conflict identities into
+    /// the worker; do not recapture them when a delayed prompt is accepted.
+    pub(crate) fn spawn_validated(
+        request: JobRequest,
+        validate: impl Fn(&Path, Option<&Path>) -> Result<()> + Send + 'static,
+    ) -> Result<Self> {
         if request.sources.is_empty() {
             bail!("file job has no sources");
         }
@@ -108,7 +136,7 @@ impl JobHandle {
         let worker = thread::Builder::new()
             .name("tersh-file-job".into())
             .spawn(move || {
-                let output = run(request, &worker_cancel, &worker_progress);
+                let output = run(request, &worker_cancel, &worker_progress, &validate);
                 *worker_result.lock().unwrap_or_else(|p| p.into_inner()) = Some(output);
             })
             .context("failed to start file worker")?;
@@ -156,7 +184,12 @@ impl Drop for JobHandle {
     }
 }
 
-fn run(request: JobRequest, cancel: &AtomicBool, progress: &Mutex<JobProgress>) -> JobResult {
+fn run(
+    request: JobRequest,
+    cancel: &AtomicBool,
+    progress: &Mutex<JobProgress>,
+    validate: &dyn Fn(&Path, Option<&Path>) -> Result<()>,
+) -> JobResult {
     let mut result = JobResult::default();
     for (index, source) in request.sources.iter().enumerate() {
         if cancel.load(Ordering::Acquire) {
@@ -183,7 +216,7 @@ fn run(request: JobRequest, cancel: &AtomicBool, progress: &Mutex<JobProgress>) 
             }
             Ok(())
         };
-        let operation = perform(&request, source, &mut observe);
+        let operation = perform(&request, source, &mut observe, validate);
         match operation {
             Ok(true) => result.succeeded.push(source.clone()),
             Ok(false) => result.skipped.push(source.clone()),
@@ -218,8 +251,15 @@ fn perform(
     request: &JobRequest,
     source: &Path,
     observe: &mut dyn FnMut(&Path, u64) -> Result<()>,
+    validate: &dyn Fn(&Path, Option<&Path>) -> Result<()>,
 ) -> Result<bool> {
     observe(source, 0)?;
+    let target = request
+        .destination
+        .as_ref()
+        .map(|destination| fs_ops::destination_for_paste(source, destination))
+        .transpose()?;
+    validate(source, target.as_deref())?;
     match request.kind {
         JobKind::Copy {
             replace,

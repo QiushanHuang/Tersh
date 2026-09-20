@@ -8,12 +8,13 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use serde::Deserialize;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    env, fs, io,
+    env, fs,
+    io::{self, Read},
     path::{Path, PathBuf},
     process::{Child, Command as ProcessCommand, Stdio},
     sync::mpsc,
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime},
 };
 
 const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
@@ -22,6 +23,8 @@ const MAX_CONCURRENT_PROBES: usize = 16;
 const MAX_PROBE_OUTPUT_BYTES: u64 = 1024 * 1024;
 
 const PROBE_SCRIPT: &str = r#"
+PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/local/cuda/bin:$PATH"
+export PATH
 printf 'hostname=%s\n' "$(hostname 2>/dev/null || echo unknown)"
 printf 'system=%s\n' "$(uname -srm 2>/dev/null || uname -a 2>/dev/null || echo unknown)"
 printf 'uptime=%s\n' "$(uptime 2>/dev/null | sed 's/^ *//')"
@@ -49,6 +52,8 @@ else
   printf 'gpu=none\n'
 fi
 "#;
+
+const PATH_BOOTSTRAP_SCRIPT: &str = r#"PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/local/cuda/bin:$PATH"; export PATH"#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostKind {
@@ -1523,6 +1528,10 @@ pub fn ssh_probe_args(host: &HostConfig) -> Vec<String> {
         "-o".to_string(),
         "BatchMode=yes".to_string(),
         "-o".to_string(),
+        "ClearAllForwardings=yes".to_string(),
+        "-o".to_string(),
+        "PermitLocalCommand=no".to_string(),
+        "-o".to_string(),
         "ConnectTimeout=3".to_string(),
         "-o".to_string(),
         "ConnectionAttempts=1".to_string(),
@@ -1602,6 +1611,7 @@ pub fn host_workbench_command(host: &HostConfig, local_tersh_program: &str) -> S
         };
         let mut args = Vec::new();
         if let Some(workdir) = host.workdir().filter(|workdir| !workdir.trim().is_empty()) {
+            args.push("--".to_string());
             args.push(workdir.to_string());
         }
         return SessionCommand {
@@ -1678,9 +1688,10 @@ fn current_tersh_program() -> String {
 
 fn remote_workbench_command(workdir: Option<&str>) -> String {
     let mut script = format!(
-        "if ! command -v tersh >/dev/null 2>&1; then printf '%s\\n' {} >&2; exit 127; fi",
+        "{}; if ! command -v tersh >/dev/null 2>&1; then printf '%s\\n' {} >&2; exit 127; fi",
+        PATH_BOOTSTRAP_SCRIPT,
         shell_quote(
-            "tersh is not installed or not in PATH. Install: cargo install --git https://github.com/QiushanHuang/Tersh.git --tag v1.1.0 --bin tersh --force"
+            "tersh is not installed or not in PATH. Install: cargo install --locked --git https://github.com/QiushanHuang/Tersh.git --bin tersh --force"
         )
     );
     if let Some(workdir) = workdir.map(str::trim).filter(|workdir| !workdir.is_empty()) {
@@ -1698,13 +1709,13 @@ fn remote_probe_command(script: &str) -> String {
     if cfg!(windows) {
         format!("cmd /C \"{}\"", script.replace('"', "\\\""))
     } else {
-        format!("sh -lc {}", shell_quote(script))
+        format!("sh -c {}", shell_quote(script))
     }
 }
 
 #[cfg(not(windows))]
 fn local_probe_shell() -> (&'static str, Vec<String>) {
-    ("sh", vec!["-lc".to_string()])
+    ("sh", vec!["-c".to_string()])
 }
 
 #[cfg(windows)]
@@ -1713,74 +1724,177 @@ fn local_probe_shell() -> (&'static str, Vec<String>) {
 }
 
 fn run_command_with_timeout(mut command: ProcessCommand, timeout: Duration) -> Result<String> {
-    let temp_files = TempProbeFiles::new();
-    let stdout = fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .truncate(true)
-        .open(&temp_files.stdout)
-        .context("create temp stdout file")?;
-    let stderr = fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .truncate(true)
-        .open(&temp_files.stderr)
-        .context("create temp stderr file")?;
-
     configure_probe_command(&mut command);
-
     let mut child = command
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .context("start probe command")?;
-    let started = Instant::now();
-    let mut timed_out = false;
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
+    let result = (|| {
+        let mut stdout = child.stdout.take().context("capture probe stdout")?;
+        let mut stderr = child.stderr.take().context("capture probe stderr")?;
+        stdout.prepare().context("prepare probe stdout")?;
+        stderr.prepare().context("prepare probe stderr")?;
+        let mut stdout_bytes = Vec::new();
+        let mut stderr_bytes = Vec::new();
+        let mut stdout_done = false;
+        let mut stderr_done = false;
+        let mut status = None;
+        let started = Instant::now();
+        loop {
+            let previous_bytes = stdout_bytes.len() + stderr_bytes.len();
+            if !stdout_done {
+                stdout_done = drain_probe_pipe(&mut stdout, "stdout", &mut stdout_bytes)?;
+            }
+            if !stderr_done {
+                stderr_done = drain_probe_pipe(&mut stderr, "stderr", &mut stderr_bytes)?;
+            }
+            if status.is_none() {
+                status = child.try_wait()?;
+            }
+            // A completed shell can leave descendants holding either pipe open.
+            // Readiness checks and the deadline stay on this worker: no blocking
+            // reader threads or inherited pipe handles outlive the probe.
+            if let Some(status) = status
+                && stdout_done
+                && stderr_done
+            {
+                if status.success() {
+                    return Ok(String::from_utf8_lossy(&stdout_bytes).into_owned());
+                }
+                let stderr = String::from_utf8_lossy(&stderr_bytes);
+                if stderr.trim().is_empty() {
+                    anyhow::bail!("probe exited with {status}");
+                }
+                anyhow::bail!("{}", stderr.trim());
+            }
+            if started.elapsed() >= timeout {
+                let mut message = format!("probe timed out after {}s", timeout.as_secs());
+                let stderr = String::from_utf8_lossy(&stderr_bytes);
+                if !stderr.trim().is_empty() {
+                    message.push_str(": ");
+                    message.push_str(stderr.trim());
+                }
+                anyhow::bail!(message);
+            }
+            if previous_bytes == stdout_bytes.len() + stderr_bytes.len() {
+                thread::sleep(
+                    Duration::from_millis(50).min(timeout.saturating_sub(started.elapsed())),
+                );
+            }
         }
-        if started.elapsed() >= timeout {
-            timed_out = true;
-            terminate_probe_child(&mut child);
-            break child.wait().context("wait probe command after timeout")?;
+    })();
+    // The closure has already dropped both read ends, even if an escaped
+    // descendant kept the writers open. Kill/reap the direct process without
+    // waiting for arbitrary descendants or their pipe EOF.
+    if result.is_err() {
+        terminate_probe_child(&mut child);
+        let cleanup_started = Instant::now();
+        while matches!(child.try_wait(), Ok(None))
+            && cleanup_started.elapsed() < Duration::from_millis(100)
+        {
+            thread::sleep(Duration::from_millis(5));
         }
-        thread::sleep(Duration::from_millis(50));
-    };
-
-    let stdout = read_lossy_limited(&temp_files.stdout, "stdout")?;
-    let stderr = read_lossy_limited(&temp_files.stderr, "stderr")?;
-
-    if timed_out {
-        let mut message = format!("probe timed out after {}s", timeout.as_secs());
-        let details = stderr.trim();
-        if !details.is_empty() {
-            message = format!("{message}: {details}");
-        }
-        anyhow::bail!(message);
     }
-
-    if status.success() {
-        return Ok(stdout);
-    }
-    let stderr = stderr.trim().to_string();
-    if stderr.is_empty() {
-        anyhow::bail!("probe exited with {}", status);
-    }
-    anyhow::bail!("{stderr}");
+    result
 }
 
-fn read_lossy_limited(path: &Path, stream: &str) -> Result<String> {
-    let metadata =
-        fs::metadata(path).with_context(|| format!("failed to inspect {}", path.display()))?;
-    if metadata.len() > MAX_PROBE_OUTPUT_BYTES {
-        anyhow::bail!(
-            "probe output too large: {stream} exceeded {} bytes",
-            MAX_PROBE_OUTPUT_BYTES
-        );
+trait ProbePipe: Read {
+    fn prepare(&self) -> io::Result<()>;
+    fn read_available(&mut self, buffer: &mut [u8]) -> io::Result<usize>;
+}
+
+#[cfg(unix)]
+impl<T: Read + std::os::fd::AsRawFd> ProbePipe for T {
+    fn prepare(&self) -> io::Result<()> {
+        let descriptor = self.as_raw_fd();
+        let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+        if flags == -1
+            || unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
-    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+
+    fn read_available(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.read(buffer)
+    }
+}
+
+#[cfg(windows)]
+impl<T: Read + std::os::windows::io::AsRawHandle> ProbePipe for T {
+    fn prepare(&self) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn read_available(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        // Anonymous child pipes support PeekNamedPipe. Read only bytes already
+        // available, avoiding an uncancellable blocking ReadFile operation.
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn PeekNamedPipe(
+                handle: *mut std::ffi::c_void,
+                buffer: *mut std::ffi::c_void,
+                size: u32,
+                read: *mut u32,
+                available: *mut u32,
+                left: *mut u32,
+            ) -> i32;
+        }
+        let mut available = 0;
+        let success = unsafe {
+            PeekNamedPipe(
+                self.as_raw_handle(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut available,
+                std::ptr::null_mut(),
+            )
+        };
+        if success == 0 {
+            let error = io::Error::last_os_error();
+            return if error.raw_os_error() == Some(109) {
+                Ok(0)
+            } else {
+                Err(error)
+            };
+        }
+        if available == 0 {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        let count = buffer.len().min(available as usize);
+        self.read(&mut buffer[..count])
+    }
+}
+
+fn drain_probe_pipe(
+    reader: &mut impl ProbePipe,
+    stream: &str,
+    bytes: &mut Vec<u8>,
+) -> Result<bool> {
+    let mut buffer = [0; 8192];
+    // Bound each drain so noisy output cannot starve stderr or deadline checks.
+    for _ in 0..16 {
+        let read = match reader.read_available(&mut buffer) {
+            Ok(0) => return Ok(true),
+            Ok(count) => count,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to read probe {stream}"));
+            }
+        };
+        if bytes.len().saturating_add(read) > MAX_PROBE_OUTPUT_BYTES as usize {
+            anyhow::bail!(
+                "probe output too large: {stream} exceeded {} bytes",
+                MAX_PROBE_OUTPUT_BYTES
+            );
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+    }
+    Ok(false)
 }
 
 #[cfg(unix)]
@@ -1814,36 +1928,6 @@ fn terminate_probe_child(child: &mut Child) {
 #[cfg(not(unix))]
 fn terminate_probe_child(child: &mut Child) {
     let _ = child.kill();
-}
-
-struct TempProbeFiles {
-    stdout: PathBuf,
-    stderr: PathBuf,
-}
-
-impl TempProbeFiles {
-    fn new() -> Self {
-        Self {
-            stdout: tempfile_path("tersh-probe-stdout"),
-            stderr: tempfile_path("tersh-probe-stderr"),
-        }
-    }
-}
-
-impl Drop for TempProbeFiles {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.stdout);
-        let _ = fs::remove_file(&self.stderr);
-    }
-}
-
-fn tempfile_path(prefix: &str) -> PathBuf {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|time| time.as_nanos())
-        .unwrap_or_default();
-    let pid = std::process::id();
-    std::env::temp_dir().join(format!("{prefix}-{pid}-{now}.log"))
 }
 
 fn default_inventory_candidates() -> Vec<PathBuf> {
@@ -2115,6 +2199,13 @@ mod tests {
     }
 
     #[test]
+    fn probe_script_bootstraps_common_non_login_shell_paths() {
+        assert!(PROBE_SCRIPT.contains("$HOME/.cargo/bin"));
+        assert!(PROBE_SCRIPT.contains("/usr/local/cuda/bin"));
+        assert!(PROBE_SCRIPT.contains("export PATH"));
+    }
+
+    #[test]
     fn failed_probe_spawn_cleans_temp_files() {
         let _guard = PROBE_TEMP_LOCK.lock().unwrap();
         let before = probe_temp_files();
@@ -2138,6 +2229,117 @@ mod tests {
 
         assert!(err.to_string().contains('\u{fffd}'));
         assert!(!err.to_string().contains("failed to read"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "subprocess fixture for inherited-pipe regression"]
+    fn escaped_probe_pipe_holder() {
+        let Some(pid_file) = std::env::var_os("TERSH_TEST_PIPE_HOLDER_PID") else {
+            return;
+        };
+        assert!(unsafe { libc::setsid() } >= 0);
+        std::fs::write(pid_file, std::process::id().to_string()).unwrap();
+        eprintln!("escaped-pipe diagnostic");
+        thread::sleep(Duration::from_secs(10));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repeated_escaped_pipe_timeouts_do_not_leak_descriptors() {
+        const TEST: &str = "cluster::tests::repeated_escaped_pipe_timeouts_do_not_leak_descriptors";
+        if std::env::var_os("TERSH_TEST_PIPE_LEAK_ISOLATED").is_none() {
+            // Isolate descriptor counts from other concurrently running tests.
+            let output = ProcessCommand::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env("TERSH_TEST_PIPE_LEAK_ISOLATED", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        struct KillHolders(Vec<PathBuf>);
+        impl Drop for KillHolders {
+            fn drop(&mut self) {
+                for path in &self.0 {
+                    if let Ok(text) = std::fs::read_to_string(path)
+                        && let Ok(pid) = text.parse::<libc::pid_t>()
+                    {
+                        unsafe {
+                            libc::kill(pid, libc::SIGKILL);
+                        }
+                    }
+                }
+            }
+        }
+        fn open_descriptors() -> usize {
+            (0..1024)
+                .filter(|fd| unsafe { libc::fcntl(*fd, libc::F_GETFD) } >= 0)
+                .count()
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let mut holders = KillHolders(Vec::new());
+        let before = open_descriptors();
+        for attempt in 0..3 {
+            let pid_file = temp.path().join(format!("holder-{attempt}"));
+            holders.0.push(pid_file.clone());
+            let mut command = ProcessCommand::new("sh");
+            command.args([
+                "-c",
+                "\"$1\" --exact cluster::tests::escaped_probe_pipe_holder --ignored --nocapture & exit 0",
+                "sh",
+            ]).arg(std::env::current_exe().unwrap()).env("TERSH_TEST_PIPE_HOLDER_PID", &pid_file);
+            let started = Instant::now();
+            let error = run_command_with_timeout(command, Duration::from_millis(150)).unwrap_err();
+            assert!(started.elapsed() < Duration::from_secs(1));
+            assert!(pid_file.exists(), "setsid descendant did not start");
+            assert!(error.to_string().contains("timed out"));
+            assert!(error.to_string().contains("escaped-pipe diagnostic"));
+        }
+        assert_eq!(
+            open_descriptors(),
+            before,
+            "timed-out readers retained pipe descriptors"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_probe_preserves_stdout_before_deadline() {
+        let mut command = ProcessCommand::new("sh");
+        command.args([
+            "-c",
+            "printf 'hostname=early\\n'; printf 'diagnostic\\n' >&2",
+        ]);
+
+        let output = run_command_with_timeout(command, Duration::from_secs(1)).unwrap();
+
+        assert_eq!(output, "hostname=early\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_deadline_covers_pipes_after_direct_child_exits() {
+        let mut command = ProcessCommand::new("sh");
+        command.args([
+            "-c",
+            "printf 'hostname=early\\n'; printf 'before timeout\\n' >&2; sleep 2 & exit 0",
+        ]);
+        let started = Instant::now();
+        let result = run_command_with_timeout(command, Duration::from_millis(100));
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "pipe readers exceeded the probe deadline"
+        );
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("timed out"));
+        assert!(error.contains("before timeout"));
     }
 
     #[cfg(unix)]

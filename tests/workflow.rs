@@ -97,7 +97,9 @@ fn trash_ui_roundtrip_survives_new_app_and_refuses_restore_conflict() {
 #[test]
 fn remapped_file_keys_replace_legacy_and_match_menu_footer_and_prompt() {
     let map=Keymap::from_json(r#"{"files":{"rename":["F2"],"open_actions":["F3"],"open_filter":["F4"]},"input":{"submit":["F5"],"cancel":["F6"]},"actions":{"submit":["F7"],"cancel":["F8"]}}"#).unwrap();
-    let mut app = App::for_test();
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("rename.txt"), "fixture").unwrap();
+    let mut app = App::new(root.path().into()).unwrap();
     app.set_keymap(map);
     app.handle_key(key('n'));
     assert_eq!(app.mode(), Mode::Normal);

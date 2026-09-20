@@ -2,16 +2,60 @@
 
 ## Unreleased
 
+No unreleased changes.
+
+## v1.2.0 - 2026-09-20
+
+A workflow release for local and SSH terminals: cancellable file jobs,
+persistent recovery, searchable actions and configurable controls.
+
 ### Added
 
-- Added a single cancellable filesystem worker for copy, move, trash, permanent delete and restore, with `J` progress/results and `Ctrl+X` cancellation.
-- Added persistent trash receipts and the `u` recovery view, no-clobber restore confirmation, and per-entry corruption warnings.
-- Added host filtering and stable inventory/alias/state/resource sorting without changing refresh scope.
-- Added complete per-context JSON keymaps, conflict checks, chord input, effective key labels and `--dump-keymap` export.
-- Added an `o` action picker for files, preview and cluster views, preserving existing dispatch and destructive confirmations.
-- Added `--ui-profile desktop|mobile|ssh`, `--theme`, `--no-motion`, `TERSH_GLYPHS` and `TERSH_MOTION`, plus `NO_COLOR` support.
-- Added bounded, timestamped cluster observation trends with missing-value gaps and scrollable expanded detail.
-- Added an offline UI cell-buffer gallery for reproducible desktop/mobile visual inspection.
+- Background copy, move, trash, delete and restore jobs, with `J` progress/results and `Ctrl+X` cancellation.
+- Managed trash receipts and `u` recovery across restarts, with original-location confirmation and no-overwrite restores.
+- Per-context JSON keymaps, up to four-key chords, conflict validation and `--dump-keymap` export.
+- Searchable `o` action menus with effective shortcut labels.
+- Cluster filtering by alias/address/role and stable inventory, alias, state and resource sorting.
+- Bounded, timestamped load/memory/disk/probe trends with explicit missing-observation gaps.
+- Desktop, mobile and SSH presentation presets; optional Unicode graphs, reduced motion and `NO_COLOR` support.
+- Reproducible offline UI gallery and native terminal workflow smoke checks.
+
+### Changed
+
+- Fit whole shortcut hints to the available width and prioritize filenames on narrow screens.
+- Separate long paths from header status and improve badge contrast and selected-row visibility.
+- Limit probe activity animation to four frames per second and stop animation at idle.
+- Generate action/help/footer hints from the effective keymap.
+- Refresh the bilingual documentation, configuration examples and contribution guidance.
+
+### Fixed
+
+- Preserve clipboard generations when an older move finishes after a new cut selection.
+- Keep existing replacement targets until staging completes and clean partial read-only copy trees on cancellation.
+- Traverse Unix directory deletion through pinned descriptors to resist ancestor symlink replacement.
+- Revalidate delayed operation identities and approved replacement targets through background execution.
+- Keep valid trash receipts usable alongside per-entry corruption warnings.
+- Use consistent used-memory semantics in host lists, resource bars and trends.
+- Preserve printable text when a configurable chord fails to match.
+- Keep restore filenames visible in narrow confirmation dialogs and prevent host launch dispatch for empty filter results.
+- Keep probe deadlines and pipe-resource lifetimes bounded when background descendants retain output pipes.
+
+### Compatibility
+
+- Rust 1.88 or newer; macOS and Linux.
+- Existing shortcuts remain the defaults. Custom bindings replace an action's previous shortcuts; Ctrl+C remains a safe-exit key.
+- Cancellation is cooperative and retains completed work. It cannot undo completed deletion or interrupt a blocked filesystem syscall.
+- Trash recovery requires managed receipts and same-filesystem rename. Existing unrecorded trash remains untouched.
+- Source builds and all existing v1.1.1 safety fixes are retained.
+
+## v1.1.1 - 2026-08-11
+
+Tersh v1.1.1 is a trust-and-usability release focused on safer file operations,
+lighter terminal rendering, clearer cluster diagnostics, and a consistent
+theme system for local, mobile, and SSH terminal workflows.
+
+### Added
+
 - Added copy-conflict handling for existing targets, with explicit `replace` or `skip` confirmation before overwriting.
 - Added `TERSH_CLIPBOARD=off` to disable OSC52 terminal clipboard writes while keeping in-app copy state and logs.
 - Added `TERSH_THEME=btop|aurora|contrast|mono` for color-rich, aurora, high-contrast, or no-color terminal rendering.
@@ -26,12 +70,14 @@
 
 ### Changed
 
-- Fit footer shortcuts as whole actions across available rows; preserve names in narrow file columns and separate long paths from status badges.
-- Improved badge contrast, full-row file focus, compact host metrics, and activity-only probe animation capped at four frames per second.
+- Changed crate metadata to version `1.1.1`, declared Rust 1.88 as the current source MSRV, and updated install guidance to use the current git source with `--locked`.
 - Changed workbench and cluster event loops to dirty-driven rendering, reducing idle redraws while still repainting on input, resize, refresh, and probe updates.
 - Changed workbench and cluster chrome to share themed status chips, footer highlighting, selected-row styling, and warning/error emphasis.
 - Changed workbench and cluster rendering to use semantic panel-title, key/value, inactive, copy, cut, and search-match colors for stronger visual hierarchy without changing layout density.
 - Changed cluster resource bars to style filled and empty segments separately, making high-load metrics stand out while keeping ASCII bar characters for lightweight remote terminals.
+- Changed the TUI theme layer to use shared semantic `Tone` / `ChipTone` primitives for panel chrome, footer styling, key-value rows, and resource bars.
+- Changed workbench and cluster panels to distinguish active and inactive chrome, making the current work surface easier to scan without adding layout weight.
+- Changed compact workbench status to show the full copy/cut buffer label instead of a generic copy count.
 - Changed file preview caching from a single entry to a bounded LRU cache for faster adjacent-file navigation without retaining stale same-path previews.
 - Changed directory entries to cache lowercase names, reducing repeated allocation during filtering and sorting.
 - Changed file rows to show cursor, selection, and copy/cut buffer state in a fixed row marker so the active operation target is easier to scan.
@@ -42,10 +88,10 @@
 
 ### Fixed
 
-- Fixed asynchronous cut-buffer reconciliation by tracking the buffer generation, so an older completed move cannot clear a newer cut selection.
-- Preserved replacement originals until copy staging finishes; cleaned incomplete read-only copy trees on cancellation/failure.
-- Used descriptor-based Unix deletion traversal to resist concurrent ancestor symlink replacement.
-- Unified memory percentage semantics across the host list, detail and trends, including macOS free-memory output.
+- Fixed stale-path hazards by storing and rechecking file identities for delayed copy, cut, rename, trash, and delete operations.
+- Fixed replace-copy behavior so existing directories are not recursively removed and existing file targets are preserved until the replacement is ready.
+- Fixed cluster probe execution so stdout and stderr are read through bounded pipes, SSH probes disable forwarding/local commands, and shell wrappers avoid login-shell startup files.
+- Fixed binary previews for files whose first control bytes appear after the initial detection window, and escaped typed destructive-confirmation text before rendering.
 - Fixed parallel test instability in probe temporary-file cleanup checks by isolating the probe-output tests from each other.
 - Hardened file operation race windows with source identity rechecks, no-follow regular-file opens, safer trash/delete target checks, no-clobber copy targets, and no-replace rename APIs where supported.
 - Fixed copy failure cleanup so failed regular-file and recursive-directory copies do not leave partial targets behind.

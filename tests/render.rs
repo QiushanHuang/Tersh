@@ -20,7 +20,9 @@ fn render_app(app: &App, width: u16, height: u16) -> String {
 
 #[test]
 fn action_menu_opens_and_searches_without_typing_into_file_filter() {
-    let mut app = App::for_test();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("rename-me.txt"), "keep").unwrap();
+    let mut app = App::new(dir.path().into()).unwrap();
     app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
     for ch in "rename".chars() {
         app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
@@ -278,6 +280,19 @@ fn render_escapes_paths_and_prompt_input() {
 }
 
 #[test]
+fn destructive_confirmation_escapes_typed_control_characters() {
+    let mut app = App::for_test();
+    app.apply(Command::PermanentDelete);
+    // The key input layer rejects controls; inject at the command boundary to
+    // verify the renderer still escapes stored input independently.
+    app.handle_command(Command::Input('\u{1b}'));
+
+    let buffer = render_app(&app, 100, 30);
+
+    assert!(buffer.contains("typed: \\u{1b}"));
+}
+
+#[test]
 fn preview_errors_and_logs_escape_control_characters() {
     let dir = tempfile::tempdir().unwrap();
     let weird = dir.path().join("bad\n\u{1b}[31m");
@@ -364,6 +379,17 @@ fn compact_layout_shows_focused_status_context() {
     assert!(buffer.contains("Status"));
     assert!(buffer.contains("dir src"));
     assert!(buffer.contains("selected 0"));
+}
+
+#[test]
+fn compact_status_distinguishes_cut_buffer_from_copy_count() {
+    let mut app = App::for_test();
+    app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+
+    let buffer = render_app(&app, 70, 12);
+
+    assert!(buffer.contains("CUT 1"));
+    assert!(!buffer.contains("copy 1"));
 }
 
 #[test]

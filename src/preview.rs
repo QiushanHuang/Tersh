@@ -118,8 +118,7 @@ pub fn preview_file(path: &Path) -> Result<Preview> {
             "Empty file",
         ));
     }
-    let detect_slice = &bytes[..bytes.len().min(DETECT_LIMIT)];
-    if looks_binary(detect_slice) {
+    if looks_binary(&bytes) {
         let hex = bytes
             .iter()
             .take(256)
