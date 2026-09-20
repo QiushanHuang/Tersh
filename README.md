@@ -228,6 +228,11 @@ See [contributors and attribution](CONTRIBUTORS.md). Tersh is licensed under the
 
 ## 中文
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/brand/tersh-logo-dark.svg">
+  <img src="docs/brand/tersh-logo-light.svg" width="360" alt="Tersh — 终端文件工作台">
+</picture>
+
 [![English](https://img.shields.io/badge/Language-English-24292f)](#english)
 [![简体中文](https://img.shields.io/badge/语言-简体中文-1677ff)](#中文)
 
