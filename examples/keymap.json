@@ -1,0 +1,15 @@
+{
+  "files": {
+    "copy": ["Ctrl+y"],
+    "open_jobs": ["F5", "J"],
+    "open_trash": ["F6", "u"]
+  },
+  "preview": {
+    "open_jobs": ["F5", "J"],
+    "open_trash": ["F6", "u"]
+  },
+  "actions": {
+    "down": ["Down", "Tab", "Ctrl+n"],
+    "up": ["Up", "BackTab", "Ctrl+p"]
+  }
+}

@@ -58,6 +58,13 @@ This matters when your working environment is:
 
 ## Features
 
+- Cancellable background copy/move/trash/delete/restore jobs; `J` opens progress/results and `Ctrl+X` requests cancellation.
+- Persistent trash recovery with `u`, original-location confirmation and no-overwrite restores across restarts.
+- Cluster host filtering (`/`, Backspace clears) and stable sorting (`v` cycles, `V` reverses) without changing probe scope.
+- Full per-context JSON keybindings, chord support, conflict validation, live help and `--dump-keymap` export.
+- Searchable `o` action menu in browsing, preview, and cluster screens: type an action name, use arrows/Tab, press Enter; existing shortcuts and confirmations stay active.
+- Device presets: `--ui-profile desktop|mobile|ssh`, `--theme btop|aurora|contrast|mono`, and `--no-motion`.
+- Cluster detail (`l`) includes bounded observation trends after two completed probes, with PageUp/PageDown scrolling.
 - Full-screen terminal file workbench
 - btop-inspired status header, sortable file list, and inspector panel
 - Shared btop-style semantic theme system for workbench and cluster views, with optional aurora, contrast, no-color, and border modes
@@ -253,6 +260,20 @@ TERSH_FOOTER=full tersh --cluster
 
 `TERSH_THEME` accepts `btop`, `aurora`, `contrast`, or `mono`. `TERSH_COLOR=off` also selects no-color mode. `TERSH_BORDER` accepts `ascii`, `rounded`, or `thick`; ASCII remains the default for maximum SSH and fallback-terminal compatibility. `TERSH_FOOTER` accepts `auto`, `compact`, or `full`.
 
+Choose a device preset without editing configuration files:
+
+```bash
+tersh --ui-profile desktop
+tersh --c --ui-profile ssh
+tersh --ui-profile mobile --theme contrast
+```
+
+Desktop uses rounded borders, Unicode sparklines and full action hints. Mobile uses compact hints, ASCII and no animation. SSH uses adaptive hints, ASCII and no animation. Profiles override the corresponding inherited UI environment variables; `--theme` and `--no-motion` apply afterwards. `NO_COLOR` or `TERSH_COLOR=off` still disables color. These settings are process-local, with no configuration or inventory writes.
+
+`TERSH_GLYPHS=unicode` enables Unicode trend sparklines; the default is ASCII. `TERSH_MOTION=off` disables activity animation. Animation is limited to four frames per second during active probes and stops at idle. Footer actions are fitted as whole shortcuts across up to two lines; `o` exposes actions that do not fit. Profiles change presentation, not key bindings.
+
+The cluster detail retains at most 60 completed observations per host in memory, with no extra probes or disk history. Load is the 1-minute load average, not CPU utilization. Memory is **used** percent on both macOS and Linux. Probe duration includes the complete SSH/collection operation, not just network latency. Trends show each observation in order, the actual elapsed span, and blank gaps for failures or unknown metrics; spacing is by sample, not proportional to time. Memory/storage scales are 0–100%; load/probe scales adapt to the visible observations. Retained old metrics remain marked stale. Scroll detail with PageUp/PageDown (also available through `o`).
+
 ## Keybindings
 
 ### Navigation
@@ -292,6 +313,25 @@ TERSH_FOOTER=full tersh --cluster
 - `n`: rename focused item
 - `d`: move to `.tersh-trash`
 - `D`: permanently delete
+- `J`: inspect current/last file job
+- `Ctrl+X`: cancel active job
+- `u`: open trash recovery; Enter selects and confirms a restore
+
+### Background jobs, recovery and keymaps
+
+Copy, move, trash, permanent delete and restore use one background worker. Browsing/filtering remains available; another mutating file operation is refused until the current job finishes. The job view reports processed roots, copied bytes, skipped/failed/remaining items. Cancellation retains completed items and removes this copy's incomplete output. Replacement stages the copy before committing. `Ctrl+C` during a job requests cancellation and waits for cleanup before exiting; it does not detach a writer. Cancellation is cooperative and cannot interrupt a blocked filesystem syscall. It cannot undo already completed deletions. Directory listing/preview loading are still synchronous.
+
+`u` reads managed receipts under the current work root's `.tersh-trash`. Restores are revalidated, confirmed, and never overwrite existing paths. A bad receipt is skipped with a warning while other valid entries remain recoverable. Legacy trash without recorded original paths is not guessed. Trash/restore use same-filesystem rename; cross-filesystem errors retain the source. Non-UTF-8 trash paths are rejected before moving because receipts use JSON paths.
+
+Configure keys in `~/.config/tersh/keymap.json` (or `$XDG_CONFIG_HOME/tersh/keymap.json`). `--keymap FILE` takes precedence over `TERSH_KEYMAP`, then the default location. Explicit missing/invalid files fail before the TUI starts.
+
+```bash
+tersh --dump-keymap > keymap.json
+tersh --keymap keymap.json
+tersh --keymap keymap.json --c
+```
+
+See [the example keymap](examples/keymap.json). Configuration is a partial context/action map, for example `{"files":{"copy":["Ctrl+y"]}}`. This replaces `yy`; it does not add another binding to it. An empty array unbinds that action's keys (the action can still be selected from its menu). Keys include single characters, `F1`–`F24`, named keys such as `Enter`/`PageDown`, modifier combinations and up to four-key chords such as `g g`. Contexts are `files`, `preview`, `input`, `help`, `actions`, `cluster`, `cluster_detail`, `cluster_filter`, `trash`, and `jobs`. Unknown actions, duplicate keys, ambiguous chord prefixes, oversized files and missing modal cancel bindings are rejected. `Ctrl+C` is always reserved for safe emergency exit. Menus, help and footers show the effective bindings; remapped old keys do not secretly keep working.
 
 ### Copy Helpers
 
@@ -351,6 +391,8 @@ The codebase is organized around a small Rust TUI core:
 - `src/ui.rs`: terminal layout and rendering
 - `src/fs_core.rs`: file listing and metadata helpers
 - `src/fs_ops.rs`: copy, rename, trash, delete, and path operations
+- `src/jobs.rs` / `src/trash.rs`: cancellable workers and persistent recovery receipts
+- `src/keymap.rs` / `src/bindings.rs`: validated bindings, chord state and generated hints
 - `src/preview.rs`: file preview logic
 - `src/clipboard.rs`: clipboard integration helpers
 - `src/cluster.rs`: cluster inventory, probing, and state handling
@@ -361,7 +403,7 @@ The codebase is organized around a small Rust TUI core:
 - Better preview coverage for more file types
 - Tighter small-screen behavior for narrow mobile terminals
 - More remote-friendly copy and batch workflows
-- Configurable keymaps and behavior
+- Asynchronous directory listing and preview loading
 - Packaging for easier install beyond local builds
 
 ## License
@@ -608,6 +650,20 @@ TERSH_CLIPBOARD=off tersh
 针对不同终端设备调整视觉密度和配色：
 
 ```bash
+tersh --ui-profile desktop
+tersh --c --ui-profile ssh
+tersh --ui-profile mobile --theme contrast
+```
+
+`desktop` 使用圆角边框、Unicode 趋势图和完整提示；`mobile` 使用紧凑提示、ASCII、无动效；`ssh` 使用自适应提示、ASCII、无动效。`--theme` 可覆盖主题，`--no-motion` 关闭动效。预设只改变显示方式，不重映射按键，也不写入配置文件。`NO_COLOR` 和 `TERSH_COLOR=off` 仍优先生效。
+
+在文件浏览、预览、集群列表或详情中按 `o`，可搜索操作名称，用方向键/Tab 选择、Enter 执行、Esc 返回。菜单复用原有命令；删除仍需要输入确认词。底部快捷键按完整条目适配宽度，空间不足的操作可从菜单进入。
+
+集群按 `l` 展开详情，两次完整探测后显示趋势，PageUp/PageDown 滚动。每台主机最多保留 60 个内存样本，不增加探测、不写历史文件。CPU load 是 1 分钟负载，不是 CPU 百分比；内存统一为已用百分比；Probe 是完整探测耗时，不是纯网络延迟。失败或未知数值显示缺口，旧指标仍标为 stale。横向按观测顺序排列并标明实际时间跨度，不代表等时间间隔；内存/磁盘固定 0–100%，负载和耗时按可见样本缩放。
+
+`TERSH_GLYPHS=unicode` 开启 Unicode 趋势图；默认 ASCII。`TERSH_MOTION=off` 关闭活动指示，开启时仅在正在探测的阶段每秒最多更新四帧，空闲停止重绘。
+
+```bash
 TERSH_THEME=aurora TERSH_BORDER=rounded tersh
 TERSH_THEME=contrast tersh
 TERSH_THEME=contrast TERSH_BORDER=thick tersh --cluster
@@ -656,6 +712,29 @@ TERSH_FOOTER=full tersh --cluster
 - `n`：重命名当前项
 - `d`：移动到 `.tersh-trash`
 - `D`：永久删除
+- `J`：查看当前/最近文件任务
+- `Ctrl+X`：请求取消当前任务
+- `u`：回收站恢复，Enter 选择记录并确认原位置
+
+### 后台任务、恢复与自定义键位
+
+复制、移动、移入回收站、永久删除和恢复由单个后台工作线程执行。任务期间可以继续浏览、筛选和预览；新的写操作会被拒绝，直到当前任务结束。`J` 显示已处理项目、复制字节数、失败、跳过和未完成项目。取消保留已完成项目并清理当前未完成的复制；替换先完成暂存，再提交。任务期间 `Ctrl+C` 会请求取消、等待清理后退出，不留下后台写入线程。取消采用协作检查，不能中断正在阻塞的系统调用，也不能撤销已经完成的永久删除。目录枚举与预览读取仍是同步的。
+
+`u` 读取当前工作根目录 `.tersh-trash` 中的恢复记录，重启后仍可恢复。恢复前显示原位置并重新校验文件及父目录身份；同名冲突不会覆盖。损坏记录会跳过并显示警告，不妨碍其他有效记录。旧版无原路径记录的垃圾文件不会猜测恢复位置。回收站和恢复使用同一文件系统内的重命名；跨文件系统失败时保留源文件。非 UTF-8 路径会在移入回收站前拒绝，避免产生无法记录原位置的数据。
+
+默认键位配置为 `~/.config/tersh/keymap.json`，设置 `XDG_CONFIG_HOME` 时使用其下的 `tersh/keymap.json`。读取优先级：`--keymap FILE` → `TERSH_KEYMAP` → 默认路径。指定配置不存在或无效时，在进入终端界面前报错。
+
+```bash
+tersh --dump-keymap > keymap.json
+tersh --keymap keymap.json
+tersh --keymap keymap.json --c
+```
+
+可参考[示例配置](examples/keymap.json)。例如 `{"files":{"copy":["Ctrl+y"]}}` 把复制改为 Ctrl+Y，并移除旧的 `yy`。空数组取消该动作的快捷键，仍可从操作菜单选择。支持字符、F1–F24、Enter/PageDown 等命名键、修饰键，以及 `g g` 这类最多四键的组合。
+
+配置覆盖文件、预览、输入框、帮助、操作菜单、集群列表/详情/筛选、回收站、任务这十个上下文。启动时检查未知动作、重复键、组合键前缀冲突、配置大小和模态取消出口。`Ctrl+C` 保留为安全退出键。菜单、帮助与底部提示都随实际键位更新。
+
+集群 `/` 按别名、地址或角色筛选，Enter 应用、Esc 还原，Backspace 清除已应用的筛选；`v` 依次切换清单顺序、别名、状态、负载、内存、磁盘、探测耗时，`V` 反转。未知指标始终排在最后，选择按主机别名保留；筛选排序不改变完整清单和探测范围。
 
 ### 复制辅助
 
@@ -715,6 +794,8 @@ Tersh 处在原始 shell 命令和完整远程文件管理器之间。
 - `src/ui.rs`：终端布局和渲染
 - `src/fs_core.rs`：文件枚举与元数据辅助
 - `src/fs_ops.rs`：复制、重命名、回收站、删除与路径操作
+- `src/jobs.rs` / `src/trash.rs`：可取消工作线程与持久化恢复记录
+- `src/keymap.rs` / `src/bindings.rs`：键位校验、组合键状态与界面提示
 - `src/preview.rs`：文件预览逻辑
 - `src/clipboard.rs`：剪贴板集成辅助
 - `src/cluster.rs`：集群清单、探测和状态处理
@@ -725,7 +806,7 @@ Tersh 处在原始 shell 命令和完整远程文件管理器之间。
 - 扩展更多文件类型的预览能力
 - 进一步优化窄屏和移动端终端体验
 - 增强面向远程环境的复制与批量工作流
-- 支持可配置快捷键和行为选项
+- 异步目录枚举与预览读取
 - 提供更容易安装的分发方式
 
 ## 许可证

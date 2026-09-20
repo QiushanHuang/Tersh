@@ -54,6 +54,51 @@ const DIRECT_JSON: &str = r#"
 "#;
 
 #[test]
+fn dashboard_shows_bounded_observation_trends() {
+    let inventory = ClusterInventory::from_json(DIRECT_JSON).unwrap();
+    let mut app = ClusterApp::new(inventory.hosts().to_vec());
+    for n in 1..=3 {
+        app.apply_snapshot(HostSnapshot::online(
+            "direct-box",
+            ProbeReport::parse(&format!(
+                "load={n}.0 0.2 0.3\nmemory=42% free\nstorage=50% used\n"
+            )),
+            n,
+        ));
+    }
+    app.apply(ClusterCommand::OpenDetail);
+    let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+    terminal
+        .draw(|frame| cluster_ui::draw(frame, &app))
+        .unwrap();
+    let text = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect::<String>();
+    assert!(text.contains("Trends"));
+    assert!(text.contains("3 samples"));
+    assert!(text.contains("Load 1m"));
+    assert!(text.contains("58%"));
+}
+
+#[test]
+fn cluster_action_menu_routes_to_existing_session_command() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let mut app = ClusterApp::new(vec![]);
+    app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+    for ch in "shell".chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+    }
+    assert_eq!(
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        Some(ClusterCommand::OpenSession)
+    );
+}
+
+#[test]
 fn inventory_parses_campus_access_json_into_monitorable_hosts() {
     let inventory = ClusterInventory::from_json(CAMPUS_JSON).unwrap();
 
@@ -823,7 +868,8 @@ fn cluster_help_footer_is_mode_specific() {
         .iter()
         .map(|cell| cell.symbol())
         .collect::<String>();
-    assert!(buffer.contains("help | q/?/Enter/Esc close"));
+    assert!(buffer.contains("help"));
+    assert!(buffer.contains("Esc/^G close"));
     assert!(!buffer.contains("q quit | ? help | ^G back | ^C force | r refresh"));
 }
 
@@ -846,7 +892,8 @@ fn cluster_detail_footer_describes_back_action() {
         .iter()
         .map(|cell| cell.symbol())
         .collect::<String>();
-    assert!(buffer.contains("detail | q/Esc back"));
+    assert!(buffer.contains("detail"));
+    assert!(buffer.contains("Esc/^G back"));
     assert!(!buffer.contains("q quit | ? help | ^G back | ^C force | r refresh"));
 }
 

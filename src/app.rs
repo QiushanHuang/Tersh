@@ -1,14 +1,11 @@
 use crate::{
     fs_core::{FileEntry, FileKind, read_dir_entries_with_diagnostics},
-    fs_ops::{
-        copy_path, destination_for_paste, permanent_delete, rename_path, trash_path,
-        validate_file_name,
-    },
+    fs_ops::{destination_for_paste, rename_path, validate_file_name},
     preview::{Preview, PreviewKind, preview_file},
 };
 use anyhow::{Context, Result};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEvent},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -45,6 +42,9 @@ pub enum Mode {
     ConfirmDelete,
     Conflict,
     Message,
+    Jobs,
+    Trash,
+    ConfirmRestore,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +88,32 @@ pub enum Command {
     Edit,
     Backspace,
     Submit,
+    OpenActions,
+    OpenJobs,
+    CancelJob,
+    OpenTrash,
+    RestoreTrash,
+    RefreshTrash,
+}
+
+macro_rules! command_actions {
+    ($($variant:ident => $id:literal),* $(,)?) => {
+        impl Command {
+            pub fn action_id(&self) -> &'static str { match self { $(Self::$variant => $id,)* Self::Input(_) => "input" } }
+            pub fn from_action(id: &str) -> Option<Self> { match id { $($id => Some(Self::$variant),)* _ => None } }
+        }
+    }
+}
+command_actions! {
+    Down=>"down", Up=>"up", HalfDown=>"half_down", HalfUp=>"half_up", First=>"first", Last=>"last",
+    Parent=>"parent", Open=>"open", OpenFilter=>"open_filter", OpenGoto=>"open_goto", OpenPreviewSearch=>"open_preview_search",
+    ToggleHidden=>"toggle_hidden", ToggleSelect=>"toggle_select", SelectAll=>"select_all", ClearSelection=>"clear_selection",
+    Copy=>"copy", Cut=>"cut", Paste=>"paste", CopyName=>"copy_name", CopyRelativePath=>"copy_relative_path", CopyAbsolutePath=>"copy_absolute_path",
+    CopyTo=>"copy_to", MoveTo=>"move_to", Rename=>"rename", Trash=>"trash", PermanentDelete=>"permanent_delete", Refresh=>"refresh",
+    OpenHelp=>"open_help", PreviewSearchNext=>"preview_search_next", PreviewSearchPrev=>"preview_search_prev",
+    CycleSort=>"cycle_sort", ReverseSort=>"reverse_sort", Cancel=>"cancel", Quit=>"quit", ForceQuit=>"force_quit",
+    Edit=>"edit", Backspace=>"backspace", Submit=>"submit", OpenActions=>"open_actions", OpenJobs=>"open_jobs",
+    CancelJob=>"cancel_job", OpenTrash=>"open_trash", RestoreTrash=>"restore", RefreshTrash=>"refresh_trash",
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,8 +123,23 @@ pub enum SortKey {
     Modified,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct App {
+    keymap: std::sync::Arc<crate::keymap::Keymap>,
+    key_state: crate::bindings::KeyState,
+    help_offset: usize,
+    help_context: String,
+    active_job: Option<crate::jobs::JobHandle>,
+    job_progress: Option<crate::jobs::JobProgress>,
+    last_job: Option<crate::jobs::JobResult>,
+    job_cut_revision: Option<u64>,
+    transfer_revision: u64,
+    exit_after_job: bool,
+    trash_entries: Vec<crate::trash::TrashEntry>,
+    trash_cursor: usize,
+    trash_error: Option<String>,
+    restore_pending: Option<PathBuf>,
+    actions: Option<crate::actions::ActionMenu<Command>>,
     cwd: PathBuf,
     work_root: PathBuf,
     all_entries: Vec<FileEntry>,
@@ -157,7 +198,6 @@ struct PendingFileOperation {
     paths: Vec<PathBuf>,
     destination: PathBuf,
     source: FileOperationSource,
-    label: &'static str,
     allow_replace: bool,
 }
 
@@ -229,6 +269,21 @@ impl App {
     fn new_with_output(path: PathBuf, terminal_output: TerminalOutput) -> Result<Self> {
         let initial = resolve_initial_location(&path)?;
         let mut app = Self {
+            keymap: std::sync::Arc::new(crate::keymap::Keymap::default()),
+            key_state: crate::bindings::KeyState::default(),
+            help_offset: 0,
+            help_context: "files".into(),
+            active_job: None,
+            job_progress: None,
+            last_job: None,
+            job_cut_revision: None,
+            transfer_revision: 0,
+            exit_after_job: false,
+            trash_entries: Vec::new(),
+            trash_cursor: 0,
+            trash_error: None,
+            restore_pending: None,
+            actions: None,
             work_root: initial.cwd.clone(),
             cwd: initial.cwd,
             all_entries: Vec::new(),
@@ -300,6 +355,21 @@ impl App {
         ];
         Self {
             work_root: cwd.clone(),
+            keymap: std::sync::Arc::new(crate::keymap::Keymap::default()),
+            key_state: crate::bindings::KeyState::default(),
+            help_offset: 0,
+            help_context: "files".into(),
+            active_job: None,
+            job_progress: None,
+            last_job: None,
+            job_cut_revision: None,
+            transfer_revision: 0,
+            exit_after_job: false,
+            trash_entries: Vec::new(),
+            trash_cursor: 0,
+            trash_error: None,
+            restore_pending: None,
+            actions: None,
             cwd,
             all_entries: entries.clone(),
             entries,
@@ -339,13 +409,13 @@ impl App {
             Command::Cancel => self.cancel(),
             Command::Quit => {
                 if self.mode == Mode::Normal {
-                    self.should_quit = true;
+                    self.request_quit();
                 } else {
                     self.mode = Mode::Normal;
                     self.input.clear();
                 }
             }
-            Command::ForceQuit => self.should_quit = true,
+            Command::ForceQuit => self.request_quit(),
             Command::OpenFilter => {
                 self.mode = Mode::Filter;
                 self.input = self.filter.clone();
@@ -354,7 +424,11 @@ impl App {
                 self.mode = Mode::Goto;
                 self.input.clear();
             }
-            Command::OpenHelp => self.mode = Mode::Help,
+            Command::OpenHelp => {
+                self.help_context = self.key_context().into();
+                self.help_offset = 0;
+                self.mode = Mode::Help;
+            }
             Command::Trash => {
                 self.mode = Mode::ConfirmTrash;
                 self.input.clear();
@@ -368,7 +442,94 @@ impl App {
     }
 
     pub fn handle_command(&mut self, command: Command) {
+        if self.active_job.is_some()
+            && matches!(
+                command,
+                Command::Paste
+                    | Command::CopyTo
+                    | Command::MoveTo
+                    | Command::Rename
+                    | Command::Trash
+                    | Command::PermanentDelete
+                    | Command::Edit
+                    | Command::RestoreTrash
+            )
+        {
+            self.log("file job active; inspect jobs or cancel before another write");
+            return;
+        }
+        if matches!(self.mode, Mode::Help | Mode::Jobs) {
+            match command {
+                Command::Down | Command::HalfDown => {
+                    self.help_offset = self
+                        .help_offset
+                        .saturating_add(1)
+                        .min(self.overlay_line_count().saturating_sub(1));
+                    return;
+                }
+                Command::Up | Command::HalfUp => {
+                    self.help_offset = self.help_offset.saturating_sub(1);
+                    return;
+                }
+                Command::First => {
+                    self.help_offset = 0;
+                    return;
+                }
+                Command::Last => {
+                    self.help_offset = self.overlay_line_count().saturating_sub(1);
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if self.mode == Mode::Trash {
+            match command {
+                Command::Down => {
+                    self.trash_cursor = self
+                        .trash_cursor
+                        .saturating_add(1)
+                        .min(self.trash_entries.len().saturating_sub(1));
+                    return;
+                }
+                Command::Up => {
+                    self.trash_cursor = self.trash_cursor.saturating_sub(1);
+                    return;
+                }
+                Command::First => {
+                    self.trash_cursor = 0;
+                    return;
+                }
+                Command::Last => {
+                    self.trash_cursor = self.trash_entries.len().saturating_sub(1);
+                    return;
+                }
+                _ => {}
+            }
+        }
         match command {
+            Command::OpenActions => self.open_actions(),
+            Command::OpenJobs => {
+                self.help_offset = 0;
+                self.mode = Mode::Jobs;
+            }
+            Command::CancelJob => {
+                if let Some(job) = &self.active_job {
+                    job.cancel();
+                    self.log("cancellation requested; completed items are retained");
+                }
+            }
+            Command::OpenTrash => {
+                self.mode = Mode::Trash;
+                self.load_trash();
+            }
+            Command::RefreshTrash => self.load_trash(),
+            Command::RestoreTrash => {
+                if let Some(entry) = self.trash_entries.get(self.trash_cursor) {
+                    self.restore_pending = Some(entry.receipt_path.clone());
+                    self.mode = Mode::ConfirmRestore;
+                    self.input.clear();
+                }
+            }
             Command::Down => {
                 if self.mode == Mode::Preview {
                     self.scroll_preview(1);
@@ -488,137 +649,88 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            self.handle_command(Command::ForceQuit);
+        if key.kind == crossterm::event::KeyEventKind::Release {
             return;
         }
-        if key.code == KeyCode::Esc {
-            self.handle_command(Command::Cancel);
-            return;
+        let context = self.key_context();
+        let matched = self.key_state.feed(&self.keymap, context, key);
+        self.pending_y = self
+            .key_state
+            .pending
+            .first()
+            .is_some_and(|key| key.code == KeyCode::Char('y'));
+        self.pending_g = self
+            .key_state
+            .pending
+            .first()
+            .is_some_and(|key| key.code == KeyCode::Char('g'));
+        for ch in std::mem::take(&mut self.key_state.replay) {
+            self.input_text(ch);
         }
-        if is_cancel_key(key) {
-            self.handle_command(Command::Cancel);
-            return;
-        }
-        if matches!(
-            self.mode,
-            Mode::Filter
-                | Mode::Goto
-                | Mode::Rename
-                | Mode::CopyTo
-                | Mode::MoveTo
-                | Mode::ConfirmTrash
-                | Mode::ConfirmDelete
-                | Mode::Conflict
-        ) {
-            let command = match key.code {
-                KeyCode::Enter => Some(Command::Submit),
-                KeyCode::Backspace => Some(Command::Backspace),
-                KeyCode::Char(ch) => Some(Command::Input(ch)),
-                _ => None,
-            };
-            if let Some(command) = command {
-                self.handle_command(command);
-            }
-            return;
-        }
-        if self.mode == Mode::PreviewSearch {
-            let command = match key.code {
-                KeyCode::Enter => Some(Command::Submit),
-                KeyCode::Backspace => Some(Command::Backspace),
-                KeyCode::Char(ch) => Some(Command::Input(ch)),
-                _ => None,
-            };
-            if let Some(command) = command {
-                self.handle_command(command);
-            }
-            return;
-        }
-        if self.mode == Mode::Help {
-            match key.code {
-                KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('?') => {
-                    self.handle_command(Command::Cancel)
+        match matched {
+            crate::keymap::KeyMatch::Action(action) => {
+                if action == "force_quit" {
+                    self.handle_command(Command::ForceQuit);
+                    return;
                 }
-                KeyCode::Char('Q') => self.handle_command(Command::ForceQuit),
-                _ => {}
-            }
-            return;
-        }
-        if self.mode == Mode::Preview {
-            if key.code == KeyCode::Char('g') && key.modifiers.is_empty() {
-                if self.pending_g {
-                    self.pending_g = false;
-                    self.handle_command(Command::First);
-                } else {
-                    self.pending_g = true;
+                if let Some(menu) = self.actions.as_mut() {
+                    match menu.handle_action(&action) {
+                        crate::actions::MenuResult::Pending => {}
+                        crate::actions::MenuResult::Cancel => self.actions = None,
+                        crate::actions::MenuResult::Run(command) => {
+                            self.actions = None;
+                            self.handle_command(command);
+                        }
+                    }
+                } else if self.mode == Mode::Trash && action == "refresh" {
+                    self.load_trash();
+                } else if let Some(command) = Command::from_action(&action) {
+                    self.handle_command(command);
                 }
-                return;
             }
-            if self.pending_g {
-                self.pending_g = false;
-            }
-            let command = match key.code {
-                KeyCode::Enter | KeyCode::Char('q') => Some(Command::Cancel),
-                KeyCode::Char('Q') => Some(Command::ForceQuit),
-                KeyCode::Char('j') => Some(Command::HalfDown),
-                KeyCode::Char('k') => Some(Command::HalfUp),
-                KeyCode::Down => Some(Command::Down),
-                KeyCode::Up => Some(Command::Up),
-                KeyCode::PageDown => Some(Command::HalfDown),
-                KeyCode::PageUp => Some(Command::HalfUp),
-                KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    Some(Command::Down)
+            crate::keymap::KeyMatch::Pending => {}
+            crate::keymap::KeyMatch::Unbound => {
+                if let Some(ch) = crate::bindings::printable(key) {
+                    self.input_text(ch);
                 }
-                KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    Some(Command::Up)
-                }
-                KeyCode::Char(' ') => Some(Command::HalfDown),
-                KeyCode::Home => Some(Command::First),
-                KeyCode::End => Some(Command::Last),
-                KeyCode::Char('G') => Some(Command::Last),
-                KeyCode::Char('e') => Some(Command::Edit),
-                KeyCode::Char('/') => Some(Command::OpenPreviewSearch),
-                KeyCode::Char('n') => Some(Command::PreviewSearchNext),
-                KeyCode::Char('N') => Some(Command::PreviewSearchPrev),
-                KeyCode::Char('g') => None,
-                _ => None,
-            };
-            if let Some(command) = command {
-                self.handle_command(command);
-            }
-            return;
-        }
-        if self.pending_y {
-            let command = match key.code {
-                KeyCode::Char('y') => Some(Command::Copy),
-                KeyCode::Char('f') => Some(Command::CopyName),
-                KeyCode::Char('r') => Some(Command::CopyRelativePath),
-                KeyCode::Char('a') => Some(Command::CopyAbsolutePath),
-                _ => None,
-            };
-            self.pending_y = false;
-            if let Some(command) = command {
-                self.handle_command(command);
-                return;
             }
         }
-        if key.code == KeyCode::Char('y') && key.modifiers.is_empty() {
-            self.pending_y = true;
-            return;
+    }
+
+    fn input_text(&mut self, ch: char) {
+        if let Some(menu) = self.actions.as_mut() {
+            menu.input_char(ch);
+        } else {
+            self.handle_input(ch);
         }
-        if key.code == KeyCode::Char('g') && key.modifiers.is_empty() {
-            if self.pending_g {
-                self.pending_g = false;
-                self.handle_command(Command::First);
-            } else {
-                self.pending_g = true;
-            }
-            return;
+    }
+
+    pub fn set_keymap(&mut self, map: crate::keymap::Keymap) {
+        self.keymap = std::sync::Arc::new(map);
+        self.key_state.clear();
+        self.actions = None;
+    }
+    pub fn keymap(&self) -> &crate::keymap::Keymap {
+        &self.keymap
+    }
+    pub fn key_context(&self) -> &'static str {
+        if self.actions.is_some() {
+            return "actions";
         }
-        if let Some(command) = key_to_command(key) {
-            self.handle_command(command);
+        match self.mode {
+            Mode::Normal => "files",
+            Mode::Preview => "preview",
+            Mode::Help | Mode::Message => "help",
+            Mode::Jobs => "jobs",
+            Mode::Trash => "trash",
+            _ => "input",
         }
-        self.pending_g = false;
+    }
+    pub fn help_context(&self) -> &str {
+        &self.help_context
+    }
+    pub fn help_offset(&self) -> usize {
+        self.help_offset
     }
 
     pub fn mode(&self) -> Mode {
@@ -627,6 +739,91 @@ impl App {
 
     pub fn should_quit(&self) -> bool {
         self.should_quit
+    }
+
+    pub fn actions(&self) -> Option<&crate::actions::ActionMenu<Command>> {
+        self.actions.as_ref()
+    }
+
+    fn open_actions(&mut self) {
+        use crate::actions::{Action, ActionMenu};
+        let mut actions = vec![Action::new("Trash recovery", "u", Command::OpenTrash)];
+        actions.push(Action::new("File jobs and results", "J", Command::OpenJobs));
+        if self.active_job.is_some() {
+            actions.push(Action::new(
+                "Cancel active file job",
+                "^X",
+                Command::CancelJob,
+            ));
+        }
+        if self.mode == Mode::Preview {
+            actions.extend([
+                Action::new("Find in preview", "/", Command::OpenPreviewSearch),
+                Action::new("Next match", "n", Command::PreviewSearchNext),
+                Action::new("Previous match", "N", Command::PreviewSearchPrev),
+                Action::new("Top of preview", "gg", Command::First),
+                Action::new("Bottom of preview", "G", Command::Last),
+                Action::new("Close preview", "q", Command::Cancel),
+            ]);
+        } else {
+            if self.copy_buffer_len() > 0 {
+                actions.push(Action::new("Paste buffer", "p", Command::Paste));
+            }
+            if let Some(entry) = self.focused() {
+                actions.push(Action::new(
+                    if entry.kind == FileKind::Directory {
+                        "Open directory"
+                    } else {
+                        "Preview item"
+                    },
+                    "Enter",
+                    Command::Open,
+                ));
+                actions.extend([
+                    Action::new("Mark / unmark item", "Space", Command::ToggleSelect),
+                    Action::new("Copy items", "yy", Command::Copy),
+                    Action::new("Cut items", "x", Command::Cut),
+                    Action::new("Copy to directory", "c", Command::CopyTo),
+                    Action::new("Move to directory", "m", Command::MoveTo),
+                    Action::new("Rename item", "n", Command::Rename),
+                    Action::new("Copy name", "yf", Command::CopyName),
+                    Action::new("Copy relative path", "yr", Command::CopyRelativePath),
+                    Action::new("Copy absolute path", "ya", Command::CopyAbsolutePath),
+                ]);
+            }
+            actions.extend([
+                Action::new("Filter files", "/", Command::OpenFilter),
+                Action::new("Go to directory", ":", Command::OpenGoto),
+                Action::new("Parent directory", "h", Command::Parent),
+                Action::new("Cycle sort", "s", Command::CycleSort),
+                Action::new("Reverse sort", "S", Command::ReverseSort),
+                Action::new("Toggle hidden files", ".", Command::ToggleHidden),
+                Action::new("Select all visible", "a", Command::SelectAll),
+                Action::new("Clear selection", "A", Command::ClearSelection),
+                Action::new("Refresh directory", "r", Command::Refresh),
+                Action::new("Help", "?", Command::OpenHelp),
+            ]);
+            if self.operation_target_count() > 0 {
+                actions.push(Action::new("Trash items (confirm)", "d", Command::Trash).dangerous());
+                actions.push(
+                    Action::new(
+                        "Permanently delete (confirm)",
+                        "D",
+                        Command::PermanentDelete,
+                    )
+                    .dangerous(),
+                );
+            }
+        }
+        if self.focused().is_some_and(|e| e.kind == FileKind::File) {
+            actions.push(Action::new("Edit file", "e", Command::Edit));
+        }
+        let context = self.key_context();
+        for action in &mut actions {
+            action.key = crate::bindings::label(&self.keymap, context, action.command.action_id())
+                .unwrap_or_else(|| "unbound".into());
+        }
+        self.actions = Some(ActionMenu::new(actions).with_bindings(&self.keymap));
     }
 
     pub fn cwd(&self) -> &Path {
@@ -1165,6 +1362,7 @@ impl App {
     }
 
     fn copy_selection(&mut self) {
+        self.transfer_revision = self.transfer_revision.wrapping_add(1);
         let paths = self.operation_targets();
         let len = paths.len();
         self.transfer_buffer = Some(TransferBuffer {
@@ -1175,6 +1373,7 @@ impl App {
     }
 
     fn cut_selection(&mut self) {
+        self.transfer_revision = self.transfer_revision.wrapping_add(1);
         let paths = self.operation_targets();
         let len = paths.len();
         self.transfer_buffer = Some(TransferBuffer {
@@ -1194,7 +1393,6 @@ impl App {
             paths: buffer.paths,
             destination: self.cwd.clone(),
             source: FileOperationSource::TransferBuffer,
-            label: "pasted",
             allow_replace: buffer.kind == TransferKind::Copy,
         };
         self.start_file_operation(operation);
@@ -1220,7 +1418,6 @@ impl App {
             paths: self.operation_targets(),
             destination,
             source: FileOperationSource::Direct,
-            label: if move_items { "moved" } else { "copied" },
             allow_replace: !move_items,
         };
         self.start_file_operation(operation);
@@ -1276,61 +1473,195 @@ impl App {
         replace_existing: bool,
         skip_conflicts: bool,
     ) {
-        let mut completed = 0;
-        let mut skipped = 0;
-        let mut failed_cut_paths = Vec::new();
-        for source in &operation.paths {
-            let target = match destination_for_paste(source, &operation.destination) {
-                Ok(target) => target,
-                Err(err) => {
-                    self.log(format!("{} skipped: {err}", operation.label));
-                    continue;
-                }
-            };
-            if skip_conflicts && target_exists(&target) {
-                skipped += 1;
-                if operation.kind == TransferKind::Cut
-                    && operation.source == FileOperationSource::TransferBuffer
-                {
-                    failed_cut_paths.push(source.clone());
-                }
-                continue;
-            }
-            let result = match operation.kind {
-                TransferKind::Copy => copy_path(source, &target, replace_existing),
-                TransferKind::Cut => rename_path(source, &target),
-            };
-            match result {
-                Ok(()) => completed += 1,
-                Err(err) => {
-                    if operation.kind == TransferKind::Cut
-                        && operation.source == FileOperationSource::TransferBuffer
-                    {
-                        failed_cut_paths.push(source.clone());
-                    }
-                    self.log(format!("{} skipped: {err}", operation.label));
-                }
-            }
-        }
-        if skipped > 0 {
-            self.log(format!("skipped {skipped} existing item(s)"));
-        }
-        self.log(format!("{} {completed} item(s)", operation.label));
-        if operation.kind == TransferKind::Cut
+        let kind = match operation.kind {
+            TransferKind::Copy => crate::jobs::JobKind::Copy {
+                replace: replace_existing,
+                skip_conflicts,
+            },
+            TransferKind::Cut => crate::jobs::JobKind::Move { skip_conflicts },
+        };
+        let cut_revision = if operation.kind == TransferKind::Cut
             && operation.source == FileOperationSource::TransferBuffer
         {
-            self.transfer_buffer = if failed_cut_paths.is_empty() {
-                None
-            } else {
-                Some(TransferBuffer {
-                    kind: TransferKind::Cut,
-                    paths: failed_cut_paths,
-                })
-            };
+            Some(self.transfer_revision)
+        } else {
+            None
+        };
+        if self.start_job(crate::jobs::JobRequest {
+            kind,
+            sources: operation.paths,
+            destination: Some(operation.destination),
+            work_root: self.work_root.clone(),
+        }) {
+            self.job_cut_revision = cut_revision;
         }
-        self.mode = Mode::Normal;
-        self.input.clear();
+    }
+
+    fn start_job(&mut self, request: crate::jobs::JobRequest) -> bool {
+        if self.active_job.is_some() {
+            self.log("file job already active");
+            return false;
+        }
+        match crate::jobs::JobHandle::spawn(request) {
+            Ok(job) => {
+                self.job_progress = Some(job.progress());
+                self.last_job = None;
+                self.active_job = Some(job);
+                self.mode = Mode::Normal;
+                self.input.clear();
+                self.log("file job started; browsing remains available");
+                true
+            }
+            Err(error) => {
+                self.log(format!("job rejected: {error:#}"));
+                false
+            }
+        }
+    }
+
+    fn request_quit(&mut self) {
+        if let Some(job) = &self.active_job {
+            job.cancel();
+            self.exit_after_job = true;
+            self.mode = Mode::Jobs;
+            self.log("waiting for cancellation and cleanup before exit");
+        } else {
+            self.should_quit = true;
+        }
+    }
+
+    pub fn job_active(&self) -> bool {
+        self.active_job.is_some()
+    }
+    pub fn job_progress(&self) -> Option<&crate::jobs::JobProgress> {
+        self.job_progress.as_ref()
+    }
+    pub fn last_job(&self) -> Option<&crate::jobs::JobResult> {
+        self.last_job.as_ref()
+    }
+    pub fn exit_after_job(&self) -> bool {
+        self.exit_after_job
+    }
+    pub fn trash_entries(&self) -> &[crate::trash::TrashEntry] {
+        &self.trash_entries
+    }
+    pub fn trash_cursor(&self) -> usize {
+        self.trash_cursor
+    }
+    pub fn trash_error(&self) -> Option<&str> {
+        self.trash_error.as_deref()
+    }
+    pub fn restore_target(&self) -> Option<&Path> {
+        let receipt = self.restore_pending.as_ref()?;
+        self.trash_entries
+            .iter()
+            .find(|entry| &entry.receipt_path == receipt)
+            .map(|entry| entry.original_path.as_path())
+    }
+    pub fn overlay_line_count(&self) -> usize {
+        if self.mode == Mode::Help {
+            self.keymap.bindings(&self.help_context).len() + 2
+        } else {
+            12 + self
+                .last_job
+                .as_ref()
+                .map(|r| (r.failed.len() + r.skipped.len() + r.unprocessed.len()).min(100))
+                .unwrap_or(0)
+        }
+    }
+
+    fn load_trash(&mut self) {
+        match crate::trash::scan_trash(&self.work_root) {
+            Ok(scan) => {
+                self.trash_entries = scan.entries;
+                self.trash_error = if scan.warning_count > 0 {
+                    Some(format!(
+                        "{} invalid receipts skipped: {}",
+                        scan.warning_count,
+                        scan.warnings
+                            .first()
+                            .map(String::as_str)
+                            .unwrap_or("inspect metadata")
+                    ))
+                } else {
+                    None
+                };
+            }
+            Err(error) => {
+                self.trash_entries.clear();
+                self.trash_error = Some(format!("{error:#}"));
+            }
+        }
+        self.trash_cursor = self
+            .trash_cursor
+            .min(self.trash_entries.len().saturating_sub(1));
+    }
+
+    /// Consume coalesced progress and a completion receipt without waiting on I/O.
+    pub fn poll_job(&mut self) -> bool {
+        let Some(job) = self.active_job.as_mut() else {
+            return false;
+        };
+        let progress = job.progress();
+        let changed = self.job_progress.as_ref().is_none_or(|old| {
+            old.current_path != progress.current_path
+                || old.copied_bytes != progress.copied_bytes
+                || old.completed != progress.completed
+                || old.cancelling != progress.cancelling
+        });
+        self.job_progress = Some(progress);
+        if !job.is_finished() {
+            return changed;
+        }
+        let result = job.try_result().unwrap_or_else(|| crate::jobs::JobResult {
+            failed: vec![crate::jobs::JobFailure {
+                path: self.cwd.clone(),
+                error: "worker stopped without a receipt; inspect targets before retry".into(),
+            }],
+            ..Default::default()
+        });
+        self.active_job = None;
+        if self.job_cut_revision.take() == Some(self.transfer_revision)
+            && let Some(buffer) = &mut self.transfer_buffer
+            && buffer.kind == TransferKind::Cut
+        {
+            buffer.paths.retain(|path| !result.succeeded.contains(path));
+            if buffer.paths.is_empty() {
+                self.transfer_buffer = None;
+            }
+        }
+        self.log(format!(
+            "{}{}: {} completed, {} failed, {} skipped, {} remaining",
+            self.job_progress
+                .as_ref()
+                .map(|p| p.label.as_str())
+                .unwrap_or("Job"),
+            if result.cancelled {
+                " cancelled"
+            } else {
+                " finished"
+            },
+            result.succeeded.len(),
+            result.failed.len(),
+            result.skipped.len(),
+            result.unprocessed.len()
+        ));
+        for error in result.failed.iter().take(3) {
+            self.log(format!(
+                "job failed: {}: {}",
+                error.path.display(),
+                error.error
+            ));
+        }
+        self.last_job = Some(result);
         self.reload();
+        if self.mode == Mode::Trash {
+            self.load_trash();
+        }
+        if self.exit_after_job {
+            self.should_quit = true;
+        }
+        true
     }
 
     fn conflict_targets(&self, operation: &PendingFileOperation) -> Vec<PathBuf> {
@@ -1350,7 +1681,7 @@ impl App {
                 self.reload();
             }
             Mode::PreviewSearch => self.execute_preview_search(),
-            Mode::Preview => {}
+            Mode::Preview | Mode::Jobs | Mode::Trash => {}
             Mode::Goto => self.submit_goto(),
             Mode::Rename => self.submit_rename(),
             Mode::CopyTo => self.copy_to_destination(false),
@@ -1359,17 +1690,28 @@ impl App {
                 if self.input == "trash" {
                     self.submit_trash();
                 } else {
-                    self.log("type trash then Enter to move to .tersh-trash");
+                    self.log("type trash then submit to move to .tersh-trash");
                 }
             }
             Mode::ConfirmDelete => {
                 if self.input == "delete" {
                     self.submit_delete();
                 } else {
-                    self.log("type delete then Enter for permanent delete");
+                    self.log("type delete then submit for permanent delete");
                 }
             }
             Mode::Conflict => self.submit_conflict(),
+            Mode::ConfirmRestore => {
+                if let Some(receipt) = self.restore_pending.take() {
+                    self.start_job(crate::jobs::JobRequest {
+                        kind: crate::jobs::JobKind::Restore,
+                        sources: vec![receipt],
+                        destination: None,
+                        work_root: self.work_root.clone(),
+                    });
+                    self.mode = Mode::Trash;
+                }
+            }
             Mode::Help | Mode::Message => self.mode = Mode::Normal,
             Mode::Normal => {}
         }
@@ -1416,35 +1758,21 @@ impl App {
     }
 
     fn submit_trash(&mut self) {
-        let targets = self.operation_targets();
-        let mut moved = 0;
-        for target in targets {
-            match trash_path(&target, &self.work_root) {
-                Ok(_) => moved += 1,
-                Err(err) => self.log(format!("trash failed: {err}")),
-            }
-        }
-        self.log(format!("trashed {moved} item(s)"));
-        self.mode = Mode::Normal;
-        self.input.clear();
-        self.selected.clear();
-        self.reload();
+        self.start_job(crate::jobs::JobRequest {
+            kind: crate::jobs::JobKind::Trash,
+            sources: self.operation_targets(),
+            destination: None,
+            work_root: self.work_root.clone(),
+        });
     }
 
     fn submit_delete(&mut self) {
-        let targets = self.operation_targets();
-        let mut deleted = 0;
-        for target in targets {
-            match permanent_delete(&target, &self.work_root) {
-                Ok(_) => deleted += 1,
-                Err(err) => self.log(format!("delete failed: {err}")),
-            }
-        }
-        self.log(format!("deleted {deleted} item(s)"));
-        self.mode = Mode::Normal;
-        self.input.clear();
-        self.selected.clear();
-        self.reload();
+        self.start_job(crate::jobs::JobRequest {
+            kind: crate::jobs::JobKind::Delete,
+            sources: self.operation_targets(),
+            destination: None,
+            work_root: self.work_root.clone(),
+        });
     }
 
     fn handle_input(&mut self, ch: char) {
@@ -1470,6 +1798,12 @@ impl App {
     }
 
     fn cancel(&mut self) {
+        if self.mode == Mode::ConfirmRestore {
+            self.restore_pending = None;
+            self.mode = Mode::Trash;
+            self.input.clear();
+            return;
+        }
         self.pending_g = false;
         self.pending_y = false;
         match self.mode {
@@ -1581,27 +1915,41 @@ pub fn run(path: PathBuf) -> Result<()> {
 }
 
 pub fn run_with_options(path: PathBuf, options: RunOptions) -> Result<()> {
+    run_with_keymap(path, options, crate::keymap::Keymap::default())
+}
+
+pub fn run_with_keymap(
+    path: PathBuf,
+    options: RunOptions,
+    keymap: crate::keymap::Keymap,
+) -> Result<()> {
     let output = if options.print_cwd {
         TerminalOutput::Stderr
     } else {
         TerminalOutput::Stdout
     };
-    let final_cwd = run_tui(path, output)?;
+    let final_cwd = run_tui(path, output, keymap)?;
     if options.print_cwd {
         println!("{}", final_cwd.display());
     }
     Ok(())
 }
 
-fn run_tui(path: PathBuf, output: TerminalOutput) -> Result<PathBuf> {
+fn run_tui(
+    path: PathBuf,
+    output: TerminalOutput,
+    keymap: crate::keymap::Keymap,
+) -> Result<PathBuf> {
     let _guard = TerminalGuard::enter(output)?;
     let backend = CrosstermBackend::new(output.writer());
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
     let mut app = App::new_with_output(path, output)?;
+    app.set_keymap(keymap);
     let mut dirty = true;
 
     while !app.should_quit() {
+        dirty |= app.poll_job();
         if dirty {
             terminal.draw(|frame| crate::ui::draw(frame, &app))?;
             dirty = false;
@@ -1624,51 +1972,6 @@ fn run_tui(path: PathBuf, output: TerminalOutput) -> Result<PathBuf> {
         }
     }
     Ok(app.cwd().to_path_buf())
-}
-
-fn key_to_command(key: KeyEvent) -> Option<Command> {
-    if key.modifiers.contains(KeyModifiers::CONTROL) {
-        return match key.code {
-            KeyCode::Char('c') => Some(Command::ForceQuit),
-            KeyCode::Char('g') => Some(Command::Cancel),
-            KeyCode::Char('d') => Some(Command::HalfDown),
-            KeyCode::Char('u') => Some(Command::HalfUp),
-            _ => None,
-        };
-    }
-    match key.code {
-        KeyCode::Char('j') | KeyCode::Down => Some(Command::Down),
-        KeyCode::Char('k') | KeyCode::Up => Some(Command::Up),
-        KeyCode::PageDown => Some(Command::HalfDown),
-        KeyCode::PageUp => Some(Command::HalfUp),
-        KeyCode::Home => Some(Command::First),
-        KeyCode::End => Some(Command::Last),
-        KeyCode::Char('G') => Some(Command::Last),
-        KeyCode::Char('h') | KeyCode::Backspace => Some(Command::Parent),
-        KeyCode::Char('l') | KeyCode::Enter => Some(Command::Open),
-        KeyCode::Char(':') => Some(Command::OpenGoto),
-        KeyCode::Char('/') => Some(Command::OpenFilter),
-        KeyCode::Char('.') => Some(Command::ToggleHidden),
-        KeyCode::Char(' ') => Some(Command::ToggleSelect),
-        KeyCode::Char('a') => Some(Command::SelectAll),
-        KeyCode::Char('A') => Some(Command::ClearSelection),
-        KeyCode::Char('x') => Some(Command::Cut),
-        KeyCode::Char('p') => Some(Command::Paste),
-        KeyCode::Char('c') => Some(Command::CopyTo),
-        KeyCode::Char('m') => Some(Command::MoveTo),
-        KeyCode::Char('n') => Some(Command::Rename),
-        KeyCode::Char('d') => Some(Command::Trash),
-        KeyCode::Char('D') => Some(Command::PermanentDelete),
-        KeyCode::Char('r') => Some(Command::Refresh),
-        KeyCode::Char('s') => Some(Command::CycleSort),
-        KeyCode::Char('S') => Some(Command::ReverseSort),
-        KeyCode::Char('e') => Some(Command::Edit),
-        KeyCode::Char('?') => Some(Command::OpenHelp),
-        KeyCode::Char('q') => Some(Command::Quit),
-        KeyCode::Char('Q') => Some(Command::ForceQuit),
-        KeyCode::Char(ch) => Some(Command::Input(ch)),
-        _ => None,
-    }
 }
 
 fn preview_signature(path: &Path) -> Option<PreviewSignature> {
@@ -1941,11 +2244,6 @@ fn editor_command_parts() -> Result<Vec<String>> {
     };
     let command = command.to_string_lossy().to_string();
     parse_command(command).ok_or_else(|| anyhow::anyhow!("invalid editor command"))
-}
-
-fn is_cancel_key(key: KeyEvent) -> bool {
-    key.modifiers.contains(KeyModifiers::CONTROL)
-        && matches!(key.code, KeyCode::Char('g') | KeyCode::Char('G'))
 }
 
 #[derive(Debug, Clone, Copy)]

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use std::{
     fs::{self, File, OpenOptions},
-    io,
+    io::{self, Read, Write},
     path::{Component, Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -11,18 +11,34 @@ pub enum DeleteDecision {
     MovedToTrash { from: PathBuf, to: PathBuf },
 }
 
-pub fn copy_path(source: &Path, target: &Path, replace: bool) -> Result<()> {
+/// The observer is called at recursive boundaries and after at most 128 KiB.
+/// Returning an error aborts the current root copy and removes its incomplete output.
+pub fn copy_path_cancellable(
+    source: &Path,
+    target: &Path,
+    replace: bool,
+    observer: &mut dyn FnMut(&Path, u64) -> Result<()>,
+) -> Result<()> {
+    observer(source, 0)?;
     if path_exists_no_follow(target)? {
         if replace {
-            return replace_path(source, target);
-        } else {
-            bail!("target already exists: {}", target.display());
+            return replace_path(source, target, observer);
         }
+        bail!("target already exists: {}", target.display());
     }
-    copy_path_no_replace(source, target)
+    copy_path_no_replace(source, target, observer)
 }
 
-fn copy_path_no_replace(source: &Path, target: &Path) -> Result<()> {
+pub fn copy_path(source: &Path, target: &Path, replace: bool) -> Result<()> {
+    copy_path_cancellable(source, target, replace, &mut |_, _| Ok(()))
+}
+
+fn copy_path_no_replace(
+    source: &Path,
+    target: &Path,
+    observer: &mut dyn FnMut(&Path, u64) -> Result<()>,
+) -> Result<()> {
+    observer(source, 0)?;
     let metadata = fs::symlink_metadata(source)
         .with_context(|| format!("failed to inspect {}", source.display()))?;
     let identity = FileIdentity::from_metadata(&metadata);
@@ -38,34 +54,54 @@ fn copy_path_no_replace(source: &Path, target: &Path) -> Result<()> {
         let is_dir = symlink_target_is_dir_for_creation(source, &link_target)?;
         create_symlink(&link_target, target, is_dir)
     } else if metadata.is_dir() {
-        copy_dir_recursive(source, target, &metadata, &identity)
+        copy_dir_recursive(source, target, &metadata, &identity, observer)
     } else if metadata.is_file() {
-        copy_regular_file(source, target, &metadata, &identity)
+        copy_regular_file(source, target, &metadata, &identity, observer)
     } else {
         bail!("unsupported file type: {}", source.display());
     }
 }
 
-fn replace_path(source: &Path, target: &Path) -> Result<()> {
+fn replace_path(
+    source: &Path,
+    target: &Path,
+    observer: &mut dyn FnMut(&Path, u64) -> Result<()>,
+) -> Result<()> {
+    let target_identity = capture_path_identity(target)?;
     let temp = temp_sibling_path(target)?;
-    let copy_result = copy_path_no_replace(source, &temp);
-    if let Err(err) = copy_result {
-        let _ = remove_existing(&temp);
+    let staged = (|| {
+        copy_path_no_replace(source, &temp, observer)?;
+        observer(source, 0)?;
+        ensure_path_identity(target, &target_identity)
+    })();
+    if let Err(err) = staged {
+        let _ = remove_copy_output(&temp);
         return Err(err);
     }
-
-    remove_existing(target)
-        .with_context(|| format!("failed to remove existing {}", target.display()))?;
-    if let Err(err) = rename_no_replace(&temp, target) {
-        let _ = remove_existing(&temp);
-        return Err(err).with_context(|| {
-            format!(
-                "failed to replace {} with {}",
-                target.display(),
-                source.display()
-            )
-        });
+    // Commit is one non-cancellable section. Keep the old target until the new
+    // complete copy is installed, with a no-clobber rollback if installation fails.
+    let backup = temp_sibling_path(target)?;
+    if let Err(err) = rename_no_replace(target, &backup) {
+        let _ = remove_copy_output(&temp);
+        return Err(err).context("failed to preserve replacement target");
     }
+    if let Err(err) = rename_no_replace(&temp, target) {
+        let rollback = rename_no_replace(&backup, target);
+        let _ = remove_copy_output(&temp);
+        return match rollback {
+            Ok(()) => Err(err).context("failed to install replacement; original restored"),
+            Err(rollback) => Err(anyhow!(
+                "failed to install replacement: {err}; original retained at {} (rollback: {rollback})",
+                backup.display()
+            )),
+        };
+    }
+    remove_existing(&backup).with_context(|| {
+        format!(
+            "replacement installed; failed to remove old backup {}",
+            backup.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -83,43 +119,10 @@ pub fn rename_path(source: &Path, target: &Path) -> Result<()> {
 }
 
 pub fn trash_path(path: &Path, work_root: &Path) -> Result<DeleteDecision> {
-    let guarded = guard_delete_target(path, work_root)?;
-    let trash_dir = prepare_trash_dir(work_root)?;
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| anyhow!("cannot trash path without file name: {}", path.display()))?;
-    for attempt in 0..100 {
-        let target = if attempt == 0 {
-            trash_dir.join(file_name)
-        } else {
-            trash_dir.join(format!(
-                "{}.{}",
-                file_name.to_string_lossy(),
-                unique_suffix()
-            ))
-        };
-        ensure_path_identity(path, &guarded.identity)?;
-        match rename_no_replace(path, &target) {
-            Ok(()) => {
-                return Ok(DeleteDecision::MovedToTrash {
-                    from: path.to_path_buf(),
-                    to: target,
-                });
-            }
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(err) => {
-                return Err(err)
-                    .with_context(|| format!("failed to move {} to trash", path.display()));
-            }
-        }
-    }
-    bail!(
-        "failed to allocate unique trash target for {}",
-        path.display()
-    );
+    crate::trash::trash_path(path, work_root)
 }
 
-fn prepare_trash_dir(work_root: &Path) -> Result<PathBuf> {
+pub(crate) fn prepare_trash_dir(work_root: &Path) -> Result<PathBuf> {
     let trash_dir = work_root.join(".tersh-trash");
     match fs::symlink_metadata(&trash_dir) {
         Ok(metadata) => {
@@ -188,6 +191,7 @@ fn copy_regular_file(
     target: &Path,
     metadata: &fs::Metadata,
     identity: &FileIdentity,
+    observer: &mut dyn FnMut(&Path, u64) -> Result<()>,
 ) -> Result<()> {
     create_parent_dir(target)?;
     ensure_path_identity(source, identity)?;
@@ -204,13 +208,22 @@ fn copy_regular_file(
         .create_new(true)
         .open(target)
         .with_context(|| format!("failed to create {}", target.display()))?;
-    if let Err(err) = io::copy(&mut input, &mut output).with_context(|| {
-        format!(
-            "failed to copy {} to {}",
-            source.display(),
-            target.display()
-        )
-    }) {
+    let copied = (|| {
+        let mut buffer = [0_u8; 128 * 1024];
+        loop {
+            observer(source, 0)?;
+            let count = input.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            output.write_all(&buffer[..count])?;
+            observer(source, count as u64)?;
+        }
+        ensure_path_identity(source, identity)?;
+        Ok(())
+    })();
+    if let Err(err) = copied {
+        drop(output);
         let _ = fs::remove_file(target);
         return Err(err);
     }
@@ -223,23 +236,27 @@ fn copy_dir_recursive(
     target: &Path,
     metadata: &fs::Metadata,
     identity: &FileIdentity,
+    observer: &mut dyn FnMut(&Path, u64) -> Result<()>,
 ) -> Result<()> {
     create_parent_dir(target)?;
     fs::create_dir(target)
         .with_context(|| format!("failed to create directory {}", target.display()))?;
-    fs::set_permissions(target, metadata.permissions()).ok();
     let result = (|| {
         ensure_path_identity(source, identity)?;
         for entry in fs::read_dir(source)? {
             let entry = entry?;
             let child_source = entry.path();
             let child_target = target.join(entry.file_name());
-            copy_path(&child_source, &child_target, false)?;
+            observer(source, 0)?;
+            ensure_same_object(source, identity)?;
+            copy_path_no_replace(&child_source, &child_target, observer)?;
         }
         Ok(())
     })();
     if result.is_err() {
-        let _ = remove_existing(target);
+        let _ = remove_copy_output(target);
+    } else {
+        fs::set_permissions(target, metadata.permissions()).ok();
     }
     result
 }
@@ -268,7 +285,7 @@ fn reject_copy_into_self(source: &Path, target: &Path) -> Result<()> {
     Ok(())
 }
 
-fn path_exists_no_follow(path: &Path) -> Result<bool> {
+pub(crate) fn path_exists_no_follow(path: &Path) -> Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -276,8 +293,9 @@ fn path_exists_no_follow(path: &Path) -> Result<bool> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct FileIdentity {
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FileIdentity {
     is_dir: bool,
     is_file: bool,
     is_symlink: bool,
@@ -308,16 +326,243 @@ impl FileIdentity {
     }
 }
 
-fn capture_path_identity(path: &Path) -> Result<FileIdentity> {
+pub(crate) fn capture_path_identity(path: &Path) -> Result<FileIdentity> {
     fs::symlink_metadata(path)
         .map(|metadata| FileIdentity::from_metadata(&metadata))
         .with_context(|| format!("failed to inspect {}", path.display()))
 }
 
-fn ensure_path_identity(path: &Path, expected: &FileIdentity) -> Result<()> {
+pub(crate) fn ensure_path_identity(path: &Path, expected: &FileIdentity) -> Result<()> {
     let actual = capture_path_identity(path)?;
     if &actual != expected {
         bail!("path changed during operation: {}", path.display());
+    }
+    Ok(())
+}
+
+pub(crate) fn ensure_same_object(path: &Path, expected: &FileIdentity) -> Result<()> {
+    let actual = capture_path_identity(path)?;
+    #[cfg(unix)]
+    let same = actual.dev == expected.dev
+        && actual.ino == expected.ino
+        && actual.is_dir == expected.is_dir
+        && actual.is_symlink == expected.is_symlink;
+    #[cfg(not(unix))]
+    let same = actual.is_dir == expected.is_dir && actual.is_symlink == expected.is_symlink;
+    if !same {
+        bail!("path changed during operation: {}", path.display());
+    }
+    Ok(())
+}
+
+/// Cancellation of a directory deletion can leave a partially deleted tree.
+/// Symlinks are removed as links and never traversed.
+pub fn permanent_delete_cancellable(
+    path: &Path,
+    work_root: &Path,
+    observer: &mut dyn FnMut(&Path, u64) -> Result<()>,
+) -> Result<()> {
+    let guarded = guard_delete_target(path, work_root)?;
+    ensure_path_identity(path, &guarded.identity)?;
+    #[cfg(unix)]
+    {
+        delete_unix_cancellable(path, &guarded.identity, observer)
+    }
+    #[cfg(not(unix))]
+    {
+        delete_recursive_cancellable(path, observer)
+    }
+}
+
+#[cfg(not(unix))]
+fn delete_recursive_cancellable(
+    path: &Path,
+    observer: &mut dyn FnMut(&Path, u64) -> Result<()>,
+) -> Result<()> {
+    observer(path, 0)?;
+    let metadata = fs::symlink_metadata(path)?;
+    let identity = FileIdentity::from_metadata(&metadata);
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        ensure_path_identity(path, &identity)?;
+        for child in fs::read_dir(path)? {
+            observer(path, 0)?;
+            ensure_same_object(path, &identity)?;
+            delete_recursive_cancellable(&child?.path(), observer)?;
+        }
+        observer(path, 0)?;
+        ensure_same_object(path, &identity)?;
+        fs::remove_dir(path)?;
+    } else {
+        ensure_path_identity(path, &identity)?;
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+// Pin each directory by descriptor. Path-based recursion can traverse an
+// unrelated directory if another process swaps an ancestor for a symlink.
+#[cfg(unix)]
+fn delete_unix_cancellable(
+    path: &Path,
+    identity: &FileIdentity,
+    observer: &mut dyn FnMut(&Path, u64) -> Result<()>,
+) -> Result<()> {
+    use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("delete target has no parent"))?;
+    let parent_identity = capture_path_identity(parent)?;
+    let parent_handle = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(parent)?;
+    if FileIdentity::from_metadata(&parent_handle.metadata()?) != parent_identity {
+        bail!("delete parent changed while opening");
+    }
+    let name = cstring_path(Path::new(
+        path.file_name()
+            .ok_or_else(|| anyhow!("missing file name"))?,
+    ))?;
+    delete_at(
+        parent_handle.as_raw_fd(),
+        &name,
+        path,
+        Some(identity),
+        observer,
+    )
+}
+
+#[cfg(unix)]
+fn delete_at(
+    parent: std::os::fd::RawFd,
+    name: &std::ffi::CStr,
+    display: &Path,
+    expected: Option<&FileIdentity>,
+    observer: &mut dyn FnMut(&Path, u64) -> Result<()>,
+) -> Result<()> {
+    use std::os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::ffi::OsStrExt,
+    };
+    observer(display, 0)?;
+    let before = stat_at(parent, name)?;
+    if let Some(expected) = expected {
+        if before.st_dev as u64 != expected.dev || before.st_ino != expected.ino {
+            bail!("delete target changed while opening");
+        }
+    }
+    if before.st_mode & libc::S_IFMT == libc::S_IFDIR {
+        let raw = unsafe {
+            libc::openat(
+                parent,
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if raw < 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        let directory = unsafe { File::from_raw_fd(raw) };
+        let opened = FileIdentity::from_metadata(&directory.metadata()?);
+        if opened.dev != before.st_dev as u64 || opened.ino != before.st_ino {
+            bail!("directory changed while opening: {}", display.display());
+        }
+        let duplicate = unsafe { libc::dup(directory.as_raw_fd()) };
+        if duplicate < 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        let stream = unsafe { libc::fdopendir(duplicate) };
+        if stream.is_null() {
+            let error = io::Error::last_os_error();
+            unsafe {
+                libc::close(duplicate);
+            }
+            return Err(error.into());
+        }
+        struct DirectoryStream(*mut libc::DIR);
+        impl Drop for DirectoryStream {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::closedir(self.0);
+                }
+            }
+        }
+        let stream = DirectoryStream(stream);
+        loop {
+            // A readdir error is treated as an error; it must not look like EOF.
+            #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+            unsafe {
+                *libc::__error() = 0;
+            }
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            unsafe {
+                *libc::__errno_location() = 0;
+            }
+            let entry = unsafe { libc::readdir(stream.0) };
+            if entry.is_null() {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error().unwrap_or_default() != 0 {
+                    return Err(error.into());
+                }
+                break;
+            }
+            let child = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_owned();
+            if child.to_bytes() == b"." || child.to_bytes() == b".." {
+                continue;
+            }
+            observer(display, 0)?;
+            let child_display = display.join(std::ffi::OsStr::from_bytes(child.to_bytes()));
+            delete_at(
+                directory.as_raw_fd(),
+                &child,
+                &child_display,
+                None,
+                observer,
+            )?;
+        }
+        observer(display, 0)?;
+        ensure_stat_at(parent, name, &before)?;
+        if unsafe { libc::unlinkat(parent, name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+    } else {
+        ensure_stat_at(parent, name, &before)?;
+        if unsafe { libc::unlinkat(parent, name.as_ptr(), 0) } != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn stat_at(parent: std::os::fd::RawFd, name: &std::ffi::CStr) -> Result<libc::stat> {
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe {
+        libc::fstatat(
+            parent,
+            name.as_ptr(),
+            metadata.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(unsafe { metadata.assume_init() })
+}
+
+#[cfg(unix)]
+fn ensure_stat_at(
+    parent: std::os::fd::RawFd,
+    name: &std::ffi::CStr,
+    expected: &libc::stat,
+) -> Result<()> {
+    let actual = stat_at(parent, name)?;
+    if actual.st_dev != expected.st_dev
+        || actual.st_ino != expected.st_ino
+        || actual.st_mode & libc::S_IFMT != expected.st_mode & libc::S_IFMT
+    {
+        bail!("path changed during deletion");
     }
     Ok(())
 }
@@ -378,6 +623,29 @@ fn symlink_target_is_dir_for_creation(source: &Path, link_target: &Path) -> Resu
     }
 }
 
+// Only use this for staging trees created by this copy. A completed child may
+// already have inherited read-only source permissions when a later step aborts.
+fn remove_copy_output(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                path,
+                fs::Permissions::from_mode(metadata.permissions().mode() | 0o700),
+            )?;
+        }
+        for child in fs::read_dir(path)? {
+            remove_copy_output(&child?.path())?;
+        }
+        fs::remove_dir(path)?;
+    } else {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
 fn remove_existing(path: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.is_dir() && !metadata.file_type().is_symlink() {
@@ -388,11 +656,11 @@ fn remove_existing(path: &Path) -> Result<()> {
     Ok(())
 }
 
-struct GuardedDeleteTarget {
-    identity: FileIdentity,
+pub(crate) struct GuardedDeleteTarget {
+    pub(crate) identity: FileIdentity,
 }
 
-fn guard_delete_target(path: &Path, work_root: &Path) -> Result<GuardedDeleteTarget> {
+pub(crate) fn guard_delete_target(path: &Path, work_root: &Path) -> Result<GuardedDeleteTarget> {
     if path.as_os_str().is_empty() || !path.is_absolute() {
         bail!("refusing to delete non-absolute path: {}", path.display());
     }
@@ -429,7 +697,7 @@ fn guard_delete_target(path: &Path, work_root: &Path) -> Result<GuardedDeleteTar
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
-fn rename_no_replace(source: &Path, target: &Path) -> io::Result<()> {
+pub(crate) fn rename_no_replace(source: &Path, target: &Path) -> io::Result<()> {
     let source = cstring_path(source)?;
     let target = cstring_path(target)?;
     let result = unsafe { libc::renamex_np(source.as_ptr(), target.as_ptr(), libc::RENAME_EXCL) };
@@ -441,7 +709,7 @@ fn rename_no_replace(source: &Path, target: &Path) -> io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn rename_no_replace(source: &Path, target: &Path) -> io::Result<()> {
+pub(crate) fn rename_no_replace(source: &Path, target: &Path) -> io::Result<()> {
     let source = cstring_path(source)?;
     let target = cstring_path(target)?;
     let result = unsafe {
@@ -465,12 +733,12 @@ fn rename_no_replace(source: &Path, target: &Path) -> io::Result<()> {
     unix,
     not(any(target_os = "macos", target_os = "ios", target_os = "linux"))
 ))]
-fn rename_no_replace(source: &Path, target: &Path) -> io::Result<()> {
+pub(crate) fn rename_no_replace(source: &Path, target: &Path) -> io::Result<()> {
     fs::rename(source, target)
 }
 
 #[cfg(windows)]
-fn rename_no_replace(source: &Path, target: &Path) -> io::Result<()> {
+pub(crate) fn rename_no_replace(source: &Path, target: &Path) -> io::Result<()> {
     fs::rename(source, target)
 }
 
@@ -482,7 +750,7 @@ fn cstring_path(path: &Path) -> io::Result<std::ffi::CString> {
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))
 }
 
-fn delete_identity(path: &Path) -> Result<PathBuf> {
+pub(crate) fn delete_identity(path: &Path) -> Result<PathBuf> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("failed to inspect delete target {}", path.display()))?;
     if metadata.file_type().is_symlink() {
@@ -500,7 +768,7 @@ fn delete_identity(path: &Path) -> Result<PathBuf> {
         .with_context(|| format!("failed to resolve delete target {}", path.display()))
 }
 
-fn unique_suffix() -> String {
+pub(crate) fn unique_suffix() -> String {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

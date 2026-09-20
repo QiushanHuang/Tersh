@@ -1,13 +1,13 @@
 use anyhow::{Context, Result};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{self, Event, KeyEvent},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 use serde::Deserialize;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     env, fs, io,
     path::{Path, PathBuf},
     process::{Child, Command as ProcessCommand, Stdio},
@@ -450,6 +450,7 @@ pub enum ClusterMode {
     Normal,
     Detail,
     Help,
+    Filter,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -467,11 +468,84 @@ pub enum ClusterCommand {
     Cancel,
     Quit,
     ForceQuit,
+    DetailDown,
+    DetailUp,
+    OpenFilter,
+    ClearFilter,
+    CycleSort,
+    ReverseSort,
+    OpenActions,
+}
+
+macro_rules! cluster_actions {
+    ($($variant:ident=>$id:literal),* $(,)?) => {
+        impl ClusterCommand {
+            pub fn action_id(self)-> &'static str { match self { $(Self::$variant=>$id,)* } }
+            pub fn from_action(id:&str)->Option<Self> { match id { $($id=>Some(Self::$variant),)* _=>None } }
+        }
+    }
+}
+cluster_actions! { Down=>"down",Up=>"up",First=>"first",Last=>"last",RefreshAll=>"refresh_all",RefreshSelected=>"refresh_selected",
+OpenSession=>"open_session",OpenWorkbench=>"open_workbench",OpenDetail=>"open_detail",OpenHelp=>"open_help",Cancel=>"cancel",
+Quit=>"quit",ForceQuit=>"force_quit",DetailDown=>"detail_down",DetailUp=>"detail_up",OpenFilter=>"open_filter",ClearFilter=>"clear_filter",
+CycleSort=>"cycle_sort",ReverseSort=>"reverse_sort",OpenActions=>"open_actions" }
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HostSort {
+    #[default]
+    Inventory,
+    Alias,
+    State,
+    Load,
+    Memory,
+    Disk,
+    Probe,
+}
+
+impl HostSort {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Inventory => "inventory",
+            Self::Alias => "alias",
+            Self::State => "state",
+            Self::Load => "load",
+            Self::Memory => "memory",
+            Self::Disk => "disk",
+            Self::Probe => "probe",
+        }
+    }
+    fn next(self) -> Self {
+        match self {
+            Self::Inventory => Self::Alias,
+            Self::Alias => Self::State,
+            Self::State => Self::Load,
+            Self::Load => Self::Memory,
+            Self::Memory => Self::Disk,
+            Self::Disk => Self::Probe,
+            Self::Probe => Self::Inventory,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct ClusterApp {
+    keymap: std::sync::Arc<crate::keymap::Keymap>,
+    key_state: crate::bindings::KeyState,
+    help_offset: usize,
+    help_context: String,
+    actions: Option<crate::actions::ActionMenu<ClusterCommand>>,
+    history: BTreeMap<String, VecDeque<crate::metrics::MetricSample>>,
+    detail_offset: u16,
+    detail_limit: std::cell::Cell<u16>,
+    animation_frame: u64,
     hosts: Vec<HostConfig>,
+    visible: Vec<usize>,
+    filter: String,
+    filter_before: String,
+    filter_origin: ClusterMode,
+    filter_anchor: Option<String>,
+    sort: HostSort,
+    sort_reverse: bool,
     snapshots: BTreeMap<String, HostSnapshot>,
     last_good_reports: BTreeMap<String, ProbeReport>,
     refresh_deadlines: BTreeMap<String, Instant>,
@@ -504,7 +578,23 @@ impl ClusterApp {
             })
             .collect();
         Self {
+            keymap: std::sync::Arc::new(crate::keymap::Keymap::default()),
+            key_state: crate::bindings::KeyState::default(),
+            help_offset: 0,
+            help_context: "cluster".into(),
+            visible: (0..hosts.len()).collect(),
+            filter: String::new(),
+            filter_before: String::new(),
+            filter_origin: ClusterMode::Normal,
+            filter_anchor: None,
+            sort: HostSort::Inventory,
+            sort_reverse: false,
             hosts,
+            actions: None,
+            history: BTreeMap::new(),
+            detail_offset: 0,
+            detail_limit: std::cell::Cell::new(0),
+            animation_frame: 0,
             snapshots,
             last_good_reports: BTreeMap::new(),
             refresh_deadlines: BTreeMap::new(),
@@ -528,14 +618,93 @@ impl ClusterApp {
     }
 
     pub fn apply(&mut self, command: ClusterCommand) {
+        if self.mode == ClusterMode::Help {
+            match command {
+                ClusterCommand::Down => {
+                    self.help_offset = self.help_offset.saturating_add(1).min(
+                        self.keymap
+                            .bindings(&self.help_context)
+                            .len()
+                            .saturating_sub(1),
+                    );
+                    return;
+                }
+                ClusterCommand::Up => {
+                    self.help_offset = self.help_offset.saturating_sub(1);
+                    return;
+                }
+                ClusterCommand::First => {
+                    self.help_offset = 0;
+                    return;
+                }
+                ClusterCommand::Last => {
+                    self.help_offset = self
+                        .keymap
+                        .bindings(&self.help_context)
+                        .len()
+                        .saturating_sub(1);
+                    return;
+                }
+                _ => {}
+            }
+        }
         match command {
+            ClusterCommand::OpenActions => self.open_actions(),
+            ClusterCommand::OpenFilter => {
+                self.filter_before = self.filter.clone();
+                self.filter_origin = self.mode;
+                self.filter_anchor = self.selected_host().map(|host| host.alias().to_owned());
+                self.mode = ClusterMode::Filter;
+            }
+            ClusterCommand::ClearFilter => {
+                self.filter.clear();
+                self.rebuild_view();
+            }
+            ClusterCommand::CycleSort => {
+                self.sort = self.sort.next();
+                self.rebuild_view();
+            }
+            ClusterCommand::ReverseSort => {
+                self.sort_reverse = !self.sort_reverse;
+                self.rebuild_view();
+            }
+            ClusterCommand::DetailDown => {
+                self.detail_offset = self
+                    .detail_offset()
+                    .saturating_add(5)
+                    .min(self.detail_limit.get())
+            }
+            ClusterCommand::DetailUp => self.detail_offset = self.detail_offset().saturating_sub(5),
             ClusterCommand::Down => self.move_cursor(1),
             ClusterCommand::Up => self.move_cursor(-1),
             ClusterCommand::First => self.cursor = 0,
-            ClusterCommand::Last => self.cursor = self.hosts.len().saturating_sub(1),
-            ClusterCommand::OpenDetail => self.mode = ClusterMode::Detail,
-            ClusterCommand::OpenHelp => self.mode = ClusterMode::Help,
-            ClusterCommand::Cancel => self.mode = ClusterMode::Normal,
+            ClusterCommand::Last => self.cursor = self.visible.len().saturating_sub(1),
+            ClusterCommand::OpenDetail => {
+                self.mode = ClusterMode::Detail;
+                self.detail_offset = 0;
+            }
+            ClusterCommand::OpenHelp => {
+                self.help_context = self.key_context().into();
+                self.help_offset = 0;
+                self.mode = ClusterMode::Help;
+            }
+            ClusterCommand::Cancel => {
+                if self.mode == ClusterMode::Filter {
+                    self.filter = self.filter_before.clone();
+                    self.rebuild_view();
+                    if let Some(alias) = &self.filter_anchor
+                        && let Some(cursor) = self
+                            .visible
+                            .iter()
+                            .position(|index| self.hosts[*index].alias() == alias)
+                    {
+                        self.cursor = cursor;
+                    }
+                    self.mode = self.filter_origin;
+                } else {
+                    self.mode = ClusterMode::Normal;
+                }
+            }
             ClusterCommand::Quit => {
                 if matches!(self.mode, ClusterMode::Help | ClusterMode::Detail) {
                     self.mode = ClusterMode::Normal;
@@ -628,6 +797,7 @@ impl ClusterApp {
             self.last_refresh_started = Some(now);
             self.log(format!("refreshing {} host(s)", started.len()));
         }
+        self.rebuild_view();
         started
     }
 
@@ -668,6 +838,16 @@ impl ClusterApp {
 
     fn apply_snapshot_inner(&mut self, snapshot: HostSnapshot) {
         let alias = snapshot.alias.clone();
+        if !matches!(
+            snapshot.connection,
+            ConnectionState::Checking | ConnectionState::Unknown
+        ) {
+            let history = self.history.entry(alias.clone()).or_default();
+            if history.len() == crate::metrics::HISTORY_LIMIT {
+                history.pop_front();
+            }
+            history.push_back(crate::metrics::MetricSample::from_snapshot(&snapshot));
+        }
         let snapshot = self.merge_last_good_snapshot(snapshot);
         let state = snapshot.connection.label();
         if snapshot.connection == ConnectionState::Online && !snapshot.report.is_empty() {
@@ -675,26 +855,156 @@ impl ClusterApp {
                 .insert(alias.clone(), snapshot.report.clone());
         }
         self.snapshots.insert(alias.clone(), snapshot);
+        self.rebuild_view();
         self.log(format!("{alias}: {state}"));
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<ClusterCommand> {
-        let command = key_to_command(key)?;
-        if self.mode == ClusterMode::Help
-            && matches!(
-                command,
-                ClusterCommand::OpenHelp | ClusterCommand::RefreshSelected
-            )
-        {
-            self.apply(ClusterCommand::Cancel);
+        if key.kind == crossterm::event::KeyEventKind::Release {
             return None;
         }
-        if self.mode == ClusterMode::Help
-            && !matches!(
+        let context = self.key_context();
+        let matched = self.key_state.feed(&self.keymap, context, key);
+        for ch in std::mem::take(&mut self.key_state.replay) {
+            self.input_text(ch);
+        }
+        match matched {
+            crate::keymap::KeyMatch::Action(action) => {
+                if action == "force_quit" {
+                    self.apply(ClusterCommand::ForceQuit);
+                    return None;
+                }
+                if let Some(menu) = self.actions.as_mut() {
+                    match menu.handle_action(&action) {
+                        crate::actions::MenuResult::Pending => {}
+                        crate::actions::MenuResult::Cancel => self.actions = None,
+                        crate::actions::MenuResult::Run(command) => {
+                            self.actions = None;
+                            return self.dispatch(command);
+                        }
+                    }
+                } else if self.mode == ClusterMode::Filter {
+                    match action.as_str() {
+                        "cancel" => self.apply(ClusterCommand::Cancel),
+                        "submit" => self.mode = self.filter_origin,
+                        "backspace" => {
+                            self.filter.pop();
+                            self.rebuild_view();
+                        }
+                        _ => {}
+                    }
+                } else if let Some(command) = ClusterCommand::from_action(&action) {
+                    return self.dispatch(command);
+                }
+            }
+            crate::keymap::KeyMatch::Unbound => {
+                if let Some(ch) = crate::bindings::printable(key) {
+                    self.input_text(ch);
+                }
+            }
+            crate::keymap::KeyMatch::Pending => {}
+        }
+        None
+    }
+
+    fn input_text(&mut self, ch: char) {
+        if let Some(menu) = self.actions.as_mut() {
+            menu.input_char(ch);
+        } else if self.mode == ClusterMode::Filter
+            && !ch.is_control()
+            && self.filter.chars().count() < 256
+        {
+            self.filter.push(ch);
+            self.rebuild_view();
+        }
+    }
+    pub fn set_keymap(&mut self, map: crate::keymap::Keymap) {
+        self.keymap = std::sync::Arc::new(map);
+        self.key_state.clear();
+        self.actions = None;
+    }
+    pub fn keymap(&self) -> &crate::keymap::Keymap {
+        &self.keymap
+    }
+    pub fn key_context(&self) -> &'static str {
+        if self.actions.is_some() {
+            return "actions";
+        }
+        match self.mode {
+            ClusterMode::Normal => "cluster",
+            ClusterMode::Detail => "cluster_detail",
+            ClusterMode::Help => "help",
+            ClusterMode::Filter => "cluster_filter",
+        }
+    }
+    pub fn help_context(&self) -> &str {
+        &self.help_context
+    }
+    pub fn help_offset(&self) -> usize {
+        self.help_offset
+    }
+
+    fn open_actions(&mut self) {
+        use crate::actions::{Action, ActionMenu};
+        let mut actions = vec![
+            Action::new(
+                "Refresh selected host",
+                "Enter",
+                ClusterCommand::RefreshSelected,
+            ),
+            Action::new("Open Tersh workbench", "t", ClusterCommand::OpenWorkbench),
+            Action::new("Open shell / SSH", "s", ClusterCommand::OpenSession),
+            Action::new("Host detail and trends", "l", ClusterCommand::OpenDetail),
+            Action::new("Filter hosts", "/", ClusterCommand::OpenFilter),
+            Action::new(
+                "Clear host filter",
+                "Backspace",
+                ClusterCommand::ClearFilter,
+            ),
+            Action::new("Cycle host sort", "v", ClusterCommand::CycleSort),
+            Action::new("Reverse host sort", "V", ClusterCommand::ReverseSort),
+            Action::new("Refresh all hosts", "r", ClusterCommand::RefreshAll),
+            Action::new("Help", "?", ClusterCommand::OpenHelp),
+        ];
+        if self.mode == ClusterMode::Detail {
+            actions.extend([
+                Action::new("Scroll detail down", "PgDn", ClusterCommand::DetailDown),
+                Action::new("Scroll detail up", "PgUp", ClusterCommand::DetailUp),
+                Action::new("Back to hosts", "q", ClusterCommand::Cancel),
+            ]);
+        }
+        if self.selected_host().is_none() {
+            actions.retain(|action| {
+                !matches!(
+                    action.command,
+                    ClusterCommand::RefreshSelected
+                        | ClusterCommand::OpenSession
+                        | ClusterCommand::OpenWorkbench
+                        | ClusterCommand::OpenDetail
+                )
+            });
+        }
+        for action in &mut actions {
+            action.key = crate::bindings::label(
+                &self.keymap,
+                self.key_context(),
+                action.command.action_id(),
+            )
+            .unwrap_or_else(|| "unbound".into());
+        }
+        self.actions = Some(ActionMenu::new(actions).with_bindings(&self.keymap));
+    }
+
+    fn dispatch(&mut self, command: ClusterCommand) -> Option<ClusterCommand> {
+        if self.selected_host().is_none()
+            && matches!(
                 command,
-                ClusterCommand::Cancel | ClusterCommand::Quit | ClusterCommand::ForceQuit
+                ClusterCommand::RefreshSelected
+                    | ClusterCommand::OpenSession
+                    | ClusterCommand::OpenWorkbench
             )
         {
+            self.log("no matching host; clear the filter first");
             return None;
         }
         match command {
@@ -713,6 +1023,38 @@ impl ClusterApp {
         self.should_quit
     }
 
+    pub fn actions(&self) -> Option<&crate::actions::ActionMenu<ClusterCommand>> {
+        self.actions.as_ref()
+    }
+    pub fn history_for(&self, alias: &str) -> Option<&VecDeque<crate::metrics::MetricSample>> {
+        self.history.get(alias)
+    }
+    pub fn detail_offset(&self) -> u16 {
+        self.detail_offset.min(self.detail_limit.get())
+    }
+    pub fn set_detail_limit(&self, limit: u16) {
+        self.detail_limit.set(limit);
+    }
+    pub fn activity_symbol(&self) -> char {
+        ['|', '/', '-', '\\'][(self.animation_frame % 4) as usize]
+    }
+
+    /// Only active probes request animation frames; idle state never does.
+    pub fn animate(&mut self, elapsed: Duration, enabled: bool) -> bool {
+        let frame = (elapsed.as_millis() / 250) as u64;
+        if enabled
+            && self.is_refreshing()
+            && self.mode != ClusterMode::Help
+            && self.actions.is_none()
+            && frame != self.animation_frame
+        {
+            self.animation_frame = frame;
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn mode(&self) -> ClusterMode {
         self.mode
     }
@@ -721,12 +1063,119 @@ impl ClusterApp {
         &self.hosts
     }
 
+    pub fn visible_hosts(&self) -> impl Iterator<Item = &HostConfig> {
+        self.visible.iter().map(|index| &self.hosts[*index])
+    }
+    pub fn visible_count(&self) -> usize {
+        self.visible.len()
+    }
+    pub fn filter(&self) -> &str {
+        &self.filter
+    }
+    pub fn sort_label(&self) -> String {
+        format!(
+            "{} {}",
+            self.sort.label(),
+            if self.sort_reverse { "desc" } else { "asc" }
+        )
+    }
+
+    fn rebuild_view(&mut self) {
+        let selected = self.selected_host().map(|host| host.alias().to_owned());
+        let query = self.filter.to_lowercase();
+        let mut visible = (0..self.hosts.len())
+            .filter(|index| {
+                let host = &self.hosts[*index];
+                [host.alias(), host.address(), host.role()]
+                    .iter()
+                    .any(|s| s.to_lowercase().contains(&query))
+            })
+            .collect::<Vec<_>>();
+        let metric = |index: usize| -> Option<f64> {
+            let snapshot = self.snapshots.get(self.hosts[index].alias())?;
+            match self.sort {
+                HostSort::Load => snapshot
+                    .report
+                    .cpu_load
+                    .as_deref()?
+                    .split_whitespace()
+                    .next()?
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|v| v.is_finite() && *v >= 0.0),
+                HostSort::Memory => snapshot
+                    .report
+                    .memory
+                    .as_deref()
+                    .and_then(crate::metrics::memory_used)
+                    .map(f64::from),
+                HostSort::Disk => snapshot
+                    .report
+                    .storage
+                    .as_deref()
+                    .and_then(crate::metrics::percent)
+                    .map(f64::from),
+                HostSort::Probe => snapshot.latency_ms.map(|value| value as f64),
+                _ => None,
+            }
+        };
+        visible.sort_by(|a, b| {
+            use std::cmp::Ordering;
+            let ordering = match self.sort {
+                HostSort::Inventory => a.cmp(b),
+                HostSort::Alias => self.hosts[*a]
+                    .alias()
+                    .to_lowercase()
+                    .cmp(&self.hosts[*b].alias().to_lowercase()),
+                HostSort::State => {
+                    let rank = |index: usize| match self
+                        .snapshots
+                        .get(self.hosts[index].alias())
+                        .map(|s| s.connection)
+                        .unwrap_or(ConnectionState::Unknown)
+                    {
+                        ConnectionState::Offline
+                        | ConnectionState::Timeout
+                        | ConnectionState::AuthFailed => 0,
+                        ConnectionState::Stale => 1,
+                        ConnectionState::Unknown => 2,
+                        ConnectionState::Checking => 3,
+                        ConnectionState::Online => 4,
+                    };
+                    rank(*a).cmp(&rank(*b))
+                }
+                _ => match (metric(*a), metric(*b)) {
+                    (Some(a), Some(b)) => a.total_cmp(&b),
+                    (Some(_), None) => return Ordering::Less,
+                    (None, Some(_)) => return Ordering::Greater,
+                    (None, None) => Ordering::Equal,
+                },
+            };
+            let ordering = if self.sort_reverse {
+                ordering.reverse()
+            } else {
+                ordering
+            };
+            ordering.then_with(|| self.hosts[*a].alias().cmp(self.hosts[*b].alias()))
+        });
+        self.visible = visible;
+        self.cursor = selected
+            .and_then(|alias| {
+                self.visible
+                    .iter()
+                    .position(|index| self.hosts[*index].alias() == alias)
+            })
+            .unwrap_or(0);
+    }
+
     pub fn cursor(&self) -> usize {
         self.cursor
     }
 
     pub fn selected_host(&self) -> Option<&HostConfig> {
-        self.hosts.get(self.cursor)
+        self.visible
+            .get(self.cursor)
+            .map(|index| &self.hosts[*index])
     }
 
     pub fn selected_snapshot(&self) -> Option<&HostSnapshot> {
@@ -874,10 +1323,11 @@ impl ClusterApp {
     }
 
     fn move_cursor(&mut self, delta: isize) {
+        self.detail_offset = 0;
         self.cursor = self
             .cursor
             .saturating_add_signed(delta)
-            .min(self.hosts.len().saturating_sub(1));
+            .min(self.visible.len().saturating_sub(1));
     }
 
     fn log(&mut self, message: impl Into<String>) {
@@ -894,24 +1344,41 @@ pub fn run() -> Result<()> {
 }
 
 pub fn run_with_config_path(path: Option<&Path>) -> Result<()> {
+    run_with_keymap(path, crate::keymap::Keymap::default())
+}
+
+pub fn run_with_keymap(path: Option<&Path>, keymap: crate::keymap::Keymap) -> Result<()> {
     let inventory = match path {
         Some(path) => ClusterInventory::from_path(path)?,
         None => ClusterInventory::load_default()?,
     };
-    run_with_inventory(inventory)
+    run_inventory_with_keymap(inventory, keymap)
 }
 
 pub fn run_with_inventory(inventory: ClusterInventory) -> Result<()> {
+    run_inventory_with_keymap(inventory, crate::keymap::Keymap::default())
+}
+
+fn run_inventory_with_keymap(
+    inventory: ClusterInventory,
+    keymap: crate::keymap::Keymap,
+) -> Result<()> {
     let guard = TerminalGuard::enter()?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
     let mut app = ClusterApp::from_inventory(inventory);
+    app.set_keymap(keymap);
     let (tx, rx) = mpsc::channel();
     start_refresh_all(&mut app, tx.clone());
     let mut dirty = true;
+    let animation_started = Instant::now();
+    let motion = crate::theme::motion_enabled();
 
     while !app.should_quit() {
+        if app.animate(animation_started.elapsed(), motion) {
+            dirty = true;
+        }
         if drain_snapshots(&mut app, &rx) {
             dirty = true;
         }
@@ -1377,32 +1844,6 @@ fn tempfile_path(prefix: &str) -> PathBuf {
         .unwrap_or_default();
     let pid = std::process::id();
     std::env::temp_dir().join(format!("{prefix}-{pid}-{now}.log"))
-}
-
-fn key_to_command(key: KeyEvent) -> Option<ClusterCommand> {
-    if key.modifiers.contains(KeyModifiers::CONTROL) {
-        return match key.code {
-            KeyCode::Char('c') => Some(ClusterCommand::ForceQuit),
-            KeyCode::Char('g') | KeyCode::Char('G') => Some(ClusterCommand::Cancel),
-            _ => None,
-        };
-    }
-    match key.code {
-        KeyCode::Esc => Some(ClusterCommand::Cancel),
-        KeyCode::Char('j') | KeyCode::Down => Some(ClusterCommand::Down),
-        KeyCode::Char('k') | KeyCode::Up => Some(ClusterCommand::Up),
-        KeyCode::Home => Some(ClusterCommand::First),
-        KeyCode::End | KeyCode::Char('G') => Some(ClusterCommand::Last),
-        KeyCode::Char('r') => Some(ClusterCommand::RefreshAll),
-        KeyCode::Enter => Some(ClusterCommand::RefreshSelected),
-        KeyCode::Char('s') => Some(ClusterCommand::OpenSession),
-        KeyCode::Char('t') => Some(ClusterCommand::OpenWorkbench),
-        KeyCode::Char('l') => Some(ClusterCommand::OpenDetail),
-        KeyCode::Char('?') => Some(ClusterCommand::OpenHelp),
-        KeyCode::Char('q') => Some(ClusterCommand::Quit),
-        KeyCode::Char('Q') => Some(ClusterCommand::ForceQuit),
-        _ => None,
-    }
 }
 
 fn default_inventory_candidates() -> Vec<PathBuf> {

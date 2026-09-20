@@ -4,6 +4,18 @@ use tersh::app::{App, Command, Mode};
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+fn wait_for_job(app: &mut App) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while app.job_active() {
+        app.poll_job();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "background file job did not finish"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
 #[test]
 fn starting_from_file_path_focuses_parent_and_opens_preview() {
     let dir = tempfile::tempdir().unwrap();
@@ -273,6 +285,7 @@ fn cut_paste_retains_failed_cut_items_for_retry() {
     app.handle_command(Command::Cut);
     app.force_cwd_for_test(dest_dir.path().to_path_buf());
     app.handle_command(Command::Paste);
+    wait_for_job(&mut app);
 
     assert!(!source_a.exists());
     assert!(dest_dir.path().join("a.txt").exists());
@@ -301,6 +314,7 @@ fn preview_page_keys_scroll_fullscreen_preview() {
     let mut app = App::new(dir.path().to_path_buf()).unwrap();
 
     app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    wait_for_job(&mut app);
     assert_eq!(app.mode(), Mode::Preview);
 
     app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
@@ -317,11 +331,13 @@ fn preview_q_closes_and_q_force_quits() {
     let mut app = App::new(dir.path().to_path_buf()).unwrap();
 
     app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    wait_for_job(&mut app);
     app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
     assert_eq!(app.mode(), Mode::Normal);
     assert!(!app.should_quit());
 
     app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    wait_for_job(&mut app);
     app.handle_key(KeyEvent::new(KeyCode::Char('Q'), KeyModifiers::NONE));
     assert!(app.should_quit());
 }
@@ -351,6 +367,7 @@ fn preview_arrow_keys_scroll_by_line() {
     let mut app = App::new(dir.path().to_path_buf()).unwrap();
 
     app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    wait_for_job(&mut app);
     app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
     assert_eq!(app.preview_offset(), 1);
 
@@ -399,6 +416,7 @@ fn goto_prompt_changes_to_specified_directory() {
         app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
     }
     app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    wait_for_job(&mut app);
 
     assert_eq!(app.cwd(), child.canonicalize().unwrap());
 }
@@ -437,6 +455,7 @@ fn yy_copies_file_and_p_pastes_into_current_directory() {
     app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
     app.force_cwd_for_test(target_dir.path().to_path_buf());
     app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+    wait_for_job(&mut app);
 
     assert_eq!(
         std::fs::read_to_string(target_dir.path().join("item.txt")).unwrap(),
@@ -458,6 +477,7 @@ fn yy_paste_existing_target_replace_overwrites() {
     app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
     app.force_cwd_for_test(target_dir.path().to_path_buf());
     app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+    wait_for_job(&mut app);
 
     assert_eq!(app.mode(), Mode::Conflict);
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "old");
@@ -466,6 +486,7 @@ fn yy_paste_existing_target_replace_overwrites() {
         app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
     }
     app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    wait_for_job(&mut app);
 
     assert_eq!(app.mode(), Mode::Normal);
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
@@ -486,12 +507,14 @@ fn yy_paste_existing_target_skip_preserves_existing() {
     app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
     app.force_cwd_for_test(target_dir.path().to_path_buf());
     app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+    wait_for_job(&mut app);
 
     assert_eq!(app.mode(), Mode::Conflict);
     for ch in "skip".chars() {
         app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
     }
     app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    wait_for_job(&mut app);
 
     assert_eq!(app.mode(), Mode::Normal);
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "old");
@@ -510,6 +533,7 @@ fn x_cuts_file_and_p_moves_into_current_directory() {
     app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
     app.force_cwd_for_test(target_dir.path().to_path_buf());
     app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+    wait_for_job(&mut app);
 
     assert!(!source.exists());
     assert_eq!(
@@ -531,6 +555,7 @@ fn copy_to_and_move_to_use_typed_destination_directory() {
         app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
     }
     app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    wait_for_job(&mut app);
     assert!(target_dir.path().join("copy.txt").exists());
 
     app.handle_command(Command::Down);
@@ -540,6 +565,7 @@ fn copy_to_and_move_to_use_typed_destination_directory() {
         app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
     }
     app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    wait_for_job(&mut app);
     assert!(!moving.exists());
     assert!(target_dir.path().join("move.txt").exists());
 }
@@ -559,6 +585,7 @@ fn move_to_existing_target_skips_without_overwrite() {
         app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
     }
     app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    wait_for_job(&mut app);
 
     assert_eq!(app.mode(), Mode::Normal);
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "old");
@@ -579,6 +606,7 @@ fn copy_to_existing_target_enters_conflict_mode_and_replace_overwrites() {
         app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
     }
     app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    wait_for_job(&mut app);
 
     assert_eq!(app.mode(), Mode::Conflict);
     assert_eq!(
@@ -590,6 +618,7 @@ fn copy_to_existing_target_enters_conflict_mode_and_replace_overwrites() {
         app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
     }
     app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    wait_for_job(&mut app);
 
     assert_eq!(app.mode(), Mode::Normal);
     assert_eq!(

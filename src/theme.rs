@@ -71,6 +71,9 @@ const THICK_BORDER: border::Set = border::Set {
 
 impl Theme {
     pub fn current() -> Self {
+        if std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty()) {
+            return Self::Mono;
+        }
         if let Ok(value) = std::env::var("TERSH_COLOR")
             && matches!(
                 value.trim().to_ascii_lowercase().as_str(),
@@ -184,6 +187,12 @@ impl Theme {
     }
 
     pub fn chip(self, fg: Color, bg: Color) -> Style {
+        // ANSI bright badge backgrounds need dark text for readable contrast.
+        let fg = if fg == self.palette().text {
+            Color::Black
+        } else {
+            fg
+        };
         match self {
             Self::Mono => Style::default().add_modifier(Modifier::BOLD),
             _ => Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD),
@@ -283,4 +292,101 @@ pub fn footer_line(theme: Theme, text: &str) -> Line<'static> {
 
 pub fn chip(label: &str, value: impl std::fmt::Display, style: Style) -> Span<'static> {
     Span::styled(format!(" {label} {value} "), style)
+}
+
+/// Fixed cells, no partial shortcuts. Extra actions remain in help/action menu.
+pub fn footer_rows(theme: Theme, text: &str, width: u16, rows: usize) -> Vec<Line<'static>> {
+    use unicode_width::UnicodeWidthStr;
+    let mut segments = text
+        .split('|')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>();
+    segments.sort_by_key(|segment| {
+        if matches!(
+            *segment,
+            "normal"
+                | "preview"
+                | "help"
+                | "detail"
+                | "actions"
+                | "filter"
+                | "find"
+                | "goto"
+                | "rename"
+                | "copy-to"
+                | "move-to"
+                | "trash"
+                | "delete"
+                | "conflict"
+                | "y_"
+                | "g_"
+                | "jobs"
+                | "cluster"
+                | "restore"
+        ) || segment.contains("^G")
+            || segment.contains("^C")
+            || segment.starts_with("q")
+            || segment.starts_with("?")
+            || segment.starts_with("o ")
+        {
+            0
+        } else if segment.starts_with("next:") || segment.starts_with("p paste") {
+            1
+        } else {
+            2
+        }
+    });
+    let mut content = vec![String::new(); rows];
+    for segment in segments {
+        for line in &mut content {
+            let separator = if line.is_empty() { "" } else { " | " };
+            if line.width() + separator.len() + segment.width() <= width as usize {
+                line.push_str(separator);
+                line.push_str(segment);
+                break;
+            }
+        }
+    }
+    content
+        .iter()
+        .map(|line| footer_line(theme, line))
+        .collect()
+}
+
+pub fn footer_height(width: u16, height: u16) -> u16 {
+    if width >= 60 && height >= 14 { 3 } else { 2 }
+}
+
+pub fn unicode_graphs() -> bool {
+    std::env::var("TERSH_GLYPHS").is_ok_and(|value| value.eq_ignore_ascii_case("unicode"))
+}
+
+pub fn motion_enabled() -> bool {
+    !std::env::var("TERSH_MOTION")
+        .is_ok_and(|value| matches!(value.to_ascii_lowercase().as_str(), "off" | "0" | "reduced"))
+}
+
+pub fn profile_settings(profile: &str) -> &'static [(&'static str, &'static str)] {
+    match profile {
+        "desktop" => &[
+            ("TERSH_FOOTER", "full"),
+            ("TERSH_BORDER", "rounded"),
+            ("TERSH_GLYPHS", "unicode"),
+            ("TERSH_MOTION", "on"),
+        ],
+        "mobile" => &[
+            ("TERSH_FOOTER", "compact"),
+            ("TERSH_BORDER", "ascii"),
+            ("TERSH_GLYPHS", "ascii"),
+            ("TERSH_MOTION", "off"),
+        ],
+        "ssh" => &[
+            ("TERSH_FOOTER", "auto"),
+            ("TERSH_BORDER", "ascii"),
+            ("TERSH_GLYPHS", "ascii"),
+            ("TERSH_MOTION", "off"),
+        ],
+        _ => &[],
+    }
 }

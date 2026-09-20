@@ -304,3 +304,215 @@ fn rename_validation_rejects_paths_and_empty_names() {
     assert!(validate_file_name("bad\u{1b}name").is_err());
     assert!(validate_file_name("safe-name.txt").is_ok());
 }
+
+#[test]
+fn trash_records_restore_receipt_before_reporting_success() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("old.txt");
+    std::fs::write(&file, "old").unwrap();
+    trash_path(&file, dir.path()).unwrap();
+    let receipts = dir.path().join(".tersh-trash/.receipts");
+    assert!(
+        receipts.is_dir(),
+        "managed trash must persist restore metadata"
+    );
+    assert_eq!(std::fs::read_dir(receipts).unwrap().count(), 1);
+}
+
+#[test]
+fn cancellation_during_copy_cleans_current_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    let target = dir.path().join("target");
+    std::fs::write(&source, vec![42_u8; 1024 * 1024]).unwrap();
+    let mut bytes = 0;
+    let result = tersh::fs_ops::copy_path_cancellable(&source, &target, false, &mut |_, count| {
+        bytes += count;
+        if bytes >= 128 * 1024 {
+            anyhow::bail!("test cancellation");
+        }
+        Ok(())
+    });
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("test cancellation")
+    );
+    assert_eq!(bytes, 128 * 1024);
+    assert!(!target.exists());
+    assert_eq!(std::fs::metadata(source).unwrap().len(), 1024 * 1024);
+}
+
+#[test]
+fn cancelled_replacement_preserves_original_and_cleans_staging() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    let target = dir.path().join("target");
+    std::fs::write(&source, vec![42_u8; 1024 * 1024]).unwrap();
+    std::fs::write(&target, "precious original").unwrap();
+    let result = tersh::fs_ops::copy_path_cancellable(&source, &target, true, &mut |_, count| {
+        if count > 0 {
+            anyhow::bail!("test cancellation");
+        }
+        Ok(())
+    });
+    assert!(result.is_err());
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "precious original"
+    );
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+}
+
+#[test]
+fn cancelled_recursive_copy_cleans_whole_incomplete_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    let target = dir.path().join("target");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(source.join("one"), "one").unwrap();
+    std::fs::write(source.join("two"), "two").unwrap();
+    let mut bytes = 0;
+    let result = tersh::fs_ops::copy_path_cancellable(&source, &target, false, &mut |_, count| {
+        bytes += count;
+        if bytes > 3 {
+            anyhow::bail!("test cancellation");
+        }
+        Ok(())
+    });
+    assert!(result.is_err());
+    assert!(!target.exists());
+    assert!(source.join("one").exists());
+    assert!(source.join("two").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn cancellable_delete_never_follows_child_symlinks() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    let kept = dir.path().join("kept");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(&kept, "precious original").unwrap();
+    std::os::unix::fs::symlink(&kept, source.join("link")).unwrap();
+    tersh::fs_ops::permanent_delete_cancellable(&source, dir.path(), &mut |_, _| Ok(())).unwrap();
+    assert!(!source.exists());
+    assert_eq!(std::fs::read_to_string(kept).unwrap(), "precious original");
+}
+
+#[test]
+fn recursive_delete_cancellation_preserves_remaining_children() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    std::fs::create_dir(&source).unwrap();
+    for index in 0..8 {
+        std::fs::write(source.join(index.to_string()), "value").unwrap();
+    }
+    let mut calls = 0;
+    let result =
+        tersh::fs_ops::permanent_delete_cancellable(&source, dir.path(), &mut |path, _| {
+            if path != source {
+                calls += 1;
+            }
+            if calls == 3 {
+                anyhow::bail!("test cancellation");
+            }
+            Ok(())
+        });
+    assert!(result.is_err());
+    assert_eq!(std::fs::read_dir(&source).unwrap().count(), 6);
+}
+
+#[cfg(unix)]
+#[test]
+fn copy_readonly_directory_populates_before_preserving_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    let target = root.path().join("target");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(source.join("item"), "contents").unwrap();
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let result = copy_path(&source, &target, false);
+    let mode = std::fs::metadata(&target).map(|m| m.permissions().mode() & 0o777);
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o700)).unwrap();
+    if target.exists() {
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    result.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(target.join("item")).unwrap(),
+        "contents"
+    );
+    assert_eq!(mode.unwrap(), 0o500);
+}
+
+#[cfg(unix)]
+#[test]
+fn cancelled_copy_cleans_completed_readonly_subdirectories() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    let child = source.join("readonly");
+    let target = root.path().join("target");
+    std::fs::create_dir_all(&child).unwrap();
+    std::fs::write(child.join("item"), "value").unwrap();
+    std::fs::write(&target, "original").unwrap();
+    std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let mut copied = false;
+    let result =
+        tersh::fs_ops::copy_path_cancellable(&source, &target, true, &mut |path, count| {
+            if count > 0 {
+                copied = true;
+            }
+            if path == source && copied {
+                anyhow::bail!("test cancellation");
+            }
+            Ok(())
+        });
+    std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(result.is_err());
+    assert_eq!(std::fs::read_to_string(target).unwrap(), "original");
+    assert_eq!(
+        std::fs::read_dir(root.path()).unwrap().count(),
+        2,
+        "all staging output must be removed"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cancellable_delete_pins_directory_when_ancestor_is_swapped_for_symlink() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    let displaced = root.path().join("displaced");
+    let outside = root.path().join("outside");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(source.join("same-name"), "delete").unwrap();
+    std::fs::write(outside.join("same-name"), "keep").unwrap();
+    let mut visits = 0;
+    let result =
+        tersh::fs_ops::permanent_delete_cancellable(&source, root.path(), &mut |path, _| {
+            if path == source {
+                visits += 1;
+                if visits == 2 {
+                    std::fs::rename(&source, &displaced).unwrap();
+                    std::os::unix::fs::symlink(&outside, &source).unwrap();
+                }
+            }
+            Ok(())
+        });
+    assert!(result.is_err());
+    assert_eq!(
+        std::fs::read_to_string(outside.join("same-name")).unwrap(),
+        "keep"
+    );
+    assert!(
+        std::fs::symlink_metadata(source)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}

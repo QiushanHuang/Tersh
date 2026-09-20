@@ -115,10 +115,27 @@ fn with_env_var(name: &str, value: &str, run: impl FnOnce()) {
         name: name.to_string(),
         old: std::env::var_os(name),
     };
+    let _no_color = EnvRestore {
+        name: "NO_COLOR".into(),
+        old: std::env::var_os("NO_COLOR"),
+    };
     unsafe {
+        std::env::remove_var("NO_COLOR");
         std::env::set_var(name, value);
     }
     run();
+}
+
+#[test]
+fn no_color_environment_disables_all_cell_colors() {
+    with_env_var("NO_COLOR", "1", || {
+        assert!(!render_app_uses_color(&App::for_test(), 120, 30));
+        assert!(!render_cluster_uses_color(
+            &ClusterApp::new(vec![]),
+            120,
+            30
+        ));
+    });
 }
 
 struct EnvRestore {

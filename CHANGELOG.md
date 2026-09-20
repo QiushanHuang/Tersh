@@ -4,6 +4,14 @@
 
 ### Added
 
+- Added a single cancellable filesystem worker for copy, move, trash, permanent delete and restore, with `J` progress/results and `Ctrl+X` cancellation.
+- Added persistent trash receipts and the `u` recovery view, no-clobber restore confirmation, and per-entry corruption warnings.
+- Added host filtering and stable inventory/alias/state/resource sorting without changing refresh scope.
+- Added complete per-context JSON keymaps, conflict checks, chord input, effective key labels and `--dump-keymap` export.
+- Added an `o` action picker for files, preview and cluster views, preserving existing dispatch and destructive confirmations.
+- Added `--ui-profile desktop|mobile|ssh`, `--theme`, `--no-motion`, `TERSH_GLYPHS` and `TERSH_MOTION`, plus `NO_COLOR` support.
+- Added bounded, timestamped cluster observation trends with missing-value gaps and scrollable expanded detail.
+- Added an offline UI cell-buffer gallery for reproducible desktop/mobile visual inspection.
 - Added copy-conflict handling for existing targets, with explicit `replace` or `skip` confirmation before overwriting.
 - Added `TERSH_CLIPBOARD=off` to disable OSC52 terminal clipboard writes while keeping in-app copy state and logs.
 - Added `TERSH_THEME=btop|aurora|contrast|mono` for color-rich, aurora, high-contrast, or no-color terminal rendering.
@@ -18,6 +26,8 @@
 
 ### Changed
 
+- Fit footer shortcuts as whole actions across available rows; preserve names in narrow file columns and separate long paths from status badges.
+- Improved badge contrast, full-row file focus, compact host metrics, and activity-only probe animation capped at four frames per second.
 - Changed workbench and cluster event loops to dirty-driven rendering, reducing idle redraws while still repainting on input, resize, refresh, and probe updates.
 - Changed workbench and cluster chrome to share themed status chips, footer highlighting, selected-row styling, and warning/error emphasis.
 - Changed workbench and cluster rendering to use semantic panel-title, key/value, inactive, copy, cut, and search-match colors for stronger visual hierarchy without changing layout density.
@@ -32,6 +42,10 @@
 
 ### Fixed
 
+- Fixed asynchronous cut-buffer reconciliation by tracking the buffer generation, so an older completed move cannot clear a newer cut selection.
+- Preserved replacement originals until copy staging finishes; cleaned incomplete read-only copy trees on cancellation/failure.
+- Used descriptor-based Unix deletion traversal to resist concurrent ancestor symlink replacement.
+- Unified memory percentage semantics across the host list, detail and trends, including macOS free-memory output.
 - Fixed parallel test instability in probe temporary-file cleanup checks by isolating the probe-output tests from each other.
 - Hardened file operation race windows with source identity rechecks, no-follow regular-file opens, safer trash/delete target checks, no-clobber copy targets, and no-replace rename APIs where supported.
 - Fixed copy failure cleanup so failed regular-file and recursive-directory copies do not leave partial targets behind.

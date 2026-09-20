@@ -1,7 +1,7 @@
 use crate::{
     app::{App, Mode},
     fs_core::{FileKind, display_path, escape_display, format_size},
-    theme::{Theme, base_block, chip, footer_compact, footer_line, panel_title},
+    theme::{Theme, base_block, chip, footer_compact, footer_height, footer_rows, panel_title},
 };
 use ratatui::{
     Frame,
@@ -20,9 +20,13 @@ pub fn draw(frame: &mut Frame, app: &App) {
             let rows = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(3),
+                    Constraint::Length(if area.width >= 80 && area.height >= 14 {
+                        4
+                    } else {
+                        3
+                    }),
                     Constraint::Min(3),
-                    Constraint::Length(2),
+                    Constraint::Length(footer_height(area.width, area.height)),
                 ])
                 .split(area);
             draw_header(frame, rows[0], app, theme);
@@ -36,16 +40,22 @@ pub fn draw(frame: &mut Frame, app: &App) {
             let rows = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(3),
+                    Constraint::Length(if area.width >= 80 && area.height >= 14 {
+                        4
+                    } else {
+                        3
+                    }),
                     Constraint::Min(3),
-                    Constraint::Length(2),
+                    Constraint::Length(footer_height(area.width, area.height)),
                 ])
                 .split(area);
             draw_header(frame, rows[0], app, theme);
             draw_body(frame, rows[1], app, theme);
             draw_footer(frame, rows[2], app, theme);
             match app.mode() {
-                Mode::Help => draw_help(frame, help_overlay_rect(area), theme),
+                Mode::Help => draw_help(frame, help_overlay_rect(area), app, theme),
+                Mode::Jobs => draw_jobs(frame, rows[1], app, theme),
+                Mode::Trash => draw_trash(frame, rows[1], app, theme),
                 Mode::Filter
                 | Mode::Goto
                 | Mode::Rename
@@ -53,12 +63,16 @@ pub fn draw(frame: &mut Frame, app: &App) {
                 | Mode::MoveTo
                 | Mode::ConfirmTrash
                 | Mode::ConfirmDelete
+                | Mode::ConfirmRestore
                 | Mode::Conflict => {
                     draw_input_modal(frame, command_overlay_rect(area, app.mode()), app, theme)
                 }
                 Mode::Message | Mode::Normal | Mode::Preview | Mode::PreviewSearch => {}
             }
         }
+    }
+    if let Some(menu) = app.actions() {
+        crate::actions::draw(frame, area, menu, theme);
     }
 }
 
@@ -74,24 +88,61 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
     } else {
         escape_display(app.filter())
     };
-    let lines = vec![Line::from(vec![
-        Span::styled("Tersh", theme.fg_bold(palette.panel_title)),
-        Span::raw(" | "),
-        Span::styled(display_path(app.cwd()), theme.fg(palette.path)),
-        Span::raw(" | "),
-        chip(
-            "items",
-            app.entries().len(),
-            theme.chip(palette.text, palette.ok),
-        ),
-        Span::raw(" "),
+    let lines = vec![
+        Line::from(vec![
+            Span::styled(" Tersh ", theme.chip(palette.text, palette.accent)),
+            Span::raw(" "),
+            Span::styled(
+                compact_path(app.cwd(), area.width.saturating_sub(10) as usize),
+                theme.fg(palette.path),
+            ),
+        ]),
+        Line::from(vec![
+            chip(
+                "items",
+                app.entries().len(),
+                theme.chip(palette.text, palette.ok),
+            ),
+            Span::raw(" "),
+            chip(
+                "sel",
+                format!(
+                    "{} {}",
+                    app.selected_len(),
+                    format_size(app.selected_total_size())
+                ),
+                theme.chip(palette.text, palette.accent_alt),
+            ),
+            Span::raw(" "),
+            chip(
+                "buf",
+                app.copy_buffer_label(),
+                theme.chip(palette.text, palette.accent),
+            ),
+            Span::raw(" "),
+            chip("sort", app.sort_label(), theme.fg_bold(palette.path)),
+            chip("hidden", hidden, theme.fg(palette.muted)),
+            chip(
+                "filter",
+                truncate_display_width(&filter, 16),
+                theme.fg(palette.warn),
+            ),
+        ]),
+    ];
+    let paragraph = Paragraph::new(lines).block(
+        base_block()
+            .borders(Borders::ALL)
+            .title(panel_title(theme, job_banner(app))),
+    );
+    frame.render_widget(paragraph, area);
+}
+
+fn draw_compact_header(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
+    let palette = theme.palette();
+    let line = Line::from(vec![
         chip(
             "sel",
-            format!(
-                "{} {}",
-                app.selected_len(),
-                format_size(app.selected_total_size())
-            ),
+            app.selected_len(),
             theme.chip(palette.text, palette.accent_alt),
         ),
         Span::raw(" "),
@@ -101,36 +152,22 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
             theme.chip(palette.text, palette.accent),
         ),
         Span::raw(" "),
-        chip("hidden", hidden, theme.chip(palette.text, palette.muted)),
-        Span::raw(" "),
-        chip("filter", filter, theme.chip(palette.text, palette.warn)),
-        Span::raw(" "),
-        chip(
-            "sort",
-            app.sort_label(),
-            theme.chip(palette.text, palette.path),
-        ),
-    ])];
-    let paragraph = Paragraph::new(lines).block(base_block().borders(Borders::ALL));
-    frame.render_widget(paragraph, area);
-}
-
-fn draw_compact_header(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
-    let filter = if app.filter().is_empty() { "-" } else { "*" };
-    let text = format!(
-        "Tersh | sel {} | buf {} | f {} | {}",
-        app.selected_len(),
-        app.copy_buffer_label(),
-        filter,
-        compact_path(app.cwd(), area.width.saturating_sub(34) as usize)
+        chip("items", app.entries().len(), theme.fg(palette.muted)),
+    ]);
+    frame.render_widget(
+        Paragraph::new(line).block(base_block().borders(Borders::ALL).title(panel_title(
+            theme,
+            format!(
+                "Tersh | {}",
+                if app.job_progress().is_some() {
+                    job_banner(app)
+                } else {
+                    compact_path(app.cwd(), area.width.saturating_sub(12) as usize)
+                }
+            ),
+        ))),
+        area,
     );
-    let paragraph = Paragraph::new(truncate_display_width(
-        &text,
-        area.width.saturating_sub(2) as usize,
-    ))
-    .style(theme.fg(theme.palette().muted))
-    .block(base_block().borders(Borders::ALL));
-    frame.render_widget(paragraph, area);
 }
 
 fn draw_body(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
@@ -175,8 +212,15 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
 
 fn draw_files(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
     let palette = theme.palette();
+    let compact = area.width < 55;
     let mut lines = vec![Line::from(Span::styled(
-        "CSB K    PERM      SIZE NAME",
+        if compact && area.width >= 44 {
+            "CSB    SIZE NAME"
+        } else if compact {
+            "CSB NAME"
+        } else {
+            "CSB K    PERM      SIZE NAME"
+        },
         theme.fg_bold(palette.key),
     ))];
     if !app.filter().is_empty() {
@@ -207,12 +251,21 @@ fn draw_files(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
             _ => "",
         };
         let perm = if entry.readonly { "RO" } else { "RW" };
-        let prefix = format!(
-            "{cursor}{mark}{buffer_mark} {:<4} {:<4} {:>8} ",
-            kind_icon(entry.kind),
-            perm,
-            format_size(entry.size)
-        );
+        let prefix = if compact && area.width >= 44 {
+            format!(
+                "{cursor}{mark}{buffer_mark} {:>7} ",
+                format_size(entry.size)
+            )
+        } else if compact {
+            format!("{cursor}{mark}{buffer_mark} ")
+        } else {
+            format!(
+                "{cursor}{mark}{buffer_mark} {:<4} {:<4} {:>8} ",
+                kind_icon(entry.kind),
+                perm,
+                format_size(entry.size)
+            )
+        };
         let inner_width = area.width.saturating_sub(2) as usize;
         let name_width = inner_width
             .saturating_sub(display_width(&prefix))
@@ -223,7 +276,13 @@ fn draw_files(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
             suffix
         );
         if index == app.cursor() {
-            lines.push(Line::from(Span::styled(row, theme.selected())));
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "{row}{}",
+                    " ".repeat(inner_width.saturating_sub(display_width(&row)))
+                ),
+                theme.selected(),
+            )));
         } else {
             lines.push(Line::from(Span::styled(
                 row,
@@ -231,19 +290,41 @@ fn draw_files(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
             )));
         }
     }
+    if app.entries().is_empty() {
+        lines.push(Line::from(if app.filter().is_empty() {
+            "Empty directory"
+        } else {
+            "No matching files"
+        }));
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{} filter | {} refresh | {} parent",
+                action_key(app, "files", "open_filter"),
+                action_key(app, "files", "refresh"),
+                action_key(app, "files", "parent")
+            ),
+            theme.fg(palette.muted),
+        )));
+    }
     let title = if app.entries().is_empty() {
-        format!("Files | sort {}", app.sort_label())
+        format!(
+            "Files | {} actions | sort {}",
+            action_key(app, "files", "open_actions"),
+            app.sort_label()
+        )
     } else {
         format!(
-            "Files {}/{} | sort {}",
+            "Files {}/{} | {} actions | sort {}",
             app.cursor().saturating_add(1),
             app.entries().len(),
+            action_key(app, "files", "open_actions"),
             app.sort_label()
         )
     };
     let paragraph = Paragraph::new(lines).block(
         base_block()
             .title(panel_title(theme, title))
+            .border_style(theme.fg(palette.accent))
             .borders(Borders::ALL),
     );
     frame.render_widget(paragraph, area);
@@ -464,94 +545,341 @@ fn draw_compact_info(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
     frame.render_widget(paragraph, area);
 }
 
-fn draw_footer(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
-    let mode = format!("{:?}", app.mode()).to_lowercase();
-    let compact = footer_compact(area.width, 60);
-    let text = match app.mode() {
-        Mode::Normal if app.pending_y() => {
-            "y_ | y copy | f name | r rel | a abs | ^G cancel | ^C force".to_string()
-        }
-        Mode::Normal if app.pending_g() => "g_ | g top | G bottom | ^G cancel | ^C force".to_string(),
-        Mode::Normal if compact && area.width < 50 => "q quit | ? help | / | ^G | ^C".to_string(),
-        Mode::Normal if compact => {
-            format!("next: {} | q quit | ? help | / | ^G | ^C", next_action(app))
-        }
-        Mode::Normal => normal_footer(app),
-        Mode::Preview if compact => "preview | q | Pg | ^G | ^C".to_string(),
-        Mode::Preview => {
-            "preview | q close | ^G close | ^C force | j/k page | Up/Down line | PgUp/PgDn | gg/G | / find | n/N | e edit".to_string()
-        }
-        Mode::PreviewSearch if compact => "find | Enter | ^G | ^C".to_string(),
-        Mode::PreviewSearch => format!("{mode} | Enter find | Backspace | Esc/^G cancel | ^C force"),
-        Mode::Filter if compact => "filter | Enter | ^G | ^C".to_string(),
-        Mode::Filter => "filter | type to narrow | Enter apply | Backspace | Esc/^G cancel | ^C force".to_string(),
-        Mode::Goto if compact => "goto | Enter | ^G | ^C".to_string(),
-        Mode::Goto => "goto | type directory | Enter go | Backspace | Esc/^G cancel | ^C force".to_string(),
-        Mode::Rename if compact => "rename | Enter | ^G | ^C".to_string(),
-        Mode::Rename => "rename | type name | Enter rename | Backspace | Esc/^G cancel | ^C force".to_string(),
-        Mode::CopyTo if compact => "copy-to | Enter | ^G | ^C".to_string(),
-        Mode::CopyTo => "copy-to | type destination | Enter copy | Backspace | Esc/^G cancel | ^C force".to_string(),
-        Mode::MoveTo if compact => "move-to | Enter | ^G | ^C".to_string(),
-        Mode::MoveTo => "move-to | type destination | Enter move | Backspace | Esc/^G cancel | ^C force".to_string(),
-        Mode::ConfirmTrash if compact => "trash | Enter | ^G | ^C".to_string(),
-        Mode::ConfirmTrash => "trash | type trash | Enter confirm | Esc/^G cancel | ^C force".to_string(),
-        Mode::ConfirmDelete if compact => "delete | Enter | ^G | ^C".to_string(),
-        Mode::ConfirmDelete => {
-            "delete | type delete | Enter confirm | Esc/^G cancel | ^C force".to_string()
-        }
-        Mode::Conflict if compact => "conflict | replace/skip | ^G | ^C".to_string(),
-        Mode::Conflict => {
-            "conflict | type replace overwrite | type skip keep existing | Enter confirm | Esc/^G cancel | ^C force".to_string()
-        }
-        Mode::Help => "help | q/?/Enter close | ^G close | ^C force".to_string(),
-        Mode::Message => format!("{mode} | Esc/^G close | ^C force"),
-    };
-    let paragraph =
-        Paragraph::new(footer_line(theme, &text)).block(base_block().borders(Borders::TOP));
-    frame.render_widget(paragraph, area);
+fn action_key(app: &App, context: &str, action: &str) -> String {
+    crate::bindings::label(app.keymap(), context, action).unwrap_or_else(|| "unbound".into())
 }
 
-fn draw_help(frame: &mut Frame, area: Rect, theme: Theme) {
-    frame.render_widget(Clear, area);
-    let lines = if area.width < 60 || area.height < 14 {
-        vec![
-            Line::from("Move: j/k arrows PgUp/PgDn"),
-            Line::from("Open: h parent, l/Enter preview"),
-            Line::from("Find: / filter, . hidden, r refresh"),
-            Line::from("Ops: Space, y..., x cut, p paste"),
-            Line::from("More: c copy-to, m move-to, n rename"),
-            Line::from("Delete: d trash, D delete"),
-            Line::from("Preview: / find, n/N, e edit"),
-            Line::from("Exit: q, Esc/^G, ^C"),
-        ]
-    } else {
-        vec![
-            Line::from("Navigation"),
-            Line::from("  j/k or arrows: move    PageUp/PageDown: page    Home/End: first/last"),
-            Line::from("  h: parent    l/Enter: open directory or preview file"),
-            Line::from("  /: filter    .: hidden    r: refresh    s/S: sort/reverse"),
-            Line::from(""),
-            Line::from("Operations"),
-            Line::from("  Space: mark    yy: copy    x: cut    p: paste"),
-            Line::from("  c: copy to...    m: move to...    n: rename"),
-            Line::from("  yf: file name    yr: relative path    ya: absolute path"),
-            Line::from("  e: edit focused regular file with $VISUAL/$EDITOR/nano"),
-            Line::from("  :: goto directory"),
-            Line::from("  d: trash, then type trash    D: delete, then type delete"),
-            Line::from(""),
-            Line::from("Preview mode"),
-            Line::from("  j/k/PageUp/PageDown: page    arrows/Ctrl+F/Ctrl+B: line"),
-            Line::from("  gg: top    G: bottom"),
-            Line::from("  /: search    n/N: next/prev match"),
-            Line::from(""),
-            Line::from("Exit"),
-            Line::from("  q: quit/close    Esc/Ctrl+G: cancel    Q/Ctrl+C: force quit"),
-        ]
+fn job_banner(app: &App) -> String {
+    let Some(progress) = app.job_progress() else {
+        return String::new();
     };
+    let status = if app.job_active() {
+        if progress.cancelling {
+            "cancelling"
+        } else {
+            "running"
+        }
+    } else if app.last_job().is_some_and(|r| r.cancelled) {
+        "cancelled"
+    } else {
+        "finished"
+    };
+    format!(
+        "{} {} {}/{} {} | {} jobs",
+        progress.label,
+        status,
+        progress.completed,
+        progress.total,
+        format_size(progress.copied_bytes),
+        action_key(app, "files", "open_jobs")
+    )
+}
+
+fn draw_jobs(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
+    frame.render_widget(Clear, area);
+    let mut lines = vec![Line::from(job_banner(app))];
+    if let Some(progress) = app.job_progress() {
+        lines.push(kv_line(
+            theme,
+            "Processed roots",
+            format!("{} / {}", progress.completed, progress.total),
+        ));
+        lines.push(kv_line(theme, "Copied", format_size(progress.copied_bytes)));
+        if let Some(path) = &progress.current_path {
+            lines.push(kv_line(theme, "Current", display_path(path)));
+        }
+    } else {
+        lines.push(Line::from("No file jobs yet"));
+    }
+    if app.exit_after_job() {
+        lines.push(Line::from("Exiting after worker cancellation and cleanup"));
+    }
+    lines.push(Line::from(
+        "Cancellation retains completed items; deletion is not undoable.",
+    ));
+    if let Some(result) = app.last_job() {
+        lines.push(kv_line(
+            theme,
+            "Result",
+            format!(
+                "{} done / {} failed / {} skipped / {} remaining",
+                result.succeeded.len(),
+                result.failed.len(),
+                result.skipped.len(),
+                result.unprocessed.len()
+            ),
+        ));
+        for failure in result.failed.iter().take(100) {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "FAILED {}: {}",
+                    display_path(&failure.path),
+                    escape_display(&failure.error)
+                ),
+                theme.danger(),
+            )));
+        }
+        for path in result.skipped.iter().take(100) {
+            lines.push(Line::from(format!("SKIPPED {}", display_path(path))));
+        }
+        for path in result.unprocessed.iter().take(100) {
+            lines.push(Line::from(format!("REMAINING {}", display_path(path))));
+        }
+    }
+    let max_offset = lines
+        .len()
+        .saturating_sub(area.height.saturating_sub(2) as usize);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .scroll((
+                app.help_offset().min(max_offset).min(u16::MAX as usize) as u16,
+                0,
+            ))
+            .block(
+                base_block()
+                    .borders(Borders::ALL)
+                    .title(panel_title(theme, "File jobs")),
+            ),
+        area,
+    );
+}
+
+fn draw_trash(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
+    frame.render_widget(Clear, area);
+    let mut lines = Vec::new();
+    if let Some(error) = app.trash_error() {
+        lines.push(Line::from(Span::styled(
+            escape_display(error),
+            theme.danger(),
+        )));
+    }
+    if app.trash_entries().is_empty() {
+        lines.push(Line::from("No restorable receipts in this work root"));
+        lines.push(Line::from(
+            "Legacy trash has no recorded original location.",
+        ));
+    }
+    let capacity = area.height.saturating_sub(2 + lines.len() as u16) as usize;
+    let start = app
+        .trash_cursor()
+        .saturating_add(1)
+        .saturating_sub(capacity);
+    for (index, entry) in app
+        .trash_entries()
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(capacity)
+    {
+        let text = format!(
+            "{} {}",
+            if index == app.trash_cursor() {
+                ">"
+            } else {
+                " "
+            },
+            compact_path(&entry.original_path, area.width.saturating_sub(4) as usize)
+        );
+        lines.push(Line::from(Span::styled(
+            text,
+            if index == app.trash_cursor() {
+                theme.selected()
+            } else {
+                theme.fg(theme.palette().path)
+            },
+        )));
+    }
+    frame.render_widget(
+        Paragraph::new(lines).block(base_block().borders(Borders::ALL).title(panel_title(
+            theme,
+            format!("Trash recovery | {} receipts", app.trash_entries().len()),
+        ))),
+        area,
+    );
+}
+
+fn draw_footer(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
+    let context = app.key_context();
+    let compact = footer_compact(area.width, 60);
+    let mode = if app.actions().is_some() {
+        "actions".into()
+    } else if app.pending_y() {
+        "y_".into()
+    } else if app.pending_g() {
+        "g_".into()
+    } else if app.mode() == Mode::PreviewSearch {
+        "find".into()
+    } else if app.mode() == Mode::ConfirmRestore {
+        "restore".into()
+    } else {
+        format!("{:?}", app.mode()).to_lowercase()
+    };
+    let mut pieces = vec![mode];
+    let mut add = |action: &str, description: &str| {
+        if action == "cancel" {
+            pieces.push(format!(
+                "{}{}",
+                crate::bindings::cancel_label(app.keymap(), context, compact),
+                if compact {
+                    String::new()
+                } else {
+                    format!(" {description}")
+                }
+            ));
+        } else if let Some(hint) = crate::bindings::hint(app.keymap(), context, action, description)
+        {
+            pieces.push(if context == "files" && action == "open" {
+                format!("next: {hint}")
+            } else {
+                hint
+            });
+        }
+    };
+    match context {
+        "files" => {
+            add("quit", "quit");
+            add("open_help", "help");
+            add("open_actions", "actions");
+            add("cancel", "clear");
+            add("open_filter", "filter");
+            if app.pending_y() {
+                add("copy", "copy");
+                add("copy_name", "name");
+                add("copy_relative_path", "rel");
+                add("copy_absolute_path", "abs");
+            } else if app.pending_g() {
+                add("first", "top");
+                add("last", "bottom");
+            } else {
+                if app.copy_buffer_len() > 0 {
+                    add("paste", "paste");
+                }
+                add(
+                    "open",
+                    match app.entries().get(app.cursor()).map(|e| e.kind) {
+                        Some(FileKind::Directory) => "open dir",
+                        Some(FileKind::File) => "preview file",
+                        _ => "inspect",
+                    },
+                );
+                if app
+                    .entries()
+                    .get(app.cursor())
+                    .is_some_and(|e| e.kind == FileKind::File)
+                {
+                    add("edit", "edit");
+                }
+                add("toggle_select", "mark");
+                add("copy", "copy");
+                add("cycle_sort", "sort");
+                add("open_jobs", "jobs");
+                add("open_trash", "trash recovery");
+                if app.job_active() {
+                    add("cancel_job", "cancel job");
+                }
+                if !compact {
+                    add("down", "down");
+                    add("up", "up");
+                    add("parent", "parent");
+                }
+            }
+        }
+        "preview" => {
+            add("cancel", "close");
+            add("open_actions", "actions");
+            add("half_down", "page down");
+            add("half_up", "page up");
+            add("open_preview_search", "find");
+            add("preview_search_next", "next");
+            add("edit", "edit");
+            add("open_jobs", "jobs");
+            if app.job_active() {
+                add("cancel_job", "cancel job");
+            }
+        }
+        "help" => {
+            add("cancel", "close");
+            add("down", "scroll");
+            add("up", "up");
+        }
+        "actions" => {
+            add("cancel", "cancel");
+            add("submit", "run");
+            add("down", "next");
+            add("up", "previous");
+        }
+        "trash" => {
+            add("cancel", "back");
+            if !app.trash_entries().is_empty() {
+                add("restore", "restore");
+            }
+            add("refresh", "refresh");
+            add("down", "down");
+            add("up", "up");
+        }
+        "jobs" => {
+            add("cancel", "back");
+            if app.job_active() {
+                add("cancel_job", "cancel job");
+            }
+            add("down", "scroll");
+        }
+        _ => {
+            add("cancel", "cancel");
+            add(
+                "submit",
+                match app.mode() {
+                    Mode::Filter => "apply",
+                    Mode::PreviewSearch => "find",
+                    Mode::ConfirmRestore => "restore",
+                    _ => "confirm",
+                },
+            );
+            add("backspace", "erase");
+        }
+    }
+    // Emergency exit is deliberately immutable in the validated keymap.
+    pieces.insert(
+        1,
+        if compact {
+            "^C".into()
+        } else if app.job_active() {
+            "^C exit safely".into()
+        } else {
+            "^C force".into()
+        },
+    );
+    let text = pieces.join(" | ");
+    frame.render_widget(
+        Paragraph::new(footer_rows(
+            theme,
+            &text,
+            area.width,
+            area.height.saturating_sub(1) as usize,
+        ))
+        .block(base_block().borders(Borders::TOP)),
+        area,
+    );
+}
+
+fn draw_help(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
+    frame.render_widget(Clear, area);
+    let lines = crate::bindings::help_lines(app.keymap(), app.help_context())
+        .into_iter()
+        .map(Line::from)
+        .collect::<Vec<_>>();
     let paragraph = Paragraph::new(lines)
+        .scroll((app.help_offset().min(u16::MAX as usize) as u16, 0))
         .block(
             base_block()
-                .title(panel_title(theme, "Help"))
+                .title(panel_title(
+                    theme,
+                    format!(
+                        "Help: {} | {} close",
+                        app.help_context(),
+                        action_key(app, "help", "cancel")
+                    ),
+                ))
                 .borders(Borders::ALL)
                 .border_style(theme.fg(theme.palette().panel_title)),
         )
@@ -571,10 +899,35 @@ fn draw_input_modal(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
         Mode::ConfirmTrash => "Move to .tersh-trash: type trash then Enter. Esc/Ctrl+G cancels.",
         Mode::ConfirmDelete => "Permanent delete: type delete then Enter. Esc/Ctrl+G cancels.",
         Mode::Conflict => "Destination already exists",
+        Mode::ConfirmRestore => {
+            "Restore to original location; existing files are never overwritten."
+        }
         Mode::PreviewSearch => "Find in preview",
         _ => "",
     };
+    let prompt = prompt
+        .replace(
+            "Esc/Ctrl+G",
+            &crate::bindings::cancel_label(app.keymap(), "input", false),
+        )
+        .replace("Enter", &action_key(app, "input", "submit"));
     let mut lines = vec![Line::from(prompt)];
+    if app.mode() == Mode::ConfirmRestore
+        && let Some(path) = app.restore_target()
+    {
+        lines.push(Line::from(format!(
+            "Name: {}",
+            path.file_name()
+                .map(|name| escape_display(&name.to_string_lossy()))
+                .unwrap_or_default()
+        )));
+        lines.push(Line::from(format!("Original: {}", display_path(path))));
+        lines.push(Line::from(format!(
+            "{} restore | {} cancel",
+            action_key(app, "input", "submit"),
+            action_key(app, "input", "cancel")
+        )));
+    }
     if matches!(app.mode(), Mode::ConfirmTrash | Mode::ConfirmDelete) {
         let required = match app.mode() {
             Mode::ConfirmTrash => "trash",
@@ -626,6 +979,7 @@ fn draw_input_modal(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
         Mode::ConfirmDelete => "DANGER",
         Mode::ConfirmTrash => "TRASH",
         Mode::Conflict => "CONFLICT",
+        Mode::ConfirmRestore => "Restore confirmation",
         _ => "Command",
     };
     let block = match app.mode() {
@@ -650,37 +1004,6 @@ fn draw_input_modal(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
         .block(block)
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
-}
-
-fn normal_footer(app: &App) -> String {
-    let mut actions = vec![format!("next: {}", next_action(app))];
-    if app.selected_len() > 0 {
-        actions.push(format!("{} selected", app.selected_len()));
-        actions.push("d trash".to_string());
-        actions.push("yy copy".to_string());
-    } else {
-        actions.push("Space mark".to_string());
-        actions.push("yy copy".to_string());
-    }
-    if app.copy_buffer_len() > 0 {
-        actions.push("p paste".to_string());
-    }
-    actions.push("s sort".to_string());
-
-    format!(
-        "normal | {} | q quit | Esc/^G clear | ^C force | ? help | j/k move | / filter | h parent",
-        actions.join(" | ")
-    )
-}
-
-fn next_action(app: &App) -> &'static str {
-    match app.entries().get(app.cursor()).map(|entry| entry.kind) {
-        Some(FileKind::Directory) => "Enter open dir",
-        Some(FileKind::File) => "Enter preview file | e edit",
-        Some(FileKind::Symlink) => "Enter inspect link",
-        Some(FileKind::Other) => "Space mark item",
-        None => "r refresh",
-    }
 }
 
 fn section_line(theme: Theme, label: &'static str) -> Line<'static> {
@@ -799,6 +1122,13 @@ fn help_overlay_rect(area: Rect) -> Rect {
 }
 
 fn command_overlay_rect(area: Rect, mode: Mode) -> Rect {
+    if mode == Mode::ConfirmRestore {
+        return if area.width < 60 || area.height < 14 {
+            area
+        } else {
+            centered_rect(90, 70, area)
+        };
+    }
     if matches!(
         mode,
         Mode::ConfirmTrash | Mode::ConfirmDelete | Mode::Conflict

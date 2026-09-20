@@ -104,3 +104,38 @@ fn cluster_status_conflicts_with_file_workbench_path_argument() {
     let stderr = String::from_utf8(output.stderr).expect("stderr is utf-8");
     assert!(stderr.contains("cannot be used with"));
 }
+#[test]
+fn help_exposes_device_profiles_and_rejects_unknown_profile() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tersh"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&output.stdout).contains("--ui-profile"));
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tersh"))
+        .args(["--ui-profile", "unknown"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+}
+
+#[test]
+fn keymap_dump_and_invalid_config_are_headless() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tersh"))
+        .arg("--dump-keymap")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(json["files"]["copy"].is_array());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("keymap.json");
+    std::fs::write(&path, r#"{"files":{"copy":["q"]}}"#).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tersh"))
+        .arg("--keymap")
+        .arg(path)
+        .arg("--dump-keymap")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!output.stdout.contains(&0x1b));
+}
