@@ -938,7 +938,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
 fn action_hint(snapshot: &HostSnapshot) -> Option<&'static str> {
     match snapshot.connection {
         ConnectionState::AuthFailed => Some("check SSH auth and trusted host key"),
-        ConnectionState::Timeout => Some("check VPN, jump host, and network route"),
+        ConnectionState::Timeout => Some("probe timed out; SSH may still work"),
         ConnectionState::Offline => Some("inspect the probe error and host availability"),
         ConnectionState::Stale => Some("refresh failed; showing last good metrics"),
         ConnectionState::Unknown => Some("refresh selected host"),
