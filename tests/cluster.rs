@@ -170,7 +170,7 @@ fn ssh_probe_args_are_non_interactive_and_use_configured_proxy_jump() {
     );
     assert!(
         args.windows(2)
-            .any(|pair| pair == ["-o", "ConnectTimeout=3"])
+            .any(|pair| pair == ["-o", "ConnectTimeout=15"])
     );
     assert!(
         args.windows(2)
@@ -1198,4 +1198,33 @@ fn cluster_render_narrow_detail_mode_shows_metrics() {
     assert!(buffer.contains("Memory"));
     assert!(buffer.contains("Storage"));
     assert!(buffer.contains("Tasks"));
+}
+
+#[test]
+fn timeout_detail_does_not_claim_ssh_is_unavailable() {
+    let inventory =
+        ClusterInventory::from_json(r#"{"servers":[{"alias":"slow","campus_ip":"slow.invalid"}]}"#)
+            .unwrap();
+    let mut app = ClusterApp::new(inventory.hosts().to_vec());
+    app.apply_snapshot(HostSnapshot::failed("slow", "probe timed out after 30s"));
+    app.apply(ClusterCommand::OpenDetail);
+    let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+    terminal
+        .draw(|frame| cluster_ui::draw(frame, &app))
+        .unwrap();
+    let text = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect::<String>();
+    assert!(text.contains("SSH may still work"));
+    assert_eq!(
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('s'),
+            crossterm::event::KeyModifiers::NONE
+        )),
+        Some(ClusterCommand::OpenSession)
+    );
 }

@@ -18,7 +18,8 @@ use std::{
 };
 
 const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
-const PROBE_TIMEOUT: Duration = Duration::from_secs(6);
+// Includes the jump connection, target handshake, and remote metrics collection.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_CONCURRENT_PROBES: usize = 16;
 const MAX_PROBE_OUTPUT_BYTES: u64 = 1024 * 1024;
 
@@ -1532,15 +1533,15 @@ pub fn ssh_probe_args(host: &HostConfig) -> Vec<String> {
         "-o".to_string(),
         "PermitLocalCommand=no".to_string(),
         "-o".to_string(),
-        "ConnectTimeout=3".to_string(),
+        "ConnectTimeout=15".to_string(),
         "-o".to_string(),
         "ConnectionAttempts=1".to_string(),
         "-o".to_string(),
         "StrictHostKeyChecking=yes".to_string(),
         "-o".to_string(),
-        "ServerAliveInterval=2".to_string(),
+        "ServerAliveInterval=10".to_string(),
         "-o".to_string(),
-        "ServerAliveCountMax=1".to_string(),
+        "ServerAliveCountMax=2".to_string(),
     ];
     if let Some(proxy_jump) = host.proxy_jump() {
         args.push("-J".to_string());
@@ -2126,6 +2127,29 @@ mod tests {
     use std::{collections::BTreeSet, sync::Mutex};
 
     static PROBE_TEMP_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn slow_jump_probe_remains_checking_until_its_budget_expires() {
+        let mut app = ClusterApp::new(vec![test_host("slow-jump")]);
+        app.begin_refresh(&["slow-jump".to_string()]);
+        // Advance the probe age without sleeping. A measured healthy jump
+        // handshake took nearly ten seconds, before metrics collection.
+        *app.refresh_deadlines.get_mut("slow-jump").unwrap() -= Duration::from_secs(10);
+        assert!(!app.mark_timed_out_refreshes());
+        assert_eq!(
+            app.snapshot_for("slow-jump").unwrap().connection,
+            ConnectionState::Checking
+        );
+        app.refresh_deadlines.insert(
+            "slow-jump".to_string(),
+            Instant::now() - Duration::from_secs(1),
+        );
+        assert!(app.mark_timed_out_refreshes());
+        assert_eq!(
+            app.snapshot_for("slow-jump").unwrap().connection,
+            ConnectionState::Timeout
+        );
+    }
 
     #[test]
     fn begin_refresh_empty_aliases_does_not_reset_refresh_timer() {

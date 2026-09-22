@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Allow slow jump-host connections 15 seconds to connect and 30 seconds for cluster probes; clarify that a probe timeout does not prove SSH is unavailable.
+
 - Stabilize the Python CI process-readiness fixture with atomic PID publication; no runtime behavior changes.
 
 ## v1.2.0 - 2026-09-20
