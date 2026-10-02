@@ -19,7 +19,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
     let theme = Theme::current();
     match app.mode() {
-        Mode::Preview | Mode::PreviewSearch => {
+        Mode::Preview | Mode::PreviewSearch | Mode::Log | Mode::LogSearch => {
             let rows = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
@@ -34,7 +34,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
                 .split(area);
             draw_header(frame, rows[0], app, theme);
             draw_fullscreen_preview(frame, rows[1], app, theme);
-            if app.mode() == Mode::PreviewSearch {
+            if matches!(app.mode(), Mode::PreviewSearch | Mode::LogSearch) {
                 draw_input_modal(frame, command_overlay_rect(area, app.mode()), app, theme);
             }
             draw_footer(frame, rows[2], app, theme);
@@ -59,6 +59,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
                 Mode::Help => draw_help(frame, help_overlay_rect(area), app, theme),
                 Mode::Jobs => draw_jobs(frame, rows[1], app, theme),
                 Mode::Trash => draw_trash(frame, rows[1], app, theme),
+                Mode::Places => draw_places(frame, rows[1], app, theme),
                 Mode::Filter
                 | Mode::Goto
                 | Mode::Rename
@@ -67,10 +68,16 @@ pub fn draw(frame: &mut Frame, app: &App) {
                 | Mode::ConfirmTrash
                 | Mode::ConfirmDelete
                 | Mode::ConfirmRestore
-                | Mode::Conflict => {
+                | Mode::Conflict
+                | Mode::ExportJob => {
                     draw_input_modal(frame, command_overlay_rect(area, app.mode()), app, theme)
                 }
-                Mode::Message | Mode::Normal | Mode::Preview | Mode::PreviewSearch => {}
+                Mode::Message
+                | Mode::Normal
+                | Mode::Preview
+                | Mode::PreviewSearch
+                | Mode::Log
+                | Mode::LogSearch => {}
             }
         }
     }
@@ -96,7 +103,22 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
             Span::styled(" Tersh ", theme.chip(palette.text, palette.accent)),
             Span::raw(" "),
             Span::styled(
-                compact_path(app.cwd(), area.width.saturating_sub(10) as usize),
+                format!(
+                    "{} ",
+                    truncate_display_width(&escape_display(app.place_host()), 20)
+                ),
+                theme.fg_bold(palette.accent_alt),
+            ),
+            Span::styled(
+                compact_path(
+                    app.cwd(),
+                    area.width.saturating_sub(
+                        12 + display_width(&truncate_display_width(
+                            &escape_display(app.place_host()),
+                            20,
+                        )) as u16,
+                    ) as usize,
+                ),
                 theme.fg(palette.path),
             ),
         ]),
@@ -109,11 +131,7 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
             Span::raw(" "),
             chip(
                 "sel",
-                format!(
-                    "{} {}",
-                    app.selected_len(),
-                    format_size(app.selected_total_size())
-                ),
+                format!("{} {}", app.selected_len(), selection_size(app)),
                 theme.chip(palette.text, palette.accent_alt),
             ),
             Span::raw(" "),
@@ -142,6 +160,10 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
 
 fn draw_compact_header(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
     let palette = theme.palette();
+    let identity = format!(
+        "Tersh@{}",
+        truncate_display_width(&escape_display(app.place_host()), 10)
+    );
     let line = Line::from(vec![
         chip(
             "sel",
@@ -161,11 +183,17 @@ fn draw_compact_header(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
         Paragraph::new(line).block(base_block().borders(Borders::ALL).title(panel_title(
             theme,
             format!(
-                "Tersh | {}",
+                "{} | {}",
+                identity,
                 if app.job_progress().is_some() {
                     job_banner(app)
                 } else {
-                    compact_path(app.cwd(), area.width.saturating_sub(12) as usize)
+                    compact_path(
+                        app.cwd(),
+                        area.width
+                            .saturating_sub((display_width(&identity) + 5) as u16)
+                            as usize,
+                    )
                 }
             ),
         ))),
@@ -174,7 +202,7 @@ fn draw_compact_header(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
 }
 
 fn draw_body(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
-    if area.width >= 120 {
+    if area.width >= 120 && app.inspector_visible() {
         let columns = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
@@ -194,7 +222,7 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
         draw_files(frame, columns[0], app, theme);
         draw_preview(frame, columns[1], app, theme);
     } else {
-        let rows = if area.height >= 7 && area.width >= 60 {
+        let rows = if area.height >= 6 && area.width >= 60 {
             Some(
                 Layout::default()
                     .direction(Direction::Vertical)
@@ -226,6 +254,12 @@ fn draw_files(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
         },
         theme.fg_bold(palette.key),
     ))];
+    if let Some(message) = app.loading_message().filter(|_| app.directory_loading()) {
+        lines.push(Line::from(Span::styled(
+            message,
+            theme.fg(theme.palette().warn),
+        )));
+    }
     if !app.filter().is_empty() {
         lines.push(kv_line(theme, "filter", escape_display(app.filter())));
     }
@@ -257,7 +291,11 @@ fn draw_files(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
         let prefix = if compact && area.width >= 44 {
             format!(
                 "{cursor}{mark}{buffer_mark} {:>7} ",
-                format_size(entry.size)
+                if entry.kind == FileKind::Directory {
+                    "-".into()
+                } else {
+                    entry_size(entry)
+                }
             )
         } else if compact {
             format!("{cursor}{mark}{buffer_mark} ")
@@ -266,7 +304,11 @@ fn draw_files(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
                 "{cursor}{mark}{buffer_mark} {:<4} {:<4} {:>8} ",
                 kind_icon(entry.kind),
                 perm,
-                format_size(entry.size)
+                if entry.kind == FileKind::Directory {
+                    "-".into()
+                } else {
+                    entry_size(entry)
+                }
             )
         };
         let inner_width = area.width.saturating_sub(2) as usize;
@@ -330,9 +372,13 @@ fn draw_files(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
 
 fn draw_fullscreen_preview(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
     let palette = theme.palette();
-    let lines = app.preview().lines.iter().collect::<Vec<_>>();
+    let lines = &app.preview().lines;
     let total_lines = lines.len();
-    let view_lines = area.height.saturating_sub(4) as usize;
+    let is_log = matches!(app.mode(), Mode::Log | Mode::LogSearch);
+    let view_lines = area.height.saturating_sub(if is_log { 5 } else { 4 }) as usize;
+    if is_log {
+        app.set_log_view_lines(view_lines.max(1));
+    }
     let offset = app.preview_offset().min(total_lines.saturating_sub(1));
     let query = app.preview_search_query().to_lowercase();
     let matches = app.preview_matches();
@@ -383,12 +429,50 @@ fn draw_fullscreen_preview(frame: &mut Frame, area: Rect, app: &App, theme: Them
                 .add_modifier(Modifier::UNDERLINED)
                 .add_modifier(Modifier::BOLD);
         }
-        rendered.push(Line::from(Span::styled(line.as_str(), style)));
+        rendered.push(Line::from(Span::styled(
+            if is_log {
+                truncate_display_width(line, area.width.saturating_sub(2) as usize)
+            } else {
+                line.clone()
+            },
+            style,
+        )));
     }
 
-    let paragraph = Paragraph::new(rendered)
-        .block(panel_block(theme, "Preview", Tone::Active))
-        .wrap(Wrap { trim: false });
+    if let Some(log) = app.log_snapshot() {
+        rendered.insert(
+            1,
+            Line::from(Span::styled(
+                truncate_display_width(
+                    &format!(
+                        "{} | {} buffered | {} known lines omitted",
+                        log.status,
+                        format_size(log.byte_count as u64),
+                        log.omitted_lines
+                    ),
+                    area.width.saturating_sub(2) as usize,
+                ),
+                theme.fg(theme.palette().warn),
+            )),
+        );
+    }
+    let title = if matches!(app.mode(), Mode::Log | Mode::LogSearch) {
+        if app.log_paused() {
+            "Log | paused"
+        } else {
+            "Log | following"
+        }
+    } else if app.structured_preview() {
+        "Preview | structured"
+    } else {
+        "Preview | raw"
+    };
+    let paragraph = Paragraph::new(rendered).block(panel_block(theme, title, Tone::Active));
+    let paragraph = if is_log || app.structured_preview() {
+        paragraph
+    } else {
+        paragraph.wrap(Wrap { trim: false })
+    };
     frame.render_widget(paragraph, area);
 }
 
@@ -438,7 +522,20 @@ fn draw_preview(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
         display_path(&app.preview().path),
         theme.fg(theme.palette().path),
     ))];
-    lines.extend(app.preview().lines.iter().cloned().map(Line::from));
+    if app.preview_loading() {
+        lines.push(Line::from(Span::styled(
+            "Loading / verifying preview",
+            theme.fg(theme.palette().warn),
+        )));
+    }
+    lines.extend(
+        app.preview()
+            .lines
+            .iter()
+            .take(area.height.saturating_sub(3) as usize)
+            .cloned()
+            .map(Line::from),
+    );
     let paragraph = Paragraph::new(lines)
         .block(panel_block(theme, "Preview", Tone::Inactive))
         .wrap(Wrap { trim: false });
@@ -452,7 +549,7 @@ fn draw_info(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
     lines.push(section_line(theme, "TARGET"));
     if let Some(entry) = focused {
         lines.push(kv_line(theme, "kind", entry.kind_marker()));
-        lines.push(kv_line(theme, "size", format_size(entry.size)));
+        lines.push(kv_line(theme, "size", entry_size(entry)));
         lines.push(kv_line(
             theme,
             "perm",
@@ -475,28 +572,46 @@ fn draw_info(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
         )));
     }
     lines.push(Line::from(""));
-    lines.push(section_line(theme, "BUFFER"));
-    let buffer_label = app.copy_buffer_label();
-    lines.push(Line::from(Span::styled(
-        buffer_label.clone(),
-        buffer_style(theme, &buffer_label),
-    )));
-    lines.push(kv_line(theme, "selected", app.selected_len().to_string()));
+    lines.push(section_line(theme, "NEXT ACTION"));
+    if app.copy_buffer_len() > 0 {
+        lines.push(Line::from(format!(
+            "{} paste {}",
+            action_key(app, "files", "paste"),
+            app.copy_buffer_label()
+        )));
+        lines.push(Line::from("Destination:"));
+        lines.push(Line::from(display_path(app.cwd())));
+        lines.push(Line::from("Conflicts are checked before writing."));
+    } else if focused.is_some_and(|entry| entry.kind == FileKind::Directory) {
+        lines.push(Line::from(format!(
+            "{} open directory",
+            action_key(app, "files", "open")
+        )));
+    } else if focused.is_some() {
+        lines.push(Line::from(format!(
+            "{} preview",
+            action_key(app, "files", "open")
+        )));
+        lines.push(Line::from(format!(
+            "{} edit",
+            action_key(app, "files", "edit")
+        )));
+    }
+    if let Some(progress) = app.job_progress() {
+        lines.push(Line::from(""));
+        lines.push(section_line(theme, "TASK"));
+        lines.push(Line::from(job_banner(app)));
+        lines.push(Line::from(format!(
+            "{} results",
+            action_key(app, "files", "open_jobs")
+        )));
+        if progress.cancelling {
+            lines.push(Line::from("Waiting for safe cleanup"));
+        }
+    }
     lines.push(Line::from(""));
-    lines.push(section_line(theme, "SEARCH"));
-    lines.push(kv_line(
-        theme,
-        "filter",
-        if app.filter().is_empty() {
-            "-".to_string()
-        } else {
-            escape_display(app.filter())
-        },
-    ));
-    lines.push(kv_line(theme, "sort", app.sort_label()));
-    lines.push(Line::from(""));
-    lines.push(section_line(theme, "LOG"));
-    for log in app.logs().iter().rev().take(5) {
+    lines.push(section_line(theme, "LAST OUTCOME"));
+    for log in app.logs().iter().rev().take(3) {
         lines.push(Line::from(Span::styled(
             escape_display(log),
             log_style(theme, log),
@@ -559,55 +674,137 @@ fn job_banner(app: &App) -> String {
 
 fn draw_jobs(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
     frame.render_widget(Clear, area);
-    let mut lines = vec![Line::from(job_banner(app))];
-    if let Some(progress) = app.job_progress() {
-        lines.push(kv_line(
-            theme,
-            "Processed roots",
-            format!("{} / {}", progress.completed, progress.total),
-        ));
-        lines.push(kv_line(theme, "Copied", format_size(progress.copied_bytes)));
-        if let Some(path) = &progress.current_path {
-            lines.push(kv_line(theme, "Current", display_path(path)));
+    let mut lines = Vec::new();
+    if app.job_active() {
+        lines.push(section_line(theme, "ACTIVE TASK"));
+        lines.push(Line::from(job_banner(app)));
+        if let Some(progress) = app.job_progress() {
+            lines.push(kv_line(
+                theme,
+                "Processed roots",
+                format!("{} / {}", progress.completed, progress.total),
+            ));
+            lines.push(kv_line(
+                theme,
+                "Copied bytes",
+                format_size(progress.copied_bytes),
+            ));
+            if let Some(elapsed) = app.job_elapsed().filter(|d| d.as_secs_f64() >= 0.5) {
+                lines.push(kv_line(
+                    theme,
+                    "Mean rate",
+                    format!(
+                        "{}/s",
+                        format_size((progress.copied_bytes as f64 / elapsed.as_secs_f64()) as u64)
+                    ),
+                ));
+            }
+            if let Some(path) = &progress.current_path {
+                lines.push(kv_line(theme, "Current", display_path(path)));
+            }
         }
-    } else {
-        lines.push(Line::from("No file jobs yet"));
     }
     if app.exit_after_job() {
         lines.push(Line::from("Exiting after worker cancellation and cleanup"));
     }
-    lines.push(Line::from(
-        "Cancellation retains completed items; deletion is not undoable.",
-    ));
-    if let Some(result) = app.last_job() {
+    if let Some(entry) = app.selected_job() {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "RECENT TASK {}/{} | #{} {}",
+                app.history_index() + 1,
+                app.job_history().entries().len(),
+                entry.id,
+                entry.kind.label()
+            ),
+            theme.fg_bold(theme.palette().accent),
+        )));
+        let c = entry.counts;
         lines.push(kv_line(
             theme,
             "Result",
             format!(
                 "{} done / {} failed / {} skipped / {} remaining",
-                result.succeeded.len(),
-                result.failed.len(),
-                result.skipped.len(),
-                result.unprocessed.len()
+                c.succeeded, c.failed, c.skipped, c.remaining
             ),
         ));
-        for failure in result.failed.iter().take(100) {
+        lines.push(kv_line(
+            theme,
+            "Copied / elapsed",
+            format!(
+                "{} / {:.2}s",
+                format_size(entry.copied_bytes),
+                entry.elapsed.as_secs_f64()
+            ),
+        ));
+        if let Some(path) = &entry.destination {
+            lines.push(kv_line(theme, "Destination", display_path(path)));
+        }
+        if entry.cancelled {
             lines.push(Line::from(Span::styled(
-                format!(
-                    "FAILED {}: {}",
-                    display_path(&failure.path),
-                    escape_display(&failure.error)
-                ),
-                theme.danger(),
+                "Cancelled; completed items remain completed",
+                theme.fg(theme.palette().warn),
             )));
         }
-        for path in result.skipped.iter().take(100) {
-            lines.push(Line::from(format!("SKIPPED {}", display_path(path))));
+        lines.push(Line::from(format!(
+            "View: {}",
+            if app.job_failures_only() {
+                "failed / remaining"
+            } else {
+                "all outcomes"
+            }
+        )));
+        if entry.omitted_details > 0 || entry.omitted_retry_items > 0 {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "Omitted: {} details / {} retry paths (storage limit)",
+                    entry.omitted_details, entry.omitted_retry_items
+                ),
+                theme.fg(theme.palette().warn),
+            )));
         }
-        for path in result.unprocessed.iter().take(100) {
-            lines.push(Line::from(format!("REMAINING {}", display_path(path))));
+        if app.job_failures_only() {
+            for failure in &entry.failures {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "FAILED {}: {}",
+                        display_path(&failure.path),
+                        escape_display(&failure.error)
+                    ),
+                    theme.danger(),
+                )));
+            }
+            for path in &entry.unprocessed {
+                lines.push(Line::from(Span::styled(
+                    format!("REMAINING {}", display_path(path)),
+                    theme.fg(theme.palette().warn),
+                )));
+            }
+            if entry.counts.failed == 0 && entry.counts.remaining == 0 {
+                lines.push(Line::from("No failed or remaining items."));
+            }
+        } else {
+            for detail in &entry.details {
+                lines.push(Line::from(Span::styled(
+                    escape_display(detail),
+                    log_style(theme, detail),
+                )));
+            }
         }
+        if entry.details.is_empty() {
+            lines.push(Line::from(
+                "No retained item details; counts above remain complete.",
+            ));
+        }
+    } else if !app.job_active() {
+        lines.push(Line::from(
+            "No file jobs yet. Copy, move or recover a file to see its result here.",
+        ));
     }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Session history | cancellation is not undo | export before exit",
+        theme.fg(theme.palette().muted),
+    )));
     let max_offset = lines
         .len()
         .saturating_sub(area.height.saturating_sub(2) as usize);
@@ -622,6 +819,61 @@ fn draw_jobs(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
                     .borders(Borders::ALL)
                     .title(panel_title(theme, "File jobs")),
             ),
+        area,
+    );
+}
+
+fn draw_places(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
+    frame.render_widget(Clear, area);
+    let entries = app.places_entries();
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!("Find: {}", escape_display(app.places_query())),
+            theme.fg_bold(theme.palette().accent),
+        )),
+        Line::from("Recent and pinned directories on this host"),
+    ];
+    if !app.places_enabled() {
+        lines.push(Line::from(
+            "Location history is disabled (TERSH_PLACES=off).",
+        ));
+    } else if entries.is_empty() {
+        lines.push(Line::from(
+            "No matching places. Navigate to a directory or pin the current one.",
+        ));
+    }
+    if let Some(error) = app.navigation_error() {
+        lines.push(Line::from(Span::styled(
+            truncate_display_width(
+                &escape_display(error),
+                area.width.saturating_sub(2) as usize,
+            ),
+            theme.danger(),
+        )));
+    }
+    let capacity = area.height.saturating_sub(2 + lines.len() as u16) as usize;
+    let start = visible_entry_start(app.places_cursor(), entries.len(), capacity);
+    for (i, place) in entries.iter().enumerate().skip(start).take(capacity) {
+        let text = format!(
+            "{} {} {}",
+            if i == app.places_cursor() { ">" } else { " " },
+            if place.pinned { "*" } else { " " },
+            compact_path(&place.path, area.width.saturating_sub(7) as usize)
+        );
+        lines.push(Line::from(Span::styled(
+            text,
+            if i == app.places_cursor() {
+                theme.selected()
+            } else {
+                theme.fg(theme.palette().path)
+            },
+        )));
+    }
+    frame.render_widget(
+        Paragraph::new(lines).block(base_block().borders(Borders::ALL).title(panel_title(
+            theme,
+            format!("Places | {} saved | * pinned", entries.len()),
+        ))),
         area,
     );
 }
@@ -689,7 +941,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
         "y_".into()
     } else if app.pending_g() {
         "g_".into()
-    } else if app.mode() == Mode::PreviewSearch {
+    } else if matches!(app.mode(), Mode::PreviewSearch | Mode::LogSearch) {
         "find".into()
     } else if app.mode() == Mode::ConfirmRestore {
         "restore".into()
@@ -710,11 +962,13 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
             ));
         } else if let Some(hint) = crate::bindings::hint(app.keymap(), context, action, description)
         {
-            pieces.push(if context == "files" && action == "open" {
-                format!("next: {hint}")
-            } else {
-                hint
-            });
+            pieces.push(
+                if context == "files" && action == "open" && area.width >= 60 {
+                    format!("next: {hint}")
+                } else {
+                    hint
+                },
+            );
         }
     };
     match context {
@@ -736,14 +990,28 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
                 if app.copy_buffer_len() > 0 {
                     add("paste", "paste");
                 }
-                add(
-                    "open",
-                    match app.entries().get(app.cursor()).map(|e| e.kind) {
-                        Some(FileKind::Directory) => "open dir",
-                        Some(FileKind::File) => "preview file",
-                        _ => "inspect",
-                    },
-                );
+                if !compact || app.copy_buffer_len() == 0 {
+                    add(
+                        "open",
+                        match app.entries().get(app.cursor()).map(|e| e.kind) {
+                            Some(FileKind::Directory) => {
+                                if area.width < 60 {
+                                    "open"
+                                } else {
+                                    "open dir"
+                                }
+                            }
+                            Some(FileKind::File) => {
+                                if area.width < 60 {
+                                    "view"
+                                } else {
+                                    "preview file"
+                                }
+                            }
+                            _ => "inspect",
+                        },
+                    );
+                }
                 if app
                     .entries()
                     .get(app.cursor())
@@ -756,6 +1024,11 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
                 add("cycle_sort", "sort");
                 add("open_jobs", "jobs");
                 add("open_trash", "trash recovery");
+                add("open_places", "places");
+                add("pin_place", "pin place");
+                add("open_log", "follow log");
+                add("toggle_structured", "format");
+                add("toggle_inspector", "inspector");
                 if app.job_active() {
                     add("cancel_job", "cancel job");
                 }
@@ -774,10 +1047,31 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
             add("open_preview_search", "find");
             add("preview_search_next", "next");
             add("edit", "edit");
+            add("toggle_structured", "raw/structured");
+            add("open_log", "follow log");
             add("open_jobs", "jobs");
             if app.job_active() {
                 add("cancel_job", "cancel job");
             }
+        }
+        "log" => {
+            add("cancel", "close");
+            add(
+                "toggle_log_pause",
+                if app.log_paused() { "resume" } else { "pause" },
+            );
+            add("open_preview_search", "find");
+            add("open_actions", "actions");
+            add("half_down", "down");
+            add("half_up", "up");
+        }
+        "places" => {
+            add("submit", "open");
+            add("cancel", "back");
+            add("pin_place", "pin");
+            add("remove_place", "forget");
+            add("clear_recent", "clear recent");
+            add("down", "next");
         }
         "help" => {
             add("cancel", "close");
@@ -801,6 +1095,11 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
         }
         "jobs" => {
             add("cancel", "back");
+            add("retry_job", "retry unresolved");
+            add("export_job", "export");
+            add("previous_job", "newer");
+            add("next_job", "older");
+            add("toggle_job_filter", "failures/all");
             if app.job_active() {
                 add("cancel_job", "cancel job");
             }
@@ -812,12 +1111,15 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
                 "submit",
                 match app.mode() {
                     Mode::Filter => "apply",
-                    Mode::PreviewSearch => "find",
+                    Mode::PreviewSearch | Mode::LogSearch => "find",
+                    Mode::ExportJob => "export",
                     Mode::ConfirmRestore => "restore",
                     _ => "confirm",
                 },
             );
-            add("backspace", "erase");
+            if app.mode() != Mode::ConfirmRestore {
+                add("backspace", "erase");
+            }
         }
     }
     // Emergency exit is deliberately immutable in the validated keymap.
@@ -831,6 +1133,9 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
             "^C force".into()
         },
     );
+    if let Some(hint) = app.chord_hint() {
+        pieces.insert(0, hint);
+    }
     let text = pieces.join(" | ");
     frame.render_widget(
         Paragraph::new(footer_rows(
@@ -880,6 +1185,8 @@ fn draw_input_modal(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
             "Restore to original location; existing files are never overwritten."
         }
         Mode::PreviewSearch => "Find in preview",
+        Mode::LogSearch => "Find in paused log",
+        Mode::ExportJob => "Export selected task as JSON to a new file (never overwrite)",
         _ => "",
     };
     let prompt = prompt
@@ -948,8 +1255,19 @@ fn draw_input_modal(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
             lines.push(Line::from(format!("{}. {}", index + 1, label)));
         }
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(escape_display(app.input())));
+    if let Some(error) = app
+        .navigation_error()
+        .filter(|_| matches!(app.mode(), Mode::Goto | Mode::ExportJob))
+    {
+        lines.push(Line::from(Span::styled(
+            escape_display(error),
+            theme.danger(),
+        )));
+    }
+    if app.mode() != Mode::ConfirmRestore {
+        lines.push(Line::from(""));
+        lines.push(Line::from(escape_display(app.input())));
+    }
     let title = match app.mode() {
         Mode::ConfirmDelete => "DANGER",
         Mode::ConfirmTrash => "TRASH",
@@ -967,17 +1285,6 @@ fn draw_input_modal(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
         .block(block)
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
-}
-
-fn buffer_style(theme: Theme, label: &str) -> Style {
-    let palette = theme.palette();
-    if label.starts_with("COPY") {
-        theme.fg_bold(palette.copy)
-    } else if label.starts_with("CUT") {
-        theme.fg_bold(palette.cut)
-    } else {
-        theme.fg(palette.inactive)
-    }
 }
 
 fn file_row_style(
@@ -1085,5 +1392,36 @@ fn command_overlay_rect(area: Rect, mode: Mode) -> Rect {
         area
     } else {
         centered_rect(70, 30, area)
+    }
+}
+
+fn entry_size(entry: &crate::fs_core::FileEntry) -> String {
+    if entry.kind == FileKind::Directory {
+        "not scanned".into()
+    } else {
+        format_size(entry.size)
+    }
+}
+fn selection_size(app: &App) -> String {
+    if app.selected_len() == 0 {
+        return format_size(0);
+    }
+    let (bytes, dirs) = app
+        .entries()
+        .iter()
+        .filter(|e| app.is_selected(&e.path))
+        .fold((0u64, 0usize), |(bytes, dirs), entry| {
+            if entry.kind == FileKind::Directory {
+                (bytes, dirs + 1)
+            } else {
+                (bytes.saturating_add(entry.size), dirs)
+            }
+        });
+    if dirs == 0 {
+        format_size(bytes)
+    } else if bytes == 0 {
+        format!("{dirs} dir(s)")
+    } else {
+        format!("{} + {dirs} dir(s)", format_size(bytes))
     }
 }

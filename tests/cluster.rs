@@ -591,7 +591,7 @@ fn inventory_rejects_unknown_json_fields() {
 }
 
 #[test]
-fn inventory_trims_stored_connection_and_display_fields() {
+fn inventory_trims_labels_but_preserves_the_workdir_path() {
     let json = r#"
 {
   "servers": [
@@ -613,7 +613,7 @@ fn inventory_trims_stored_connection_and_display_fields() {
     assert_eq!(host.address(), "203.0.113.10");
     assert_eq!(host.user(), Some("ops"));
     assert_eq!(host.role(), "Remote server");
-    assert_eq!(host.workdir(), Some("/srv/app"));
+    assert_eq!(host.workdir(), Some(" /srv/app "));
     assert_eq!(host.ssh_target(), "ops@203.0.113.10");
 }
 
@@ -724,9 +724,8 @@ fn cluster_render_tiny_keeps_exit_visible() {
         .map(|cell| cell.symbol())
         .collect::<String>();
     assert!(buffer.contains("q quit"));
-    assert!(buffer.contains("? help"));
-    assert!(buffer.contains("l detail"));
-    assert!(buffer.contains("^G"));
+    assert!(buffer.contains("t tersh"));
+    assert!(buffer.contains("o actions"));
     assert!(buffer.contains("^C"));
 }
 

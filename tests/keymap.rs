@@ -151,7 +151,26 @@ fn exported_defaults_roundtrip_and_describe_every_context() {
     let json = map.to_json().unwrap();
     let parsed = Keymap::from_json(&json).unwrap();
     assert_eq!(json, parsed.to_json().unwrap());
-    assert_eq!(map.contexts().len(), 10);
+    for required in [
+        "files",
+        "preview",
+        "input",
+        "help",
+        "actions",
+        "cluster",
+        "cluster_detail",
+        "cluster_filter",
+        "trash",
+        "jobs",
+        "places",
+        "log",
+    ] {
+        assert!(
+            map.contexts().contains(&required),
+            "missing context: {required}"
+        );
+        assert_eq!(map.contexts(), parsed.contexts());
+    }
     for context in map.contexts() {
         for (id, keys) in map.bindings(context) {
             assert_eq!(map.label(context, &id), keys.first().cloned());

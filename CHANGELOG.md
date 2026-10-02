@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+The development source reports `1.3.0-dev.1`; no new tag or release is implied.
+These additions are not in the v1.2.0 tag. See the
+[workflow update](docs/product-evolution.md#english) for controls, limits and
+local measurements.
+
+- Keep directory, preview verification, recovery listing and on-demand log reads off the interactive thread with bounded workers and stale-result rejection.
+- Preserve navigation focus and failed path input; add scoped recent/pinned places with bounded private state and opt-out.
+- Add the latest 20 in-session task summaries, unresolved-item retry through fresh validation, and no-overwrite JSON export.
+- Add paused/searchable log following and token-preserving JSON, quoted CSV and diff previews with raw fallback.
+- Group searchable actions, show effective chord hints, prioritize compact primary actions and allow the contextual inspector to collapse.
+- Retain last valid host metrics during checking, add attention/events/pause views, fair per-host refresh with backoff, and probe cleanup on exit.
+- Forward only validated presentation settings and exact host/path identity into workbench sessions; retain no-color/ASCII/no-motion fallbacks.
+- Avoid constructing a full-directory selection lookup when no files are marked; reduce the observed large-directory startup cost.
+- Validate native Ubuntu x86_64 and real SSH Unicode editing, resize and dashboard/workbench round trips; make PTY harnesses drain output and handle alternate-screen transitions.
+- Keep projection-policy test fixtures private regardless of the caller's umask, without relaxing policy checks.
+- Use size optimization and fat LTO for release-profile builds. The measured macOS candidate is 5.6% smaller; small-directory startup is about 20 ms slower than the baseline.
+
 - Allow slow jump-host connections 15 seconds to connect and 30 seconds for cluster probes; clarify that a probe timeout does not prove SSH is unavailable.
 
 - Stabilize the Python CI process-readiness fixture with atomic PID publication; no runtime behavior changes.

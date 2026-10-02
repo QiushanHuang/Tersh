@@ -71,6 +71,8 @@ combinations; keep a simple alternative on mobile keyboards.
 | `cluster_filter` | Host filter input |
 | `trash` | Recovery list |
 | `jobs` | File-job progress/results |
+| `places` | Searchable recent and pinned directories |
+| `log` | Bounded log tail/follow, pause and search |
 
 Unknown contexts/actions, duplicate JSON fields, duplicate keys and ambiguous
 chord prefixes are rejected. For example, `g` and `g g` cannot coexist as
@@ -100,7 +102,10 @@ automatic probing remains capped and rotated. No history is written to disk.
 ## File-operation boundaries
 
 Only one mutation job runs at a time. Directory listing and preview loading
-remain synchronous. Cancellation is cooperative and preserves completed work;
+use bounded background readers in the interactive runtime. A newer queued read
+supersedes an older one; stale results cannot replace the current directory or
+preview. Returning to a parent restores the departed child, and a failed path
+input stays editable. Cancellation is cooperative and preserves completed work;
 permanent deletion cannot be undone. Replacing existing directories is refused.
 
 Trash receipts belong to the work root selected at startup. Restore validates
@@ -109,3 +114,93 @@ same-filesystem rename. Malformed records are reported and excluded. Receipts
 use filesystem permissions and identity checks; they are not cryptographic
 protection against their OS owner. Legacy trash and non-UTF-8 original paths
 are not silently assigned invented recovery metadata.
+
+## Locations
+
+`b` opens recent and pinned locations; `B` pins/unpins the current work directory.
+Type to filter, use arrows/Tab and Enter to open. In the locations view, Ctrl+B
+toggles a pin, Ctrl+D forgets the selected saved record, and Ctrl+L clears recent
+records for the highlighted place's host while retaining pins (`--c`), or the current host in the file workbench. In `--c`, `B` pins the configured work directory. These actions change location metadata, never the
+directory itself. Failed navigation retains the selection and explains the error.
+
+The file workbench lists locations for its current host identity. `--c` can search
+saved host/path pairs and configured `workdir` entries. Saved remote locations
+must still match the current alias, SSH target, resolved jump target and host
+kind before they can launch. Remote histories stay on their host; no history
+sync or additional SSH discovery runs in the background.
+
+State is limited to 128 entries, 64 pins and 64 KiB:
+
+- `TERSH_PLACES=off` disables history and pins.
+- `TERSH_PLACES_FILE` selects a state file.
+- Otherwise use `$XDG_STATE_HOME/tersh/places.json` or
+  `~/.local/state/tersh/places.json`.
+
+State files are private and written atomically. A kernel lock protects saves;
+an existing lock sidecar is normal. A concurrent state change is reported rather
+than overwritten; reopen the view/application as directed to reload it. Invalid
+or symbolic-link state files are not replaced. Saved paths must be absolute UTF-8.
+
+## Recent task results
+
+`J` opens the active task and the latest 20 results from this session. Use `[`/`]`
+for newer/older results, `f` for failed/remaining items, `r` to propose a retry,
+and `e` to export the selected result as JSON to a new file.
+
+History has a 1 MiB retained-data budget and 64 KiB per entry. Full outcome counts
+remain available when details are omitted; the view and export state the omitted
+counts. Retrying includes failed and remaining items only, clears previous
+overwrite/skip decisions, and revalidates the sources and destination through
+the normal confirmation path. If retry paths were omitted, retry is refused
+rather than silently operating on a subset. Export never overwrites an existing
+file. General task history is in-memory; persistent trash recovery remains separate.
+
+Progress distinguishes processed top-level items from bytes copied. The displayed
+mean rate is an estimate based on elapsed task time; no ETA is invented when a
+total byte count is unknown. Cancelling preserves already completed operations.
+
+## Logs and structured previews
+
+`L` opens a bounded log tail on the focused regular file. Space pauses/resumes;
+scrolling or `/` search pauses following so the reading position stays stable.
+`n`/`N` move between matches. Escape closes the log view. Each background poll
+reads at most 64 KiB, with automatic polling at most four times per second. The retained buffer is
+at most 2,000 lines / 256 KiB; older data and truncated lines are identified.
+
+The reader reports observed file rotation, shortening and read errors. A file
+that is truncated and regrows past the old offset entirely between two polls may
+not be recognized as rotated. Pausing stops further automatic scheduling and freezes the displayed buffer; an already in-flight read may finish.
+Symbolic links and special files are refused for following.
+
+`f` switches raw/structured preview for JSON, CSV and unified diff. JSON formatting
+preserves original numeric tokens, duplicate fields, order and string escapes.
+CSV supports quoted commas/newlines. Structured input/output is capped at
+256 KiB, 2,000 lines and 512 display columns; CSV is limited to 32 columns.
+Invalid or oversized input has an explicit bounded raw fallback. These are data
+limits, not a claim about peak process memory. No external renderer is launched.
+
+## Host attention and refresh
+
+In `--c`, `a` toggles hosts needing attention, `E` opens the latest 100 state
+changes, and `P` pauses automatic refresh. Manual refresh remains available.
+`TERSH_DISK_WARN` sets the used-storage warning threshold (0–100, default 90).
+Unknown, old and failed observations remain distinguishable from fresh success.
+
+Refreshing retains the last valid values with a separate checking/error state
+and data age. Normal refresh scheduling is per host; repeated failure backs off
+to 30/60/120 seconds. Existing concurrency and connection-time budgets remain
+bounded. Closing the dashboard cancels active probes and reaps their workers.
+Attention filters and charts reuse existing snapshots and never add collectors.
+
+Trend positions represent observation order with equal visual spacing, not equal
+time intervals. Gaps remain missing. Memory/storage use fixed percentage scales;
+load is not CPU utilization, and probe duration is not pure network latency.
+
+## Interface behavior
+
+`I` toggles the wide-screen inspector. Directory sizes are shown as unscanned
+rather than presenting directory metadata as recursive storage use. At 40 columns,
+primary actions and the action menu retain priority, including custom keybindings.
+Action menus group tasks, support search aliases, and explain unavailable actions.
+Pending chord hints follow the effective keymap. Existing no-color, ASCII and
+no-motion presets continue to work without font extensions or idle animation.

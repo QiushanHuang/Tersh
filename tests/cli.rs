@@ -64,7 +64,7 @@ fn cluster_long_alias_keeps_existing_cluster_mode_contracts() {
 }
 
 #[test]
-fn version_reports_minor_release() {
+fn version_reports_package_version() {
     let binary = env!("CARGO_BIN_EXE_tersh");
     let output = Command::new(binary)
         .arg("--version")
@@ -74,7 +74,10 @@ fn version_reports_minor_release() {
     assert!(output.status.success());
 
     let stdout = String::from_utf8(output.stdout).expect("version output is utf-8");
-    assert!(stdout.contains("tersh 1.2.0"));
+    assert_eq!(
+        stdout.trim(),
+        format!("tersh {}", env!("CARGO_PKG_VERSION"))
+    );
 }
 
 #[test]

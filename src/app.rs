@@ -19,13 +19,15 @@ use std::{
     io::{self, Read, Write},
     path::{Path, PathBuf},
     process::Command as ProcessCommand,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 const PREVIEW_SIGNATURE_HASH_LIMIT: u64 = (2 * 1024 * 1024) + 1;
 const PREVIEW_CACHE_LIMIT: usize = 32;
 const PREVIEW_CACHE_BYTES_LIMIT: usize = 4 * 1024 * 1024;
 const PREVIEW_CACHE_ENTRY_BYTES_LIMIT: usize = 512 * 1024;
+const DIRECTORY_MEMORY_LIMIT: usize = 64;
+const PREVIEW_SETTLE: Duration = Duration::from_millis(80);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -45,6 +47,10 @@ pub enum Mode {
     Jobs,
     Trash,
     ConfirmRestore,
+    Places,
+    ExportJob,
+    Log,
+    LogSearch,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,6 +100,19 @@ pub enum Command {
     OpenTrash,
     RestoreTrash,
     RefreshTrash,
+    OpenPlaces,
+    PinPlace,
+    RemovePlace,
+    ClearRecent,
+    PreviousJob,
+    NextJob,
+    ToggleJobFilter,
+    RetryJob,
+    ExportJob,
+    OpenLog,
+    ToggleLogPause,
+    ToggleStructured,
+    ToggleInspector,
 }
 
 macro_rules! command_actions {
@@ -114,6 +133,9 @@ command_actions! {
     CycleSort=>"cycle_sort", ReverseSort=>"reverse_sort", Cancel=>"cancel", Quit=>"quit", ForceQuit=>"force_quit",
     Edit=>"edit", Backspace=>"backspace", Submit=>"submit", OpenActions=>"open_actions", OpenJobs=>"open_jobs",
     CancelJob=>"cancel_job", OpenTrash=>"open_trash", RestoreTrash=>"restore", RefreshTrash=>"refresh_trash",
+    OpenPlaces=>"open_places", PinPlace=>"pin_place", RemovePlace=>"remove_place", ClearRecent=>"clear_recent",
+    PreviousJob=>"previous_job", NextJob=>"next_job", ToggleJobFilter=>"toggle_job_filter", RetryJob=>"retry_job", ExportJob=>"export_job",
+    OpenLog=>"open_log", ToggleLogPause=>"toggle_log_pause", ToggleStructured=>"toggle_structured", ToggleInspector=>"toggle_inspector",
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,6 +188,25 @@ pub struct App {
     sort_key: SortKey,
     sort_reverse: bool,
     preview_cache: VecDeque<CachedPreview>,
+    readers: Option<AsyncReads>,
+    directory_memory: VecDeque<(PathBuf, OsString)>,
+    navigation_error: Option<String>,
+    places: crate::places::Places,
+    places_cursor: usize,
+    places_query: String,
+    place_scope: (String, String),
+    job_history: crate::job_history::JobHistory,
+    history_index: usize,
+    job_failures_only: bool,
+    active_request: Option<crate::jobs::JobRequest>,
+    active_started: Option<Instant>,
+    structured_preview: bool,
+    inspector_visible: bool,
+    log_session: Option<crate::log_session::LogSession>,
+    log_return_mode: Mode,
+    log_view_lines: std::cell::Cell<usize>,
+    place_navigation: bool,
+    export_job_id: Option<u64>,
     pending_file_operation: Option<PendingFileOperation>,
     pending_rename: Option<BufferedPath>,
     pending_direct_targets: Option<Vec<BufferedPath>>,
@@ -289,6 +330,7 @@ struct PreviewSignature {
 
 #[derive(Debug, Clone)]
 struct CachedPreview {
+    structured: bool,
     path: PathBuf,
     signature: PreviewSignature,
     preview: Preview,
@@ -300,6 +342,164 @@ struct InitialLocation {
     focus_name: Option<OsString>,
     open_preview: bool,
     show_hidden: bool,
+}
+
+enum DirectoryRead {
+    Location {
+        path: PathBuf,
+        initial: bool,
+        show_hidden: bool,
+        goto_input: Option<String>,
+    },
+    Trash(PathBuf),
+}
+
+struct LoadedDirectory {
+    location: InitialLocation,
+    listing: crate::fs_core::DirectoryEntries,
+}
+
+enum DirectoryResult {
+    Location(std::result::Result<LoadedDirectory, String>),
+    Trash(std::result::Result<crate::trash::TrashScan, String>),
+}
+
+struct PreviewRead {
+    structured: bool,
+    path: PathBuf,
+    signature: Option<PreviewSignature>,
+    cached: Option<Preview>,
+}
+
+struct LoadedPreview {
+    structured: bool,
+    path: PathBuf,
+    signature: Option<PreviewSignature>,
+    preview: Preview,
+}
+
+#[derive(Debug, Clone)]
+struct PendingDirectory {
+    generation: u64,
+    path: PathBuf,
+    initial: bool,
+    navigation: bool,
+    focus: Option<OsString>,
+    goto_input: Option<String>,
+}
+
+#[derive(Debug)]
+struct AsyncReads {
+    directory: crate::reader::LatestReader<DirectoryRead, DirectoryResult>,
+    preview: crate::reader::LatestReader<PreviewRead, LoadedPreview>,
+    directory_generation: u64,
+    preview_generation: u64,
+    pending_directory: Option<PendingDirectory>,
+    pending_preview: Option<(Instant, PathBuf)>,
+    preview_loading: bool,
+    trash_loading: bool,
+    root_initialized: bool,
+    trash_after_directory: bool,
+}
+
+impl AsyncReads {
+    fn new() -> Result<Self> {
+        Self::with_handlers(read_directory, read_preview)
+    }
+
+    fn with_handlers(
+        directory: impl FnMut(DirectoryRead) -> DirectoryResult + Send + 'static,
+        preview: impl FnMut(PreviewRead) -> LoadedPreview + Send + 'static,
+    ) -> Result<Self> {
+        Ok(Self {
+            directory: crate::reader::LatestReader::new("tersh-directory-reader", directory)?,
+            preview: crate::reader::LatestReader::new("tersh-preview-reader", preview)?,
+            directory_generation: 0,
+            preview_generation: 0,
+            pending_directory: None,
+            pending_preview: None,
+            preview_loading: false,
+            trash_loading: false,
+            root_initialized: false,
+            trash_after_directory: false,
+        })
+    }
+}
+
+fn read_directory(request: DirectoryRead) -> DirectoryResult {
+    match request {
+        DirectoryRead::Trash(root) => DirectoryResult::Trash(
+            crate::trash::scan_trash(&root).map_err(|error| format!("{error:#}")),
+        ),
+        DirectoryRead::Location {
+            path,
+            initial,
+            show_hidden,
+            goto_input,
+        } => {
+            let result = (|| -> Result<LoadedDirectory> {
+                let location = if initial {
+                    resolve_initial_location(&path)?
+                } else {
+                    let path = if let Some(input) = goto_input {
+                        let expanded = expand_path(&input);
+                        if expanded.is_absolute() {
+                            expanded
+                        } else {
+                            path.join(expanded)
+                        }
+                    } else {
+                        path
+                    };
+                    let cwd = path
+                        .canonicalize()
+                        .with_context(|| format!("failed to resolve {}", path.display()))?;
+                    if !cwd.is_dir() {
+                        anyhow::bail!("not a directory: {}", cwd.display());
+                    }
+                    InitialLocation {
+                        cwd,
+                        focus_name: None,
+                        open_preview: false,
+                        show_hidden,
+                    }
+                };
+                let listing =
+                    read_dir_entries_with_diagnostics(&location.cwd, location.show_hidden, "")?;
+                Ok(LoadedDirectory { location, listing })
+            })();
+            DirectoryResult::Location(result.map_err(|error| format!("{error:#}")))
+        }
+    }
+}
+
+fn read_preview(request: PreviewRead) -> LoadedPreview {
+    let signature = preview_signature(&request.path);
+    let preview = if signature.is_some()
+        && signature == request.signature
+        && let Some(cached) = request.cached
+    {
+        cached
+    } else {
+        (if request.structured {
+            crate::preview::preview_file_structured(&request.path)
+        } else {
+            preview_file(&request.path)
+        })
+        .unwrap_or_else(|error| {
+            Preview::message(
+                request.path.clone(),
+                PreviewKind::Error,
+                crate::fs_core::escape_display(&error.to_string()),
+            )
+        })
+    };
+    LoadedPreview {
+        structured: request.structured,
+        path: request.path,
+        signature,
+        preview,
+    }
 }
 
 fn resolve_initial_location(path: &Path) -> Result<InitialLocation> {
@@ -339,13 +539,743 @@ fn resolve_initial_location(path: &Path) -> Result<InitialLocation> {
 }
 
 impl App {
+    /// Starts directory and preview readers without waiting for filesystem I/O.
+    pub fn new_async(path: PathBuf) -> Result<Self> {
+        Self::new_async_with_output(path, TerminalOutput::Stdout)
+    }
+
+    fn new_async_with_output(path: PathBuf, output: TerminalOutput) -> Result<Self> {
+        Self::new_async_with_readers(path, output, AsyncReads::new()?)
+    }
+
+    fn new_async_with_readers(
+        path: PathBuf,
+        output: TerminalOutput,
+        readers: AsyncReads,
+    ) -> Result<Self> {
+        let path = if path.is_absolute() {
+            path
+        } else {
+            std::env::current_dir()?.join(path)
+        };
+        let initial = InitialLocation {
+            cwd: path.clone(),
+            focus_name: None,
+            open_preview: false,
+            show_hidden: false,
+        };
+        let mut app = Self::empty_with_location(initial, output);
+        app.readers = Some(readers);
+        app.request_directory(path, true, false, None, None);
+        Ok(app)
+    }
+
+    pub fn directory_loading(&self) -> bool {
+        self.readers
+            .as_ref()
+            .is_some_and(|readers| readers.pending_directory.is_some())
+    }
+
+    pub fn preview_loading(&self) -> bool {
+        self.readers
+            .as_ref()
+            .is_some_and(|readers| readers.preview_loading)
+    }
+
+    pub fn trash_loading(&self) -> bool {
+        self.readers
+            .as_ref()
+            .is_some_and(|readers| readers.trash_loading)
+    }
+
+    pub fn loading_message(&self) -> Option<&str> {
+        if self.directory_loading() {
+            Some("Loading directory; navigation remains available")
+        } else if self.trash_loading() {
+            Some("Loading recovery entries")
+        } else if self.preview_loading() {
+            Some("Loading or verifying preview")
+        } else {
+            None
+        }
+    }
+
+    pub fn navigation_error(&self) -> Option<&str> {
+        self.navigation_error.as_deref()
+    }
+
+    /// Applies only current generations; worker results never mutate UI state.
+    pub fn poll_readers(&mut self) -> bool {
+        let log_changed = self.poll_log();
+        let Some(readers) = self.readers.as_mut() else {
+            return log_changed;
+        };
+        let directory = readers.directory.take_result();
+        let preview = readers.preview.take_result();
+        let mut changed = log_changed;
+        if let Some((generation, result)) = directory
+            && generation == self.readers.as_ref().unwrap().directory_generation
+        {
+            match result {
+                DirectoryResult::Location(result) => {
+                    let pending = self.readers.as_mut().unwrap().pending_directory.take();
+                    if let Some(pending) =
+                        pending.filter(|pending| pending.generation == generation)
+                    {
+                        match result {
+                            Ok(loaded) => {
+                                if !self.readers.as_ref().unwrap().root_initialized {
+                                    self.work_root = loaded.location.cwd.clone();
+                                    self.readers.as_mut().unwrap().root_initialized = true;
+                                }
+                                self.cwd = loaded.location.cwd;
+                                self.show_hidden = loaded.location.show_hidden;
+                                if pending.navigation {
+                                    self.filter.clear();
+                                    self.selected.clear();
+                                }
+                                self.all_entries = loaded.listing.entries;
+                                self.sort_all_entries();
+                                self.refresh_visible_entries();
+                                let focus = pending
+                                    .focus
+                                    .or(loaded.location.focus_name)
+                                    .or_else(|| self.remembered_focus(&self.cwd));
+                                if let Some(name) = focus {
+                                    self.focus_raw_name(&name);
+                                }
+                                if pending.goto_input.is_some() {
+                                    self.mode = Mode::Normal;
+                                    self.input.clear();
+                                }
+                                if loaded.location.open_preview
+                                    && self
+                                        .focused()
+                                        .is_some_and(|entry| entry.kind == FileKind::File)
+                                {
+                                    self.mode = Mode::Preview;
+                                }
+                                if !self.log_active() {
+                                    self.preview_offset = 0;
+                                }
+                                self.navigation_error = None;
+                                if pending.navigation || pending.initial {
+                                    self.record_place();
+                                }
+                                self.place_navigation = false;
+                                if loaded.listing.skipped > 0 {
+                                    self.log(format!(
+                                        "skipped {} unreadable item(s)",
+                                        loaded.listing.skipped
+                                    ));
+                                }
+                            }
+                            Err(error) => {
+                                let message = format!(
+                                    "{} failed: {error}",
+                                    if pending.goto_input.is_some() {
+                                        "goto"
+                                    } else {
+                                        "directory load"
+                                    }
+                                );
+                                self.navigation_error = Some(message.clone());
+                                self.log(message);
+                                if let Some(input) = pending.goto_input {
+                                    if self.place_navigation {
+                                        self.mode = Mode::Places;
+                                        self.input.clear();
+                                    } else {
+                                        self.mode = Mode::Goto;
+                                        self.input = input;
+                                    }
+                                }
+                                self.place_navigation = false;
+                                self.update_preview();
+                            }
+                        }
+                        changed = true;
+                        if self.readers.as_ref().unwrap().trash_after_directory {
+                            self.readers.as_mut().unwrap().trash_after_directory = false;
+                            if self.mode == Mode::Trash {
+                                self.load_trash();
+                            }
+                        }
+                    }
+                }
+                DirectoryResult::Trash(result) => {
+                    self.readers.as_mut().unwrap().trash_loading = false;
+                    self.apply_trash_result(result);
+                    changed = true;
+                }
+            }
+        }
+        if let Some((generation, loaded)) = preview
+            && !matches!(self.mode, Mode::Log | Mode::LogSearch)
+            && generation == self.readers.as_ref().unwrap().preview_generation
+            && self
+                .focused()
+                .is_some_and(|entry| entry.path == loaded.path)
+        {
+            self.readers.as_mut().unwrap().preview_loading = false;
+            self.cache_loaded_preview(&loaded);
+            self.preview = loaded.preview;
+            self.preview_offset = self
+                .preview_offset
+                .min(self.preview.lines.len().saturating_sub(1));
+            // Recompute search against the newly verified contents, never old rows.
+            if !self.preview_search_query.is_empty() {
+                let query = self.preview_search_query.to_lowercase();
+                self.preview_search_matches = self
+                    .preview
+                    .lines
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, line)| {
+                        line.to_lowercase().contains(&query).then_some(index)
+                    })
+                    .collect();
+                self.preview_search_index = (!self.preview_search_matches.is_empty()).then_some(0);
+            }
+            changed = true;
+        }
+        let ready = self
+            .readers
+            .as_ref()
+            .unwrap()
+            .pending_preview
+            .as_ref()
+            .is_some_and(|(deadline, _)| Instant::now() >= *deadline);
+        if ready {
+            let readers = self.readers.as_mut().unwrap();
+            let (_, path) = readers.pending_preview.take().unwrap();
+            let cached = self
+                .preview_cache
+                .iter()
+                .find(|cached| cached.path == path && cached.structured == self.structured_preview);
+            readers.preview.submit(
+                readers.preview_generation,
+                PreviewRead {
+                    structured: self.structured_preview,
+                    path,
+                    signature: cached.map(|cached| cached.signature.clone()),
+                    cached: cached.map(|cached| cached.preview.clone()),
+                },
+            );
+        }
+        changed
+    }
+
+    fn cache_loaded_preview(&mut self, loaded: &LoadedPreview) {
+        self.preview_cache
+            .retain(|cached| cached.path != loaded.path);
+        if let Some(signature) = &loaded.signature
+            && loaded.preview.kind != PreviewKind::Error
+        {
+            let estimated_bytes = preview_cache_bytes(&loaded.preview);
+            if estimated_bytes <= PREVIEW_CACHE_ENTRY_BYTES_LIMIT {
+                self.preview_cache.push_back(CachedPreview {
+                    structured: loaded.structured,
+                    path: loaded.path.clone(),
+                    signature: signature.clone(),
+                    preview: loaded.preview.clone(),
+                    estimated_bytes,
+                });
+                self.trim_preview_cache();
+            }
+        }
+    }
+
+    fn remember_cursor(&mut self) {
+        if let Some(name) = self.focused().map(|entry| entry.raw_name.clone()) {
+            self.directory_memory.retain(|(path, _)| path != &self.cwd);
+            self.directory_memory.push_back((self.cwd.clone(), name));
+            while self.directory_memory.len() > DIRECTORY_MEMORY_LIMIT {
+                self.directory_memory.pop_front();
+            }
+        }
+    }
+
+    fn remembered_focus(&self, directory: &Path) -> Option<OsString> {
+        self.directory_memory
+            .iter()
+            .rev()
+            .find(|(path, _)| path == directory)
+            .map(|(_, name)| name.clone())
+    }
+
+    fn request_directory(
+        &mut self,
+        path: PathBuf,
+        initial: bool,
+        navigation: bool,
+        focus: Option<OsString>,
+        goto_input: Option<String>,
+    ) {
+        if navigation {
+            self.remember_cursor();
+        }
+        let readers = self.readers.as_mut().expect("asynchronous readers");
+        readers.directory_generation = readers.directory_generation.wrapping_add(1);
+        readers.preview_generation = readers.preview_generation.wrapping_add(1);
+        readers.preview.clear_pending();
+        readers.pending_preview = None;
+        readers.preview_loading = false;
+        readers.trash_loading = false;
+        readers.pending_directory = Some(PendingDirectory {
+            generation: readers.directory_generation,
+            path: path.clone(),
+            initial,
+            navigation,
+            focus,
+            goto_input: goto_input.clone(),
+        });
+        readers.directory.submit(
+            readers.directory_generation,
+            DirectoryRead::Location {
+                path,
+                initial,
+                show_hidden: self.show_hidden,
+                goto_input,
+            },
+        );
+        if !self.log_active() {
+            self.preview =
+                Preview::message(self.cwd.clone(), PreviewKind::Empty, "Loading directory");
+        }
+        self.navigation_error = None;
+    }
+
+    fn apply_trash_result(&mut self, result: std::result::Result<crate::trash::TrashScan, String>) {
+        match result {
+            Ok(scan) => {
+                self.trash_entries = scan.entries;
+                self.trash_error = (scan.warning_count > 0).then(|| {
+                    format!(
+                        "{} invalid receipts skipped: {}",
+                        scan.warning_count,
+                        scan.warnings
+                            .first()
+                            .map(String::as_str)
+                            .unwrap_or("inspect metadata")
+                    )
+                });
+            }
+            Err(error) => {
+                self.trash_entries.clear();
+                self.trash_error = Some(error);
+            }
+        }
+        self.trash_cursor = self
+            .trash_cursor
+            .min(self.trash_entries.len().saturating_sub(1));
+    }
+
+    pub fn places_entries(&self) -> Vec<crate::places::Place> {
+        let query = self.places_query.to_lowercase();
+        self.places
+            .recent(&self.place_scope.0, &self.place_scope.1)
+            .into_iter()
+            .filter(|place| place.path.to_string_lossy().to_lowercase().contains(&query))
+            .cloned()
+            .collect()
+    }
+    pub fn places_cursor(&self) -> usize {
+        self.places_cursor
+    }
+    pub fn places_query(&self) -> &str {
+        &self.places_query
+    }
+    pub fn place_host(&self) -> &str {
+        &self.place_scope.0
+    }
+
+    pub fn places_enabled(&self) -> bool {
+        self.places.is_enabled()
+    }
+    pub fn set_places(&mut self, places: crate::places::Places) {
+        self.places = places;
+    }
+    pub fn set_place_scope(&mut self, host: String, identity: String) {
+        self.place_scope = (host, identity);
+    }
+    pub fn job_history(&self) -> &crate::job_history::JobHistory {
+        &self.job_history
+    }
+    pub fn history_index(&self) -> usize {
+        self.history_index
+    }
+    pub fn selected_job(&self) -> Option<&crate::job_history::HistoryEntry> {
+        self.job_history.entries().get(self.history_index)
+    }
+    pub fn job_failures_only(&self) -> bool {
+        self.job_failures_only
+    }
+    pub fn log_snapshot(&self) -> Option<&crate::log_reader::LogSnapshot> {
+        self.log_session
+            .as_ref()
+            .and_then(|session| session.snapshot())
+    }
+    fn log_active(&self) -> bool {
+        self.log_session
+            .as_ref()
+            .is_some_and(|session| session.active())
+    }
+
+    pub fn log_paused(&self) -> bool {
+        self.log_session
+            .as_ref()
+            .is_some_and(|session| session.paused())
+    }
+    pub fn set_log_view_lines(&self, lines: usize) {
+        self.log_view_lines.set(lines.max(1));
+    }
+
+    pub fn structured_preview(&self) -> bool {
+        self.structured_preview
+    }
+    pub fn inspector_visible(&self) -> bool {
+        self.inspector_visible
+    }
+    pub fn chord_hint(&self) -> Option<String> {
+        self.key_state.hint(self.keymap(), self.key_context())
+    }
+    pub fn job_elapsed(&self) -> Option<Duration> {
+        self.active_started.map(|at| at.elapsed())
+    }
+
+    fn record_place(&mut self) {
+        if let Err(error) = self
+            .places
+            .visit(&self.place_scope.0, &self.place_scope.1, &self.cwd)
+        {
+            self.log(format!("place was not saved: {error:#}"));
+        }
+    }
+
+    fn pin_place(&mut self) {
+        let path = if self.mode == Mode::Places {
+            self.places_entries()
+                .get(self.places_cursor)
+                .map(|place| place.path.clone())
+        } else {
+            Some(self.cwd.clone())
+        };
+        if let Some(path) = path {
+            match self
+                .places
+                .toggle_pin(&self.place_scope.0, &self.place_scope.1, &path)
+            {
+                Ok(()) => self.log(if self.places.is_enabled() {
+                    "place pin updated"
+                } else {
+                    "saved places are disabled"
+                }),
+                Err(error) => self.log(format!("pin failed: {error:#}")),
+            }
+            if self.mode == Mode::Places {
+                self.places_cursor = self
+                    .places_entries()
+                    .iter()
+                    .position(|place| place.path == path)
+                    .unwrap_or(0);
+            }
+        }
+        self.places_cursor = self
+            .places_cursor
+            .min(self.places_entries().len().saturating_sub(1));
+    }
+
+    fn remove_place(&mut self) {
+        if let Some(place) = self.places_entries().get(self.places_cursor) {
+            if let Err(error) =
+                self.places
+                    .remove(&self.place_scope.0, &self.place_scope.1, &place.path)
+            {
+                self.log(format!("remove place failed: {error:#}"));
+            } else {
+                self.log("saved location removed; files unchanged");
+            }
+        }
+        self.places_cursor = self
+            .places_cursor
+            .min(self.places_entries().len().saturating_sub(1));
+    }
+
+    fn clear_recent_places(&mut self) {
+        if let Err(error) = self
+            .places
+            .clear_recent(&self.place_scope.0, &self.place_scope.1)
+        {
+            self.log(format!("clear recent failed: {error:#}"));
+        } else {
+            self.log("recent locations cleared; pinned locations retained");
+        }
+        self.places_cursor = self
+            .places_cursor
+            .min(self.places_entries().len().saturating_sub(1));
+    }
+
+    fn open_place(&mut self) {
+        let Some(place) = self.places_entries().get(self.places_cursor).cloned() else {
+            return;
+        };
+        self.place_navigation = true;
+        self.input = place.path.to_string_lossy().into_owned();
+        self.mode = Mode::Goto;
+        self.submit_goto();
+        if self.readers.is_none() && self.navigation_error.is_some() {
+            self.mode = Mode::Places;
+        }
+    }
+
+    fn open_log(&mut self) {
+        self.open_log_with(crate::log_session::LogSession::new);
+    }
+
+    fn open_log_with(
+        &mut self,
+        create: impl FnOnce(PathBuf) -> std::io::Result<crate::log_session::LogSession>,
+    ) {
+        if self.log_active() {
+            return;
+        }
+        let Some(path) = self
+            .focused()
+            .filter(|entry| entry.kind == FileKind::File)
+            .map(|entry| entry.path.clone())
+        else {
+            self.log("select a regular file to follow a log");
+            return;
+        };
+        let opened = if let Some(session) = &mut self.log_session {
+            session.reopen(path.clone());
+            Ok(())
+        } else {
+            create(path.clone()).map(|session| {
+                self.log_session = Some(session);
+            })
+        };
+        match opened {
+            Ok(()) => {
+                self.log_return_mode = if matches!(self.mode, Mode::Preview | Mode::PreviewSearch) {
+                    Mode::Preview
+                } else {
+                    Mode::Normal
+                };
+                if let Some(readers) = &mut self.readers {
+                    readers.preview_generation = readers.preview_generation.wrapping_add(1);
+                    readers.preview.clear_pending();
+                    readers.pending_preview = None;
+                    readers.preview_loading = false;
+                }
+                self.mode = Mode::Log;
+                self.preview =
+                    Preview::message(path, PreviewKind::Text, "Loading bounded log tail");
+                self.clear_preview_search();
+                self.preview_offset = 0;
+            }
+            Err(error) => self.log(format!("cannot start log reader: {error}")),
+        }
+    }
+
+    fn close_log(&mut self) {
+        if let Some(session) = &mut self.log_session {
+            session.deactivate();
+        }
+        self.mode = self.log_return_mode;
+        self.clear_preview_search();
+        self.preview_offset = 0;
+        self.update_preview();
+    }
+
+    fn pause_log(&mut self) {
+        self.preview_offset = self.preview_offset();
+        if let Some(session) = &mut self.log_session {
+            session.set_paused(true);
+        }
+    }
+
+    fn toggle_log_pause(&mut self) {
+        if !self.log_active() {
+            return;
+        }
+        self.preview_offset = self.preview_offset();
+        if let Some(session) = &mut self.log_session {
+            let paused = !session.paused();
+            session.set_paused(paused);
+            if !paused {
+                self.scroll_preview_to_bottom();
+            }
+        }
+    }
+
+    fn poll_log(&mut self) -> bool {
+        let Some(session) = &mut self.log_session else {
+            return false;
+        };
+        let changed = session.poll();
+        if changed && let Some(snapshot) = session.snapshot() {
+            self.preview = Preview {
+                path: session.path().to_path_buf(),
+                kind: PreviewKind::Text,
+                lines: snapshot.lines.clone(),
+                truncated: snapshot.truncated,
+            };
+            if !session.paused() {
+                self.preview_offset = self.preview.lines.len().saturating_sub(1);
+            }
+            if !self.preview_search_query.is_empty() {
+                let query = self.preview_search_query.to_lowercase();
+                self.preview_search_matches = self
+                    .preview
+                    .lines
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, line)| {
+                        line.to_lowercase().contains(&query).then_some(index)
+                    })
+                    .collect();
+                self.preview_search_index = if self.preview_search_matches.is_empty() {
+                    None
+                } else {
+                    Some(
+                        self.preview_search_index
+                            .unwrap_or(0)
+                            .min(self.preview_search_matches.len() - 1),
+                    )
+                };
+            }
+        }
+        changed
+    }
+
+    fn retry_job(&mut self) {
+        if self.active_job.is_some() {
+            self.log("wait for or cancel the active task before retrying");
+            return;
+        }
+        let Some(entry) = self.selected_job() else {
+            self.log("no completed task selected");
+            return;
+        };
+        let request = match entry.retry_request() {
+            Ok(request) => request,
+            Err(error) => {
+                self.log(format!("retry unavailable: {error:#}"));
+                return;
+            }
+        };
+        if request.work_root != self.work_root {
+            self.log("retry work root differs from this workbench; reopen the original location");
+            return;
+        }
+        let sources = match request
+            .sources
+            .iter()
+            .map(|path| BufferedPath::new(path.clone()))
+            .collect::<Result<Vec<_>>>()
+        {
+            Ok(sources) => sources,
+            Err(error) => {
+                self.log(format!("retry source unavailable: {error:#}"));
+                return;
+            }
+        };
+        match request.kind {
+            crate::jobs::JobKind::Copy { .. } | crate::jobs::JobKind::Move { .. } => {
+                let Some(destination) = request.destination else {
+                    self.log("retry destination unavailable");
+                    return;
+                };
+                self.start_file_operation(PendingFileOperation {
+                    kind: if matches!(request.kind, crate::jobs::JobKind::Copy { .. }) {
+                        TransferKind::Copy
+                    } else {
+                        TransferKind::Cut
+                    },
+                    paths: sources,
+                    destination,
+                    source: FileOperationSource::Direct,
+                    allow_replace: matches!(request.kind, crate::jobs::JobKind::Copy { .. }),
+                    approved_conflicts: Vec::new(),
+                });
+            }
+            crate::jobs::JobKind::Delete | crate::jobs::JobKind::Trash => {
+                self.pending_destructive_targets = Some(sources);
+                self.mode = if request.kind == crate::jobs::JobKind::Delete {
+                    Mode::ConfirmDelete
+                } else {
+                    Mode::ConfirmTrash
+                };
+                self.input.clear();
+            }
+            crate::jobs::JobKind::Restore => {
+                // Every receipt remains checked by the existing Restore job engine.
+                self.start_checked_job(request, sources, Vec::new());
+            }
+        }
+    }
+
+    fn submit_export_job(&mut self) {
+        let Some(id) = self.export_job_id else {
+            return;
+        };
+        let path = expand_path(&self.input);
+        let path = if path.is_absolute() {
+            path
+        } else {
+            self.cwd.join(path)
+        };
+        let Some(entry) = self.job_history.get(id) else {
+            self.navigation_error = Some("selected task is no longer retained".into());
+            return;
+        };
+        match entry.export(&path) {
+            Ok(()) => {
+                self.mode = Mode::Jobs;
+                self.input.clear();
+                self.export_job_id = None;
+                self.navigation_error = None;
+                self.log(format!(
+                    "task summary exported: {}",
+                    crate::fs_core::display_path(&path)
+                ));
+            }
+            Err(error) => {
+                let message = format!("export failed: {error:#}");
+                self.navigation_error = Some(message.clone());
+                self.log(message);
+            }
+        }
+    }
+
     pub fn new(path: PathBuf) -> Result<Self> {
         Self::new_with_output(path, TerminalOutput::Stdout)
     }
 
     fn new_with_output(path: PathBuf, terminal_output: TerminalOutput) -> Result<Self> {
         let initial = resolve_initial_location(&path)?;
-        let mut app = Self {
+        let focus = initial.focus_name.clone();
+        let open_preview = initial.open_preview;
+        let mut app = Self::empty_with_location(initial, terminal_output);
+        app.reload();
+        if let Some(name) = focus {
+            app.focus_raw_name(&name);
+            if open_preview
+                && app
+                    .focused()
+                    .is_some_and(|entry| entry.kind == FileKind::File)
+            {
+                app.mode = Mode::Preview;
+            }
+        }
+        app.record_place();
+        Ok(app)
+    }
+
+    fn empty_with_location(initial: InitialLocation, terminal_output: TerminalOutput) -> Self {
+        Self {
             keymap: std::sync::Arc::new(crate::keymap::Keymap::default()),
             key_state: crate::bindings::KeyState::default(),
             help_offset: 0,
@@ -387,24 +1317,30 @@ impl App {
             sort_key: SortKey::Kind,
             sort_reverse: false,
             preview_cache: VecDeque::new(),
+            readers: None,
+            directory_memory: VecDeque::new(),
+            navigation_error: None,
+            places: crate::places::Places::memory(),
+            places_cursor: 0,
+            places_query: String::new(),
+            place_scope: ("local".into(), "local".into()),
+            job_history: crate::job_history::JobHistory::default(),
+            history_index: 0,
+            job_failures_only: false,
+            active_request: None,
+            active_started: None,
+            structured_preview: false,
+            inspector_visible: true,
+            log_session: None,
+            log_return_mode: Mode::Normal,
+            log_view_lines: std::cell::Cell::new(20),
+            place_navigation: false,
+            export_job_id: None,
             pending_file_operation: None,
             pending_rename: None,
             pending_direct_targets: None,
             pending_destructive_targets: None,
-        };
-        app.reload();
-        if let Some(name) = initial.focus_name {
-            app.focus_raw_name(&name);
-            if initial.open_preview
-                && app
-                    .focused()
-                    .map(|entry| entry.kind == FileKind::File)
-                    .unwrap_or(false)
-            {
-                app.mode = Mode::Preview;
-            }
         }
-        Ok(app)
     }
 
     pub fn for_test() -> Self {
@@ -480,6 +1416,25 @@ impl App {
             sort_key: SortKey::Kind,
             sort_reverse: false,
             preview_cache: VecDeque::new(),
+            readers: None,
+            directory_memory: VecDeque::new(),
+            navigation_error: None,
+            places: crate::places::Places::memory(),
+            places_cursor: 0,
+            places_query: String::new(),
+            place_scope: ("local".into(), "local".into()),
+            job_history: crate::job_history::JobHistory::default(),
+            history_index: 0,
+            job_failures_only: false,
+            active_request: None,
+            active_started: None,
+            structured_preview: false,
+            inspector_visible: true,
+            log_session: None,
+            log_return_mode: Mode::Normal,
+            log_view_lines: std::cell::Cell::new(20),
+            place_navigation: false,
+            export_job_id: None,
             pending_file_operation: None,
             pending_rename: None,
             pending_direct_targets: None,
@@ -488,14 +1443,18 @@ impl App {
     }
 
     pub fn apply(&mut self, command: Command) {
+        if self.directory_loading() && matches!(command, Command::Trash | Command::PermanentDelete)
+        {
+            return;
+        }
+
         match command {
             Command::Cancel => self.cancel(),
             Command::Quit => {
                 if self.mode == Mode::Normal {
                     self.request_quit();
                 } else {
-                    self.mode = Mode::Normal;
-                    self.input.clear();
+                    self.cancel();
                 }
             }
             Command::ForceQuit => self.request_quit(),
@@ -504,6 +1463,8 @@ impl App {
                 self.input = self.filter.clone();
             }
             Command::OpenGoto => {
+                self.cancel_pending_goto();
+                self.place_navigation = false;
                 self.mode = Mode::Goto;
                 self.input.clear();
             }
@@ -523,6 +1484,103 @@ impl App {
     }
 
     pub fn handle_command(&mut self, command: Command) {
+        if self.log_active()
+            && matches!(
+                command,
+                Command::OpenPlaces
+                    | Command::OpenJobs
+                    | Command::OpenTrash
+                    | Command::OpenGoto
+                    | Command::OpenHelp
+                    | Command::Parent
+                    | Command::Refresh
+                    | Command::Edit
+                    | Command::ToggleStructured
+            )
+        {
+            self.close_log();
+        }
+        if self.directory_loading() {
+            let initial = self
+                .readers
+                .as_ref()
+                .and_then(|readers| readers.pending_directory.as_ref())
+                .is_some_and(|pending| pending.initial);
+            if matches!(
+                command,
+                Command::Open
+                    | Command::Paste
+                    | Command::CopyTo
+                    | Command::MoveTo
+                    | Command::Rename
+                    | Command::Trash
+                    | Command::PermanentDelete
+                    | Command::Edit
+                    | Command::RestoreTrash
+                    | Command::Copy
+                    | Command::Cut
+                    | Command::ToggleSelect
+                    | Command::SelectAll
+            ) || (initial
+                && matches!(
+                    command,
+                    Command::Parent
+                        | Command::PinPlace
+                        | Command::Submit
+                        | Command::OpenTrash
+                        | Command::RefreshTrash
+                ))
+            {
+                self.log(
+                    "directory loading; wait for current rows before selecting or changing files",
+                );
+                return;
+            }
+        }
+
+        if self.mode == Mode::Places {
+            let count = self.places_entries().len();
+            match command {
+                Command::Down | Command::HalfDown => {
+                    self.places_cursor = (self.places_cursor + 1).min(count.saturating_sub(1));
+                    return;
+                }
+                Command::Up | Command::HalfUp => {
+                    self.places_cursor = self.places_cursor.saturating_sub(1);
+                    return;
+                }
+                Command::First => {
+                    self.places_cursor = 0;
+                    return;
+                }
+                Command::Last => {
+                    self.places_cursor = count.saturating_sub(1);
+                    return;
+                }
+                Command::Backspace => {
+                    self.places_query.pop();
+                    self.places_cursor = 0;
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if matches!(self.mode, Mode::Log | Mode::LogSearch)
+            && matches!(
+                command,
+                Command::Down
+                    | Command::Up
+                    | Command::HalfDown
+                    | Command::HalfUp
+                    | Command::First
+                    | Command::Last
+                    | Command::PreviewSearchNext
+                    | Command::PreviewSearchPrev
+                    | Command::OpenPreviewSearch
+            )
+        {
+            self.pause_log();
+        }
         if self.active_job.is_some()
             && matches!(
                 command,
@@ -588,6 +1646,53 @@ impl App {
             }
         }
         match command {
+            Command::OpenPlaces => {
+                self.places_cursor = 0;
+                self.places_query.clear();
+                self.mode = Mode::Places;
+            }
+            Command::PinPlace => self.pin_place(),
+            Command::RemovePlace => self.remove_place(),
+            Command::ClearRecent => self.clear_recent_places(),
+            Command::PreviousJob => {
+                self.history_index = self.history_index.saturating_sub(1);
+                self.help_offset = 0;
+            }
+            Command::NextJob => {
+                self.history_index = (self.history_index + 1)
+                    .min(self.job_history.entries().len().saturating_sub(1));
+                self.help_offset = 0;
+            }
+            Command::ToggleJobFilter => {
+                self.job_failures_only = !self.job_failures_only;
+                self.help_offset = 0;
+            }
+            Command::RetryJob => self.retry_job(),
+            Command::ExportJob => {
+                if let Some(entry) = self.selected_job() {
+                    self.export_job_id = Some(entry.id);
+                    self.mode = Mode::ExportJob;
+                    self.input.clear();
+                    self.navigation_error = None;
+                } else {
+                    self.log("no completed task to export");
+                }
+            }
+            Command::OpenLog => self.open_log(),
+            Command::ToggleLogPause => self.toggle_log_pause(),
+            Command::ToggleStructured => {
+                if self
+                    .focused()
+                    .is_some_and(|entry| entry.kind == FileKind::File)
+                {
+                    self.structured_preview = !self.structured_preview;
+                    self.preview_offset = 0;
+                    self.update_preview();
+                } else {
+                    self.log("select a regular file for structured preview");
+                }
+            }
+            Command::ToggleInspector => self.inspector_visible = !self.inspector_visible,
             Command::OpenActions => self.open_actions(),
             Command::OpenJobs => {
                 self.help_offset = 0;
@@ -612,35 +1717,35 @@ impl App {
                 }
             }
             Command::Down => {
-                if self.mode == Mode::Preview {
+                if self.mode == Mode::Preview || self.mode == Mode::Log {
                     self.scroll_preview(1);
                 } else {
                     self.move_cursor(1);
                 }
             }
             Command::Up => {
-                if self.mode == Mode::Preview {
+                if self.mode == Mode::Preview || self.mode == Mode::Log {
                     self.scroll_preview(-1);
                 } else {
                     self.move_cursor(-1);
                 }
             }
             Command::HalfDown => {
-                if self.mode == Mode::Preview {
+                if self.mode == Mode::Preview || self.mode == Mode::Log {
                     self.scroll_preview(10);
                 } else {
                     self.move_cursor(10);
                 }
             }
             Command::HalfUp => {
-                if self.mode == Mode::Preview {
+                if self.mode == Mode::Preview || self.mode == Mode::Log {
                     self.scroll_preview(-10);
                 } else {
                     self.move_cursor(-10);
                 }
             }
             Command::First => {
-                if self.mode == Mode::Preview {
+                if self.mode == Mode::Preview || self.mode == Mode::Log {
                     self.scroll_preview_to_top();
                 } else {
                     self.cursor = 0;
@@ -648,7 +1753,7 @@ impl App {
                 }
             }
             Command::Last => {
-                if self.mode == Mode::Preview {
+                if self.mode == Mode::Preview || self.mode == Mode::Log {
                     self.scroll_preview_to_bottom();
                 } else {
                     self.cursor = self.entries.len().saturating_sub(1);
@@ -733,6 +1838,7 @@ impl App {
             Command::Edit => self.open_in_editor(),
             Command::Input(ch) => self.handle_input(ch),
             Command::Backspace => {
+                self.cancel_pending_goto();
                 self.input.pop();
                 if self.mode == Mode::Filter {
                     self.filter = self.input.clone();
@@ -814,6 +1920,10 @@ impl App {
             return "actions";
         }
         match self.mode {
+            Mode::Places => "places",
+            Mode::ExportJob => "input",
+            Mode::Log => "log",
+            Mode::LogSearch => "input",
             Mode::Normal => "files",
             Mode::Preview => "preview",
             Mode::Help | Mode::Message => "help",
@@ -852,7 +1962,7 @@ impl App {
                 Command::CancelJob,
             ));
         }
-        if self.mode == Mode::Preview {
+        if matches!(self.mode, Mode::Preview | Mode::Log) {
             actions.extend([
                 Action::new("Find in preview", "/", Command::OpenPreviewSearch),
                 Action::new("Next match", "n", Command::PreviewSearchNext),
@@ -861,7 +1971,7 @@ impl App {
                 Action::new("Bottom of preview", "G", Command::Last),
                 Action::new("Close preview", "q", Command::Cancel),
             ]);
-        } else {
+        } else if self.mode == Mode::Normal {
             if self.copy_buffer_len() > 0 {
                 actions.push(Action::new("Paste buffer", "p", Command::Paste));
             }
@@ -911,11 +2021,78 @@ impl App {
                 );
             }
         }
-        if self.focused().is_some_and(|e| e.kind == FileKind::File) {
+        if matches!(self.mode, Mode::Normal | Mode::Preview)
+            && self.focused().is_some_and(|e| e.kind == FileKind::File)
+        {
             actions.push(Action::new("Edit file", "e", Command::Edit));
+        }
+        actions.extend([
+            Action::new("Recent and pinned places", "b", Command::OpenPlaces),
+            Action::new("Pin / unpin place", "B", Command::PinPlace),
+            Action::new("Toggle context inspector", "I", Command::ToggleInspector),
+        ]);
+        let file_available = matches!(self.mode, Mode::Normal | Mode::Preview | Mode::Log)
+            && self
+                .focused()
+                .is_some_and(|entry| entry.kind == FileKind::File);
+        for action in [
+            Action::new("Follow log file", "L", Command::OpenLog),
+            Action::new(
+                "Toggle raw / structured preview",
+                "f",
+                Command::ToggleStructured,
+            ),
+        ] {
+            actions.push(if file_available {
+                action
+            } else {
+                action.disabled("Select a regular file first")
+            });
+        }
+        if self.log_active() {
+            actions.push(Action::new(
+                "Pause / resume log",
+                "Space",
+                Command::ToggleLogPause,
+            ));
+        }
+        if self.mode == Mode::Jobs {
+            let retry = Action::new("Retry unresolved task items", "r", Command::RetryJob);
+            actions.push(if self.active_job.is_some() {
+                retry.disabled("A file task is still running")
+            } else if self
+                .selected_job()
+                .is_some_and(|entry| entry.retry_request().is_ok())
+            {
+                retry
+            } else {
+                retry.disabled("No complete unresolved-item context is retained")
+            });
+            let export = Action::new("Export selected task summary", "e", Command::ExportJob);
+            actions.push(if self.selected_job().is_some() {
+                export
+            } else {
+                export.disabled("No completed task selected")
+            });
+            actions.push(Action::new(
+                "Show failures / all task details",
+                "f",
+                Command::ToggleJobFilter,
+            ));
+        }
+        if self.mode == Mode::Places {
+            actions.extend([
+                Action::new("Remove saved location", "^D", Command::RemovePlace),
+                Action::new(
+                    "Clear recent locations (keep pins)",
+                    "^L",
+                    Command::ClearRecent,
+                ),
+            ]);
         }
         let context = self.key_context();
         for action in &mut actions {
+            *action = action.clone().with_metadata(action.command.action_id());
             action.key = crate::bindings::label(&self.keymap, context, action.command.action_id())
                 .unwrap_or_else(|| "unbound".into());
         }
@@ -927,7 +2104,11 @@ impl App {
     }
 
     pub fn entries(&self) -> &[FileEntry] {
-        &self.entries
+        if self.directory_loading() {
+            &[]
+        } else {
+            &self.entries
+        }
     }
 
     pub fn cursor(&self) -> usize {
@@ -1022,7 +2203,20 @@ impl App {
     }
 
     pub fn preview_offset(&self) -> usize {
-        self.preview_offset
+        if self.log_active() {
+            let last_page = self
+                .preview
+                .lines
+                .len()
+                .saturating_sub(self.log_view_lines.get());
+            if self.log_paused() {
+                self.preview_offset.min(last_page)
+            } else {
+                last_page
+            }
+        } else {
+            self.preview_offset
+        }
     }
 
     pub fn preview_search_query(&self) -> &str {
@@ -1108,12 +2302,19 @@ impl App {
     }
 
     fn reload(&mut self) {
+        if self.readers.is_some() {
+            let focus = self.focused().map(|entry| entry.raw_name.clone());
+            self.request_directory(self.cwd.clone(), false, false, focus, None);
+            return;
+        }
         match read_dir_entries_with_diagnostics(&self.cwd, self.show_hidden, "") {
             Ok(result) => {
                 self.all_entries = result.entries;
                 self.sort_all_entries();
                 self.refresh_visible_entries();
-                self.preview_offset = 0;
+                if !self.log_active() {
+                    self.preview_offset = 0;
+                }
                 if result.skipped > 0 {
                     self.log(format!("skipped {} unreadable item(s)", result.skipped));
                 }
@@ -1124,12 +2325,48 @@ impl App {
                 self.entries.clear();
                 self.selected.clear();
                 self.update_preview();
-                self.preview_offset = 0;
+                if !self.log_active() {
+                    self.preview_offset = 0;
+                }
             }
         }
     }
 
     fn update_preview(&mut self) {
+        if self.log_active() {
+            return;
+        }
+        let path = self.focused().map(|entry| entry.path.clone());
+        let cached = path
+            .as_ref()
+            .and_then(|path| {
+                self.preview_cache.iter().find(|cached| {
+                    &cached.path == path && cached.structured == self.structured_preview
+                })
+            })
+            .map(|cached| cached.preview.clone());
+        if let Some(readers) = self.readers.as_mut() {
+            readers.preview_generation = readers.preview_generation.wrapping_add(1);
+            readers.preview.clear_pending();
+            readers.preview_loading = path.is_some();
+            readers.pending_preview = path
+                .as_ref()
+                .map(|path| (Instant::now() + PREVIEW_SETTLE, path.clone()));
+            self.preview = cached.unwrap_or_else(|| {
+                Preview::message(
+                    path.unwrap_or_else(|| self.cwd.clone()),
+                    PreviewKind::Empty,
+                    if readers.preview_loading {
+                        "Loading preview"
+                    } else {
+                        "No file selected"
+                    },
+                )
+            });
+            self.preview_search_matches.clear();
+            self.preview_search_index = None;
+            return;
+        }
         if let Some(path) = self.focused().map(|entry| entry.path.clone()) {
             self.preview = self.preview_for_path(&path);
         } else {
@@ -1141,17 +2378,22 @@ impl App {
     fn preview_for_path(&mut self, path: &Path) -> Preview {
         let signature = preview_signature(path);
         if let Some(signature) = &signature
-            && let Some(index) = self
-                .preview_cache
-                .iter()
-                .position(|cache| cache.path == path && &cache.signature == signature)
+            && let Some(index) = self.preview_cache.iter().position(|cache| {
+                cache.path == path
+                    && cache.structured == self.structured_preview
+                    && &cache.signature == signature
+            })
             && let Some(cache) = self.preview_cache.remove(index)
         {
             let preview = cache.preview.clone();
             self.preview_cache.push_back(cache);
             return preview;
         }
-        let preview = match preview_file(path) {
+        let preview = match if self.structured_preview {
+            crate::preview::preview_file_structured(path)
+        } else {
+            preview_file(path)
+        } {
             Ok(preview) => preview,
             Err(err) => Preview::message(
                 path.to_path_buf(),
@@ -1166,6 +2408,7 @@ impl App {
             self.preview_cache.retain(|cache| cache.path != path);
             if estimated_bytes <= PREVIEW_CACHE_ENTRY_BYTES_LIMIT {
                 self.preview_cache.push_back(CachedPreview {
+                    structured: self.structured_preview,
                     path: path.to_path_buf(),
                     signature,
                     preview: preview.clone(),
@@ -1195,6 +2438,7 @@ impl App {
     }
 
     fn scroll_preview(&mut self, delta: isize) {
+        self.preview_offset = self.preview_offset();
         if self.preview.lines.is_empty() {
             self.preview_offset = 0;
             return;
@@ -1202,10 +2446,16 @@ impl App {
         if delta.is_negative() {
             self.preview_offset = self.preview_offset.saturating_sub(delta.unsigned_abs());
         } else {
-            self.preview_offset = self
-                .preview_offset
-                .saturating_add(delta as usize)
-                .min(self.preview.lines.len().saturating_sub(1));
+            self.preview_offset = self.preview_offset.saturating_add(delta as usize).min(
+                self.preview
+                    .lines
+                    .len()
+                    .saturating_sub(if self.log_active() {
+                        self.log_view_lines.get()
+                    } else {
+                        1
+                    }),
+            );
         }
     }
 
@@ -1215,7 +2465,15 @@ impl App {
     }
 
     fn scroll_preview_to_bottom(&mut self) {
-        self.preview_offset = self.preview.lines.len().saturating_sub(1);
+        self.preview_offset = self
+            .preview
+            .lines
+            .len()
+            .saturating_sub(if self.log_active() {
+                self.log_view_lines.get()
+            } else {
+                1
+            });
         self.pending_g = false;
     }
 
@@ -1227,11 +2485,16 @@ impl App {
     }
 
     fn enter_preview_search(&mut self) {
-        if self.mode != Mode::Preview {
+        if self.mode != Mode::Preview && self.mode != Mode::Log {
             return;
         }
         self.input = self.preview_search_query.clone();
-        self.mode = Mode::PreviewSearch;
+        self.mode = if self.mode == Mode::Log {
+            self.pause_log();
+            Mode::LogSearch
+        } else {
+            Mode::PreviewSearch
+        };
     }
 
     fn execute_preview_search(&mut self) {
@@ -1431,11 +2694,29 @@ impl App {
     }
 
     fn go_parent(&mut self) {
-        if let Some(parent) = self.cwd.parent() {
-            self.cwd = parent.to_path_buf();
-            self.selected.clear();
-            self.filter.clear();
-            self.reload();
+        let current = self
+            .readers
+            .as_ref()
+            .and_then(|readers| readers.pending_directory.as_ref())
+            .filter(|pending| pending.goto_input.is_none())
+            .map(|pending| pending.path.clone())
+            .unwrap_or_else(|| self.cwd.clone());
+        if let Some(parent) = current.parent() {
+            let parent = parent.to_path_buf();
+            let focus = current.file_name().map(OsStr::to_os_string);
+            if self.readers.is_some() {
+                self.request_directory(parent, false, true, focus, None);
+            } else {
+                self.remember_cursor();
+                self.cwd = parent;
+                self.selected.clear();
+                self.filter.clear();
+                self.reload();
+                self.record_place();
+                if let Some(name) = focus {
+                    self.focus_raw_name(&name);
+                }
+            }
         }
     }
 
@@ -1446,11 +2727,21 @@ impl App {
         }
         if let Some(entry) = self.focused() {
             if entry.kind == FileKind::Directory {
-                self.cwd = entry.path.clone();
-                self.selected.clear();
-                self.filter.clear();
-                self.cursor = 0;
-                self.reload();
+                let path = entry.path.clone();
+                if self.readers.is_some() {
+                    self.request_directory(path, false, true, None, None);
+                } else {
+                    self.remember_cursor();
+                    self.cwd = path;
+                    self.selected.clear();
+                    self.filter.clear();
+                    self.cursor = 0;
+                    self.reload();
+                    self.record_place();
+                    if let Some(name) = self.remembered_focus(&self.cwd) {
+                        self.focus_raw_name(&name);
+                    }
+                }
             } else {
                 self.mode = Mode::Preview;
                 self.update_preview();
@@ -1661,6 +2952,7 @@ impl App {
             request.kind,
             crate::jobs::JobKind::Copy { replace: true, .. }
         );
+        let remembered_request = request.clone();
         match crate::jobs::JobHandle::spawn_validated(request, move |source, target| {
             sources
                 .iter()
@@ -1683,7 +2975,8 @@ impl App {
         }) {
             Ok(job) => {
                 self.job_progress = Some(job.progress());
-                self.last_job = None;
+                self.active_request = Some(remembered_request);
+                self.active_started = Some(Instant::now());
                 self.active_job = Some(job);
                 self.mode = Mode::Normal;
                 self.input.clear();
@@ -1714,6 +3007,8 @@ impl App {
     pub fn job_progress(&self) -> Option<&crate::jobs::JobProgress> {
         self.job_progress.as_ref()
     }
+    /// Compatibility details from the latest task, bounded to 64 KiB including
+    /// vector/path/error capacities. Exact outcome counts live in `job_history`.
     pub fn last_job(&self) -> Option<&crate::jobs::JobResult> {
         self.last_job.as_ref()
     }
@@ -1740,15 +3035,34 @@ impl App {
         if self.mode == Mode::Help {
             self.keymap.bindings(&self.help_context).len() + 2
         } else {
-            12 + self
-                .last_job
-                .as_ref()
-                .map(|r| (r.failed.len() + r.skipped.len() + r.unprocessed.len()).min(100))
+            20 + self
+                .selected_job()
+                .map(|entry| {
+                    if self.job_failures_only {
+                        entry.failures.len() + entry.unprocessed.len()
+                    } else {
+                        entry.details.len()
+                    }
+                })
                 .unwrap_or(0)
         }
     }
 
     fn load_trash(&mut self) {
+        if let Some(readers) = &mut self.readers {
+            // One directory worker also owns recovery scans. Only the newest
+            // requested screen may publish rows; abandoned navigation keeps cwd.
+            readers.directory_generation = readers.directory_generation.wrapping_add(1);
+            readers.pending_directory = None;
+            readers.trash_loading = true;
+            self.trash_entries.clear();
+            self.trash_error = None;
+            readers.directory.submit(
+                readers.directory_generation,
+                DirectoryRead::Trash(self.work_root.clone()),
+            );
+            return;
+        }
         match crate::trash::scan_trash(&self.work_root) {
             Ok(scan) => {
                 self.trash_entries = scan.entries;
@@ -1791,6 +3105,9 @@ impl App {
         if !job.is_finished() {
             return changed;
         }
+        // The completion may race the earlier live-progress sample. Once the
+        // worker finished, capture its final byte count for history and export.
+        self.job_progress = Some(job.progress());
         let result = job.try_result().unwrap_or_else(|| crate::jobs::JobResult {
             failed: vec![crate::jobs::JobFailure {
                 path: self.cwd.clone(),
@@ -1833,10 +3150,46 @@ impl App {
                 error.error
             ));
         }
-        self.last_job = Some(result);
-        self.reload();
+        if let Some(request) = self.active_request.take() {
+            let elapsed = self
+                .active_started
+                .take()
+                .map(|at| at.elapsed())
+                .unwrap_or_default();
+            self.job_history.push(
+                &request,
+                &result,
+                self.job_progress
+                    .as_ref()
+                    .unwrap_or(&crate::jobs::JobProgress::default()),
+                elapsed,
+            );
+            self.history_index = 0;
+        }
+        self.last_job = Some(retain_last_job_result(result));
+        if let Some(pending) = self
+            .readers
+            .as_ref()
+            .and_then(|readers| readers.pending_directory.clone())
+        {
+            // Refresh the requested destination after the mutation, preserving
+            // the user's pending navigation instead of reloading the old cwd.
+            self.request_directory(
+                pending.path,
+                pending.initial,
+                pending.navigation,
+                pending.focus,
+                pending.goto_input,
+            );
+        } else {
+            self.reload();
+        }
         if self.mode == Mode::Trash {
-            self.load_trash();
+            if let Some(readers) = &mut self.readers {
+                readers.trash_after_directory = true;
+            } else {
+                self.load_trash();
+            }
         }
         if self.exit_after_job {
             self.should_quit = true;
@@ -1893,7 +3246,13 @@ impl App {
                 }
             }
             Mode::Help | Mode::Message => self.mode = Mode::Normal,
-            Mode::Normal => {}
+            Mode::Places => self.open_place(),
+            Mode::ExportJob => self.submit_export_job(),
+            Mode::LogSearch => {
+                self.execute_preview_search();
+                self.mode = Mode::Log;
+            }
+            Mode::Normal | Mode::Log => {}
         }
     }
 
@@ -1926,19 +3285,35 @@ impl App {
     }
 
     fn submit_goto(&mut self) {
+        if self.readers.is_some() {
+            self.request_directory(
+                self.cwd.clone(),
+                false,
+                true,
+                None,
+                Some(self.input.clone()),
+            );
+            return;
+        }
         match self.resolve_dir_input() {
             Ok(path) => {
+                self.remember_cursor();
                 self.cwd = path;
                 self.selected.clear();
                 self.filter.clear();
                 self.mode = Mode::Normal;
                 self.input.clear();
+                self.navigation_error = None;
                 self.reload();
+                self.record_place();
+                if let Some(name) = self.remembered_focus(&self.cwd) {
+                    self.focus_raw_name(&name);
+                }
             }
             Err(err) => {
-                self.log(format!("goto failed: {err}"));
-                self.mode = Mode::Normal;
-                self.input.clear();
+                let message = format!("goto failed: {err}");
+                self.navigation_error = Some(message.clone());
+                self.log(message);
             }
         }
     }
@@ -1969,10 +3344,18 @@ impl App {
     }
 
     fn handle_input(&mut self, ch: char) {
+        if self.mode == Mode::Places {
+            self.places_query.push(ch);
+            self.places_cursor = 0;
+            return;
+        }
+        self.cancel_pending_goto();
         match self.mode {
             Mode::Filter
             | Mode::Goto
             | Mode::PreviewSearch
+            | Mode::LogSearch
+            | Mode::ExportJob
             | Mode::Rename
             | Mode::CopyTo
             | Mode::MoveTo
@@ -1991,6 +3374,41 @@ impl App {
     }
 
     fn cancel(&mut self) {
+        if self.mode == Mode::LogSearch {
+            self.mode = Mode::Log;
+            self.input.clear();
+            return;
+        }
+        if self.mode == Mode::Log {
+            self.close_log();
+            return;
+        }
+        if self.mode == Mode::ExportJob {
+            self.mode = Mode::Jobs;
+            self.input.clear();
+            self.export_job_id = None;
+            self.navigation_error = None;
+            return;
+        }
+        let abandoned_directory = self.directory_loading();
+        if let Some(readers) = &mut self.readers {
+            // Initial root resolution must complete before any filesystem action.
+            // Escape may close a modal, but cannot leave an unbound runtime root.
+            if !readers
+                .pending_directory
+                .as_ref()
+                .is_some_and(|pending| pending.initial)
+            {
+                readers.directory_generation = readers.directory_generation.wrapping_add(1);
+                readers.directory.clear_pending();
+                readers.pending_directory = None;
+                readers.trash_loading = false;
+            }
+        }
+        if abandoned_directory || self.mode == Mode::Trash {
+            self.update_preview();
+        }
+
         if self.mode == Mode::ConfirmRestore {
             self.restore_pending = None;
             self.mode = Mode::Trash;
@@ -2016,6 +3434,24 @@ impl App {
                 self.mode = Mode::Normal;
                 self.input.clear();
             }
+        }
+    }
+
+    fn cancel_pending_goto(&mut self) {
+        let pending = self
+            .readers
+            .as_ref()
+            .and_then(|readers| readers.pending_directory.as_ref())
+            .is_some_and(|pending| pending.goto_input.is_some());
+        if pending {
+            let readers = self.readers.as_mut().unwrap();
+            readers.directory_generation = readers.directory_generation.wrapping_add(1);
+            readers.directory.clear_pending();
+            readers.pending_directory = None;
+            self.update_preview();
+        }
+        if self.mode == Mode::Goto {
+            self.navigation_error = None;
         }
     }
 
@@ -2063,7 +3499,11 @@ impl App {
     }
 
     fn focused(&self) -> Option<&FileEntry> {
-        self.entries.get(self.cursor)
+        if self.directory_loading() {
+            None
+        } else {
+            self.entries.get(self.cursor)
+        }
     }
 
     fn focus_raw_name(&mut self, name: &OsStr) {
@@ -2074,7 +3514,9 @@ impl App {
         {
             self.cursor = index;
             self.update_preview();
-            self.preview_offset = 0;
+            if !self.log_active() {
+                self.preview_offset = 0;
+            }
         }
     }
 
@@ -2124,6 +3566,9 @@ impl App {
     }
 
     fn retain_visible_selection(&mut self) {
+        if self.selected.is_empty() {
+            return;
+        }
         let visible = self
             .entries
             .iter()
@@ -2138,6 +3583,75 @@ impl App {
             self.logs.remove(0);
         }
     }
+}
+
+const LAST_JOB_BYTES_LIMIT: usize = 64 * 1024;
+
+fn retain_last_job_result(result: crate::jobs::JobResult) -> crate::jobs::JobResult {
+    if retained_job_result_bytes(&result) <= LAST_JOB_BYTES_LIMIT {
+        return result;
+    }
+    let mut kept = crate::jobs::JobResult {
+        cancelled: result.cancelled,
+        ..Default::default()
+    };
+    let mut used = std::mem::size_of_val(&kept);
+    for failure in result.failed {
+        let mut path = PathBuf::from(failure.path.as_os_str());
+        path.shrink_to_fit();
+        let mut error = failure.error;
+        if error.len() > 1024 {
+            let mut end = 1000;
+            while !error.is_char_boundary(end) {
+                end -= 1;
+            }
+            error.truncate(end);
+            error.push_str(" [detail truncated]");
+        }
+        error.shrink_to_fit();
+        let bytes =
+            std::mem::size_of::<crate::jobs::JobFailure>() + path.capacity() + error.capacity();
+        if used.saturating_add(bytes) <= LAST_JOB_BYTES_LIMIT {
+            used += bytes;
+            kept.failed.push(crate::jobs::JobFailure { path, error });
+        }
+    }
+    for (paths, output) in [
+        (result.unprocessed, &mut kept.unprocessed),
+        (result.skipped, &mut kept.skipped),
+        (result.succeeded, &mut kept.succeeded),
+    ] {
+        for path in paths {
+            let mut path = PathBuf::from(path.as_os_str());
+            path.shrink_to_fit();
+            let bytes = std::mem::size_of::<PathBuf>() + path.capacity();
+            if used.saturating_add(bytes) <= LAST_JOB_BYTES_LIMIT {
+                used += bytes;
+                output.push(path);
+            }
+        }
+        output.shrink_to_fit();
+    }
+    kept.failed.shrink_to_fit();
+    debug_assert!(retained_job_result_bytes(&kept) <= LAST_JOB_BYTES_LIMIT);
+    kept
+}
+
+fn retained_job_result_bytes(result: &crate::jobs::JobResult) -> usize {
+    std::mem::size_of_val(result)
+        + result.failed.capacity() * std::mem::size_of::<crate::jobs::JobFailure>()
+        + result
+            .failed
+            .iter()
+            .map(|failure| failure.path.capacity() + failure.error.capacity())
+            .sum::<usize>()
+        + [&result.succeeded, &result.skipped, &result.unprocessed]
+            .into_iter()
+            .map(|paths| {
+                paths.capacity() * std::mem::size_of::<PathBuf>()
+                    + paths.iter().map(PathBuf::capacity).sum::<usize>()
+            })
+            .sum::<usize>()
 }
 
 pub fn run(path: PathBuf) -> Result<()> {
@@ -2174,17 +3688,38 @@ fn run_tui(
     let backend = CrosstermBackend::new(output.writer());
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
-    let mut app = App::new_with_output(path, output)?;
+    let mut app = App::new_async_with_output(path, output)?;
+    app.set_place_scope(
+        std::env::var("TERSH_HOST_ALIAS").unwrap_or_else(|_| "local".into()),
+        std::env::var("TERSH_HOST_ID").unwrap_or_else(|_| "local".into()),
+    );
+    match crate::places::Places::load_default() {
+        Ok(places) => app.set_places(places),
+        Err(error) => {
+            app.set_places(crate::places::Places::disabled());
+            app.log(format!("places unavailable: {error:#}"));
+        }
+    }
     app.set_keymap(keymap);
     let mut dirty = true;
 
     while !app.should_quit() {
         dirty |= app.poll_job();
+        dirty |= app.poll_readers();
         if dirty {
             terminal.draw(|frame| crate::ui::draw(frame, &app))?;
             dirty = false;
         }
-        if event::poll(Duration::from_millis(250))? {
+        let poll_interval = if app.directory_loading()
+            || app.preview_loading()
+            || app.trash_loading()
+            || app.log_active()
+        {
+            Duration::from_millis(20)
+        } else {
+            Duration::from_millis(250)
+        };
+        if event::poll(poll_interval)? {
             match event::read()? {
                 Event::Key(key) => {
                     app.handle_key(key);
@@ -2679,5 +4214,356 @@ mod tests {
         };
 
         assert_eq!(expand_path(&format!("~{user}")), home);
+    }
+
+    fn settle_async(app: &mut App) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while app.directory_loading() || app.preview_loading() || app.trash_loading() {
+            assert!(
+                Instant::now() < deadline,
+                "asynchronous readers did not settle"
+            );
+            app.poll_readers();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    fn async_goto(app: &mut App, path: &Path) {
+        app.handle_command(Command::OpenGoto);
+        for ch in path.to_str().unwrap().chars() {
+            app.handle_command(Command::Input(ch));
+        }
+        app.handle_command(Command::Submit);
+    }
+
+    #[test]
+    fn slow_initial_read_is_on_worker_and_dropping_app_does_not_wait() {
+        let root = tempfile::tempdir().unwrap();
+        let (started, observed) = std::sync::mpsc::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let readers = AsyncReads::with_handlers(
+            move |request| {
+                started.send(std::thread::current().id()).unwrap();
+                blocked.recv().unwrap();
+                read_directory(request)
+            },
+            read_preview,
+        )
+        .unwrap();
+        let mut app =
+            App::new_async_with_readers(root.path().into(), TerminalOutput::Stdout, readers)
+                .unwrap();
+        let worker = observed.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_ne!(worker, std::thread::current().id());
+        app.handle_command(Command::OpenHelp);
+        assert_eq!(app.mode(), Mode::Help);
+        let started = Instant::now();
+        drop(app);
+        let elapsed = started.elapsed();
+        release.send(()).unwrap();
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "drop waited for a blocked directory read"
+        );
+    }
+
+    #[test]
+    fn stale_directory_result_cannot_overwrite_newer_navigation() {
+        let root = tempfile::tempdir().unwrap();
+        let slow = root.path().join("slow");
+        let latest = root.path().join("latest");
+        fs::create_dir(&slow).unwrap();
+        fs::create_dir(&latest).unwrap();
+        fs::write(slow.join("old-row"), "old").unwrap();
+        fs::write(latest.join("new-row"), "new").unwrap();
+        let (entered, observed) = std::sync::mpsc::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let readers = AsyncReads::with_handlers(
+            move |request| {
+                if matches!(
+                    &request,
+                    DirectoryRead::Location {
+                        goto_input: Some(_),
+                        ..
+                    }
+                ) {
+                    entered.send(()).unwrap();
+                    blocked.recv().unwrap();
+                }
+                read_directory(request)
+            },
+            read_preview,
+        )
+        .unwrap();
+        let mut app =
+            App::new_async_with_readers(root.path().into(), TerminalOutput::Stdout, readers)
+                .unwrap();
+        settle_async(&mut app);
+        async_goto(&mut app, &slow);
+        observed.recv_timeout(Duration::from_secs(2)).unwrap();
+        async_goto(&mut app, &latest);
+        release.send(()).unwrap();
+        observed.recv_timeout(Duration::from_secs(2)).unwrap();
+        app.poll_readers();
+        assert!(app.directory_loading());
+        assert_ne!(app.cwd(), slow.canonicalize().unwrap());
+        assert!(app.entries().is_empty());
+        release.send(()).unwrap();
+        settle_async(&mut app);
+        assert_eq!(app.cwd(), latest.canonicalize().unwrap());
+        assert_eq!(app.entries()[0].name, "new-row");
+    }
+
+    #[test]
+    fn stale_preview_is_discarded_and_fast_selection_is_debounced() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["a", "b", "c", "d"] {
+            fs::write(root.path().join(name), name).unwrap();
+        }
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_worker = seen.clone();
+        let (entered, observed) = std::sync::mpsc::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let readers = AsyncReads::with_handlers(read_directory, move |request| {
+            let name = request
+                .path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            seen_worker.lock().unwrap().push(name.clone());
+            if name == "b" || name == "d" {
+                entered.send(name).unwrap();
+                blocked.recv().unwrap();
+            }
+            read_preview(request)
+        })
+        .unwrap();
+        let mut app =
+            App::new_async_with_readers(root.path().into(), TerminalOutput::Stdout, readers)
+                .unwrap();
+        settle_async(&mut app);
+        app.handle_command(Command::Down);
+        std::thread::sleep(PREVIEW_SETTLE + Duration::from_millis(5));
+        app.poll_readers();
+        assert_eq!(observed.recv_timeout(Duration::from_secs(2)).unwrap(), "b");
+        app.handle_command(Command::Down);
+        app.handle_command(Command::Down);
+        app.poll_readers();
+        assert!(seen.lock().unwrap().iter().all(|name| name != "c"));
+        std::thread::sleep(PREVIEW_SETTLE + Duration::from_millis(5));
+        app.poll_readers();
+        release.send(()).unwrap();
+        assert_eq!(observed.recv_timeout(Duration::from_secs(2)).unwrap(), "d");
+        app.poll_readers();
+        assert_eq!(app.preview.path.file_name().unwrap(), "d");
+        assert!(app.preview_loading());
+        release.send(()).unwrap();
+        settle_async(&mut app);
+        assert!(app.preview.lines.iter().any(|line| line.contains('d')));
+        assert_eq!(*seen.lock().unwrap(), ["a", "b", "d"]);
+    }
+
+    #[test]
+    fn slow_trash_scan_keeps_input_available_and_publishes_on_poll() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("file"), "file").unwrap();
+        let (entered, observed) = std::sync::mpsc::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let readers = AsyncReads::with_handlers(
+            move |request| {
+                if matches!(request, DirectoryRead::Trash(_)) {
+                    entered.send(()).unwrap();
+                    blocked.recv().unwrap();
+                }
+                read_directory(request)
+            },
+            read_preview,
+        )
+        .unwrap();
+        let mut app =
+            App::new_async_with_readers(root.path().into(), TerminalOutput::Stdout, readers)
+                .unwrap();
+        settle_async(&mut app);
+        app.handle_command(Command::OpenTrash);
+        observed.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(app.trash_loading());
+        app.handle_command(Command::OpenHelp);
+        assert_eq!(app.mode(), Mode::Help);
+        release.send(()).unwrap();
+        settle_async(&mut app);
+        assert!(!app.trash_loading());
+    }
+
+    #[test]
+    fn directory_cursor_memory_is_bounded() {
+        let mut app = App::for_test();
+        for index in 0..(DIRECTORY_MEMORY_LIMIT + 10) {
+            app.cwd = PathBuf::from(format!("/synthetic/{index}"));
+            app.remember_cursor();
+        }
+        assert_eq!(app.directory_memory.len(), DIRECTORY_MEMORY_LIMIT);
+        assert!(app.remembered_focus(Path::new("/synthetic/0")).is_none());
+    }
+
+    #[test]
+    fn editing_pending_goto_keeps_new_input_and_cancels_old_destination() {
+        let root = tempfile::tempdir().unwrap();
+        let child = root.path().join("child");
+        fs::create_dir(&child).unwrap();
+        let (entered, observed) = std::sync::mpsc::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let readers = AsyncReads::with_handlers(
+            move |request| {
+                if matches!(
+                    &request,
+                    DirectoryRead::Location {
+                        goto_input: Some(_),
+                        ..
+                    }
+                ) {
+                    entered.send(()).unwrap();
+                    blocked.recv().unwrap();
+                }
+                read_directory(request)
+            },
+            read_preview,
+        )
+        .unwrap();
+        let mut app =
+            App::new_async_with_readers(root.path().into(), TerminalOutput::Stdout, readers)
+                .unwrap();
+        settle_async(&mut app);
+        async_goto(&mut app, &child);
+        observed.recv_timeout(Duration::from_secs(2)).unwrap();
+        app.handle_command(Command::Input('x'));
+        let typed = app.input.clone();
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_millis(100);
+        while Instant::now() < deadline {
+            app.poll_readers();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(app.cwd(), root.path().canonicalize().unwrap());
+        assert_eq!(app.mode(), Mode::Goto);
+        assert_eq!(app.input(), typed);
+    }
+
+    #[test]
+    fn repeated_log_open_close_reuses_one_worker_during_blocked_reads() {
+        use std::sync::{
+            Arc, Condvar, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("slow.log");
+        fs::write(&path, "line\n").unwrap();
+        fs::write(root.path().join("latest.log"), "latest-only\n").unwrap();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let started = Arc::new(AtomicUsize::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let factories = Arc::new(AtomicUsize::new(0));
+        let mut app = App::new(path).unwrap();
+        for _ in 0..12 {
+            {
+                let gate = gate.clone();
+                let started = started.clone();
+                let active = active.clone();
+                let peak = peak.clone();
+                let factories = factories.clone();
+                app.open_log_with(move |path| {
+                    factories.fetch_add(1, Ordering::SeqCst);
+                    crate::log_session::LogSession::new_with_opener(path, move |path| {
+                        let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(count, Ordering::SeqCst);
+                        started.fetch_add(1, Ordering::SeqCst);
+                        let (lock, ready) = &*gate;
+                        let mut released = lock.lock().unwrap();
+                        while !*released {
+                            released = ready.wait(released).unwrap();
+                        }
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        crate::log_reader::LogReader::open(path)
+                    })
+                });
+            }
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while started.load(Ordering::SeqCst) < factories.load(Ordering::SeqCst) {
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            app.handle_command(Command::Cancel);
+            assert!(app.log_snapshot().is_none());
+        }
+        let created = factories.load(Ordering::SeqCst);
+        let concurrent = peak.load(Ordering::SeqCst);
+        app.cursor = app
+            .entries
+            .iter()
+            .position(|entry| entry.name == "latest.log")
+            .unwrap();
+        app.open_log_with(|_| panic!("reopening must reuse the existing worker"));
+        assert!(app.log_snapshot().is_none());
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while app.log_snapshot().is_none() {
+            assert!(Instant::now() < deadline);
+            app.poll_readers();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(app.log_snapshot().unwrap().lines, ["latest-only"]);
+        app.handle_command(Command::Cancel);
+        for _ in 0..100 {
+            assert!(!app.poll_readers(), "inactive log session published data");
+        }
+        assert!(app.log_snapshot().is_none());
+        assert_eq!(
+            created, 1,
+            "one App created {created} log workers across 12 open/close cycles; peak readers={concurrent}"
+        );
+        assert_eq!(concurrent, 1);
+    }
+
+    #[test]
+    fn completed_app_job_bounds_legacy_details_but_keeps_exact_history_counts() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        for index in 0..300 {
+            fs::write(
+                root.path()
+                    .join(format!("item-{index:04}-{}.txt", "x".repeat(160))),
+                "before",
+            )
+            .unwrap();
+        }
+        let mut app = App::new(root.path().into()).unwrap();
+        app.handle_command(Command::SelectAll);
+        app.handle_command(Command::CopyTo);
+        for ch in destination.path().to_str().unwrap().chars() {
+            app.handle_command(Command::Input(ch));
+        }
+        for entry in &app.entries {
+            fs::write(&entry.path, "changed-before-submitting").unwrap();
+        }
+        app.handle_command(Command::Submit);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while app.job_active() {
+            assert!(Instant::now() < deadline);
+            app.poll_job();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let result = app.last_job().unwrap();
+        assert!(
+            retained_job_result_bytes(result) <= LAST_JOB_BYTES_LIMIT,
+            "compatibility last_job retained {} bytes beyond {} byte detail budget",
+            retained_job_result_bytes(result),
+            LAST_JOB_BYTES_LIMIT
+        );
+        assert_eq!(app.selected_job().unwrap().counts.failed, 300);
+        assert_eq!(app.selected_job().unwrap().counts.total, 300);
+        assert!(result.failed.len() < 300);
+        assert_eq!(fs::read_dir(destination.path()).unwrap().count(), 0);
     }
 }

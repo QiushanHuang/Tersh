@@ -10,6 +10,16 @@ pub struct KeyState {
 }
 
 impl KeyState {
+    pub fn hint(&self, map: &Keymap, context: &str) -> Option<String> {
+        let options = map.completions(context, &self.pending);
+        (!options.is_empty()).then(|| {
+            options
+                .into_iter()
+                .map(|(key, action)| format!("{key} {}", action.replace('_', " ")))
+                .collect::<Vec<_>>()
+                .join(" | ")
+        })
+    }
     pub fn clear(&mut self) {
         self.pending.clear();
     }
@@ -32,7 +42,7 @@ impl KeyState {
         self.pending.push(key);
         let mut result = map.resolve(context, &self.pending);
         if result == KeyMatch::Unbound && self.pending.len() > 1 {
-            if matches!(context, "input" | "actions" | "cluster_filter") {
+            if matches!(context, "input" | "actions" | "cluster_filter" | "places") {
                 self.replay.extend(
                     self.pending[..self.pending.len() - 1]
                         .iter()
@@ -120,7 +130,12 @@ pub fn help_lines(map: &Keymap, context: &str) -> Vec<String> {
             } else {
                 keys.join(" / ")
             };
-            format!("{keys}: {}", action.replace('_', " "))
+            let (group, description, _) = crate::actions::metadata(&action);
+            if group == "Actions" {
+                format!("{keys}: {}", action.replace('_', " "))
+            } else {
+                format!("{keys}: {} — {description}", action.replace('_', " "))
+            }
         })
         .collect()
 }
