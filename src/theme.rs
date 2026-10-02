@@ -443,38 +443,20 @@ pub fn footer_rows(theme: Theme, text: &str, width: u16, rows: usize) -> Vec<Lin
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>();
     segments.sort_by_key(|segment| {
-        if matches!(
-            *segment,
-            "normal"
-                | "preview"
-                | "help"
-                | "detail"
-                | "actions"
-                | "filter"
-                | "find"
-                | "goto"
-                | "rename"
-                | "copy-to"
-                | "move-to"
-                | "trash"
-                | "delete"
-                | "conflict"
-                | "y_"
-                | "g_"
-                | "jobs"
-                | "cluster"
-                | "restore"
-        ) || segment.contains("^G")
-            || segment.contains("^C")
-            || segment.starts_with("q")
-            || segment.starts_with("?")
-            || segment.starts_with("o ")
+        if segment.starts_with("next:")
+            || segment.ends_with(" paste")
+            || segment.ends_with(" open")
+            || segment.ends_with(" view")
         {
             0
-        } else if segment.starts_with("next:") || segment.starts_with("p paste") {
+        } else if segment.ends_with(" actions") {
             1
-        } else {
+        } else if segment.contains("^G") || segment.contains("Esc") {
             2
+        } else if segment.starts_with("q ") || segment.starts_with("?") || segment.contains("^C") {
+            3
+        } else {
+            4
         }
     });
     let mut content = vec![String::new(); rows];
@@ -495,7 +477,7 @@ pub fn footer_rows(theme: Theme, text: &str, width: u16, rows: usize) -> Vec<Lin
 }
 
 pub fn footer_height(width: u16, height: u16) -> u16 {
-    if width >= 60 && height >= 14 { 3 } else { 2 }
+    if width >= 40 && height >= 10 { 3 } else { 2 }
 }
 
 pub fn unicode_graphs() -> bool {

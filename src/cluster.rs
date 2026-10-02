@@ -12,15 +12,40 @@ use std::{
     io::{self, Read},
     path::{Path, PathBuf},
     process::{Child, Command as ProcessCommand, Stdio},
-    sync::mpsc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant, SystemTime},
 };
 
 const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
-const PROBE_TIMEOUT: Duration = Duration::from_secs(6);
+// Includes the jump connection, target handshake, and remote metrics collection.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_CONCURRENT_PROBES: usize = 16;
 const MAX_PROBE_OUTPUT_BYTES: u64 = 1024 * 1024;
+const EVENT_LIMIT: usize = 100;
+
+/// User threshold is configuration, not a new monitoring collector.
+pub fn parse_disk_threshold(value: Option<&str>) -> Result<u16> {
+    let value = value.unwrap_or("90");
+    let threshold = value
+        .parse::<u16>()
+        .context("TERSH_DISK_WARN must be an integer from 0 to 100")?;
+    anyhow::ensure!(threshold <= 100, "TERSH_DISK_WARN must be from 0 to 100");
+    Ok(threshold)
+}
+
+#[derive(Debug, Clone)]
+pub struct HostEvent {
+    pub at: SystemTime,
+    pub alias: String,
+    pub previous: ConnectionState,
+    pub current: ConnectionState,
+    pub message: String,
+}
 
 const PROBE_SCRIPT: &str = r#"
 PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/local/cuda/bin:$PATH"
@@ -121,6 +146,23 @@ impl HostConfig {
     pub fn workdir(&self) -> Option<&str> {
         self.workdir.as_deref()
     }
+
+    pub fn place_scope(&self) -> (String, String) {
+        if self.kind == HostKind::Local {
+            return ("local".into(), "local".into());
+        }
+        (
+            self.alias.clone(),
+            format!(
+                "{}|{}|{}",
+                self.ssh_target,
+                self.proxy_jump_target()
+                    .or_else(|| self.proxy_jump())
+                    .unwrap_or(""),
+                self.kind.label()
+            ),
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -145,7 +187,7 @@ impl ClusterInventory {
                 user: None,
                 proxy_jump: None,
                 proxy_jump_target: None,
-                workdir: normalize_optional(main.workdir),
+                workdir: normalize_workdir(main.workdir),
             });
         }
 
@@ -168,7 +210,7 @@ impl ClusterInventory {
                 user,
                 proxy_jump: None,
                 proxy_jump_target: None,
-                workdir: normalize_optional(jump.workdir),
+                workdir: normalize_workdir(jump.workdir),
             });
         }
 
@@ -193,7 +235,7 @@ impl ClusterInventory {
                 user,
                 proxy_jump,
                 proxy_jump_target,
-                workdir: normalize_optional(server.workdir),
+                workdir: normalize_workdir(server.workdir),
             });
         }
 
@@ -380,6 +422,51 @@ struct ActiveProbe {
     timed_out: bool,
 }
 
+/// Own every probe thread for this dashboard. Leaving the TUI cancels all
+/// commands and reaps their processes before the terminal guard is restored.
+#[derive(Default)]
+struct ProbeWorkers {
+    cancel: Arc<AtomicBool>,
+    threads: Vec<(Arc<AtomicBool>, thread::JoinHandle<()>)>,
+}
+
+impl ProbeWorkers {
+    fn reap(&mut self) {
+        let mut index = 0;
+        while index < self.threads.len() {
+            if self.threads[index].0.load(Ordering::Acquire) || self.threads[index].1.is_finished()
+            {
+                let (_, thread) = self.threads.swap_remove(index);
+                let _ = thread.join();
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    fn spawn(&mut self, host: HostConfig, token: u64, tx: mpsc::Sender<ProbeSnapshot>) {
+        self.reap();
+        let cancel = self.cancel.clone();
+        let done = Arc::new(AtomicBool::new(false));
+        let worker_done = done.clone();
+        let thread = thread::spawn(move || {
+            let snapshot = collect_host_snapshot_cancellable(&host, &cancel);
+            worker_done.store(true, Ordering::Release);
+            let _ = tx.send(ProbeSnapshot { token, snapshot });
+        });
+        self.threads.push((done, thread));
+    }
+}
+
+impl Drop for ProbeWorkers {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+        for (_, worker) in self.threads.drain(..) {
+            let _ = worker.join();
+        }
+    }
+}
+
 impl HostSnapshot {
     pub fn unknown(alias: impl Into<String>) -> Self {
         Self {
@@ -456,6 +543,8 @@ pub enum ClusterMode {
     Detail,
     Help,
     Filter,
+    Events,
+    Places,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -480,6 +569,11 @@ pub enum ClusterCommand {
     CycleSort,
     ReverseSort,
     OpenActions,
+    ToggleAttention,
+    OpenEvents,
+    TogglePause,
+    OpenPlaces,
+    PinPlace,
 }
 
 macro_rules! cluster_actions {
@@ -493,7 +587,19 @@ macro_rules! cluster_actions {
 cluster_actions! { Down=>"down",Up=>"up",First=>"first",Last=>"last",RefreshAll=>"refresh_all",RefreshSelected=>"refresh_selected",
 OpenSession=>"open_session",OpenWorkbench=>"open_workbench",OpenDetail=>"open_detail",OpenHelp=>"open_help",Cancel=>"cancel",
 Quit=>"quit",ForceQuit=>"force_quit",DetailDown=>"detail_down",DetailUp=>"detail_up",OpenFilter=>"open_filter",ClearFilter=>"clear_filter",
-CycleSort=>"cycle_sort",ReverseSort=>"reverse_sort",OpenActions=>"open_actions" }
+CycleSort=>"cycle_sort",ReverseSort=>"reverse_sort",OpenActions=>"open_actions",
+ToggleAttention=>"toggle_attention",OpenEvents=>"open_events",TogglePause=>"toggle_pause",
+OpenPlaces=>"open_places",PinPlace=>"pin_place" }
+
+#[derive(Debug, Clone)]
+pub struct HostPlace {
+    pub host: String,
+    pub identity: String,
+    pub path: PathBuf,
+    pub pinned: bool,
+    pub valid: bool,
+    pub configured: bool,
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum HostSort {
@@ -532,7 +638,7 @@ impl HostSort {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ClusterApp {
     keymap: std::sync::Arc<crate::keymap::Keymap>,
     key_state: crate::bindings::KeyState,
@@ -553,6 +659,24 @@ pub struct ClusterApp {
     sort_reverse: bool,
     snapshots: BTreeMap<String, HostSnapshot>,
     last_good_reports: BTreeMap<String, ProbeReport>,
+    last_good_at: BTreeMap<String, SystemTime>,
+    expired_data: BTreeSet<String>,
+    final_states: BTreeMap<String, ConnectionState>,
+    events: VecDeque<HostEvent>,
+    event_limit: std::cell::Cell<usize>,
+    attention_only: bool,
+    refresh_paused: bool,
+    disk_threshold: u16,
+    observations: BTreeMap<String, u64>,
+    last_attempt: BTreeMap<String, Instant>,
+    next_due: BTreeMap<String, Instant>,
+    failure_streak: BTreeMap<String, u32>,
+    places: crate::places::Places,
+    place_choices: Vec<HostPlace>,
+    place_cursor: usize,
+    place_query: String,
+    place_message: Option<String>,
+    pending_workbench: Option<HostConfig>,
     refresh_deadlines: BTreeMap<String, Instant>,
     active_probes: BTreeMap<String, ActiveProbe>,
     cursor: usize,
@@ -602,6 +726,24 @@ impl ClusterApp {
             animation_frame: 0,
             snapshots,
             last_good_reports: BTreeMap::new(),
+            last_good_at: BTreeMap::new(),
+            expired_data: BTreeSet::new(),
+            final_states: BTreeMap::new(),
+            events: VecDeque::new(),
+            event_limit: std::cell::Cell::new(0),
+            attention_only: false,
+            refresh_paused: false,
+            disk_threshold: 90,
+            observations: BTreeMap::new(),
+            last_attempt: BTreeMap::new(),
+            next_due: BTreeMap::new(),
+            failure_streak: BTreeMap::new(),
+            places: crate::places::Places::memory(),
+            place_choices: Vec::new(),
+            place_cursor: 0,
+            place_query: String::new(),
+            place_message: None,
+            pending_workbench: None,
             refresh_deadlines: BTreeMap::new(),
             active_probes: BTreeMap::new(),
             cursor: 0,
@@ -623,15 +765,18 @@ impl ClusterApp {
     }
 
     pub fn apply(&mut self, command: ClusterCommand) {
-        if self.mode == ClusterMode::Help {
+        if matches!(self.mode, ClusterMode::Help | ClusterMode::Events) {
+            let max_offset = if self.mode == ClusterMode::Events {
+                self.event_limit.get()
+            } else {
+                self.keymap
+                    .bindings(&self.help_context)
+                    .len()
+                    .saturating_sub(1)
+            };
             match command {
                 ClusterCommand::Down => {
-                    self.help_offset = self.help_offset.saturating_add(1).min(
-                        self.keymap
-                            .bindings(&self.help_context)
-                            .len()
-                            .saturating_sub(1),
-                    );
+                    self.help_offset = self.help_offset.saturating_add(1).min(max_offset);
                     return;
                 }
                 ClusterCommand::Up => {
@@ -643,17 +788,37 @@ impl ClusterApp {
                     return;
                 }
                 ClusterCommand::Last => {
-                    self.help_offset = self
-                        .keymap
-                        .bindings(&self.help_context)
-                        .len()
-                        .saturating_sub(1);
+                    self.help_offset = max_offset;
                     return;
                 }
                 _ => {}
             }
         }
         match command {
+            ClusterCommand::OpenPlaces => {
+                self.place_query.clear();
+                self.place_cursor = 0;
+                self.place_message = None;
+                self.rebuild_places();
+                self.mode = ClusterMode::Places;
+            }
+            ClusterCommand::PinPlace => self.pin_configured_place(),
+            ClusterCommand::ToggleAttention => {
+                self.attention_only = !self.attention_only;
+                self.rebuild_view();
+            }
+            ClusterCommand::OpenEvents => {
+                self.help_offset = 0;
+                self.mode = ClusterMode::Events;
+            }
+            ClusterCommand::TogglePause => {
+                self.refresh_paused = !self.refresh_paused;
+                self.log(if self.refresh_paused {
+                    "Automatic refresh paused; active probes finish; manual refresh available"
+                } else {
+                    "Automatic refresh resumed"
+                });
+            }
             ClusterCommand::OpenActions => self.open_actions(),
             ClusterCommand::OpenFilter => {
                 self.filter_before = self.filter.clone();
@@ -663,6 +828,7 @@ impl ClusterApp {
             }
             ClusterCommand::ClearFilter => {
                 self.filter.clear();
+                self.attention_only = false;
                 self.rebuild_view();
             }
             ClusterCommand::CycleSort => {
@@ -711,7 +877,13 @@ impl ClusterApp {
                 }
             }
             ClusterCommand::Quit => {
-                if matches!(self.mode, ClusterMode::Help | ClusterMode::Detail) {
+                if matches!(
+                    self.mode,
+                    ClusterMode::Help
+                        | ClusterMode::Detail
+                        | ClusterMode::Events
+                        | ClusterMode::Places
+                ) {
                     self.mode = ClusterMode::Normal;
                 } else {
                     self.should_quit = true;
@@ -744,6 +916,10 @@ impl ClusterApp {
     }
 
     pub fn begin_refresh(&mut self, aliases: &[String]) -> Vec<String> {
+        self.begin_refresh_ordered(aliases, true)
+    }
+
+    fn begin_refresh_ordered(&mut self, aliases: &[String], rotate: bool) -> Vec<String> {
         let mut started = Vec::new();
         let now = Instant::now();
         if aliases.is_empty() {
@@ -756,7 +932,11 @@ impl ClusterApp {
             return started;
         }
         let slots = MAX_CONCURRENT_PROBES.saturating_sub(self.active_probes.len());
-        let start = self.refresh_cursor % aliases.len();
+        let start = if rotate {
+            self.refresh_cursor % aliases.len()
+        } else {
+            0
+        };
         let mut last_index = start;
         let mut skipped_active = false;
         for offset in 0..aliases.len() {
@@ -783,12 +963,18 @@ impl ClusterApp {
             self.refreshing.insert(alias.clone());
             self.refresh_deadlines
                 .insert(alias.clone(), now + PROBE_TIMEOUT);
+            self.last_attempt.insert(alias.clone(), now);
             started.push(alias.clone());
             last_index = index;
-            self.snapshots
-                .insert(alias.clone(), HostSnapshot::checking(alias.clone()));
+            let mut checking = self
+                .snapshots
+                .get(alias)
+                .cloned()
+                .unwrap_or_else(|| HostSnapshot::unknown(alias));
+            checking.connection = ConnectionState::Checking;
+            self.snapshots.insert(alias.clone(), checking);
         }
-        if !started.is_empty() {
+        if rotate && aliases.len() > 1 && !started.is_empty() {
             self.refresh_cursor = (last_index + 1) % aliases.len();
         }
         if started.is_empty() {
@@ -847,19 +1033,61 @@ impl ClusterApp {
             snapshot.connection,
             ConnectionState::Checking | ConnectionState::Unknown
         ) {
+            let delay = if snapshot.connection == ConnectionState::Online {
+                self.failure_streak.remove(&alias);
+                DEFAULT_REFRESH_INTERVAL
+            } else {
+                let streak = self.failure_streak.entry(alias.clone()).or_default();
+                *streak = streak.saturating_add(1);
+                Duration::from_secs((15u64 << (*streak).min(3)).min(120))
+            };
+            self.next_due.insert(alias.clone(), Instant::now() + delay);
             let history = self.history.entry(alias.clone()).or_default();
             if history.len() == crate::metrics::HISTORY_LIMIT {
                 history.pop_front();
             }
             history.push_back(crate::metrics::MetricSample::from_snapshot(&snapshot));
+            *self.observations.entry(alias.clone()).or_default() += 1;
         }
         let snapshot = self.merge_last_good_snapshot(snapshot);
         let state = snapshot.connection.label();
         if snapshot.connection == ConnectionState::Online && !snapshot.report.is_empty() {
             self.last_good_reports
                 .insert(alias.clone(), snapshot.report.clone());
+            self.last_good_at.insert(
+                alias.clone(),
+                snapshot.refreshed_at.unwrap_or_else(SystemTime::now),
+            );
+        }
+        if !matches!(
+            snapshot.connection,
+            ConnectionState::Checking | ConnectionState::Unknown
+        ) {
+            let previous = self
+                .final_states
+                .insert(alias.clone(), snapshot.connection)
+                .unwrap_or(ConnectionState::Unknown);
+            if previous != snapshot.connection {
+                if self.events.len() == EVENT_LIMIT {
+                    self.events.pop_front();
+                }
+                self.events.push_back(HostEvent {
+                    at: snapshot.refreshed_at.unwrap_or_else(SystemTime::now),
+                    alias: alias.clone(),
+                    previous,
+                    current: snapshot.connection,
+                    message: snapshot
+                        .error
+                        .as_deref()
+                        .unwrap_or("probe completed")
+                        .chars()
+                        .take(512)
+                        .collect(),
+                });
+            }
         }
         self.snapshots.insert(alias.clone(), snapshot);
+        self.update_expired_data();
         self.rebuild_view();
         self.log(format!("{alias}: {state}"));
     }
@@ -888,6 +1116,8 @@ impl ClusterApp {
                             return self.dispatch(command);
                         }
                     }
+                } else if self.mode == ClusterMode::Places {
+                    return self.handle_place_action(&action);
                 } else if self.mode == ClusterMode::Filter {
                     match action.as_str() {
                         "cancel" => self.apply(ClusterCommand::Cancel),
@@ -915,6 +1145,13 @@ impl ClusterApp {
     fn input_text(&mut self, ch: char) {
         if let Some(menu) = self.actions.as_mut() {
             menu.input_char(ch);
+        } else if self.mode == ClusterMode::Places
+            && !ch.is_control()
+            && self.place_query.chars().count() < 256
+        {
+            self.place_query.push(ch);
+            self.place_cursor = 0;
+            self.rebuild_places();
         } else if self.mode == ClusterMode::Filter
             && !ch.is_control()
             && self.filter.chars().count() < 256
@@ -938,8 +1175,9 @@ impl ClusterApp {
         match self.mode {
             ClusterMode::Normal => "cluster",
             ClusterMode::Detail => "cluster_detail",
-            ClusterMode::Help => "help",
+            ClusterMode::Help | ClusterMode::Events => "help",
             ClusterMode::Filter => "cluster_filter",
+            ClusterMode::Places => "places",
         }
     }
     pub fn help_context(&self) -> &str {
@@ -969,6 +1207,27 @@ impl ClusterApp {
             Action::new("Cycle host sort", "v", ClusterCommand::CycleSort),
             Action::new("Reverse host sort", "V", ClusterCommand::ReverseSort),
             Action::new("Refresh all hosts", "r", ClusterCommand::RefreshAll),
+            Action::new(
+                "Toggle hosts needing attention",
+                "a",
+                ClusterCommand::ToggleAttention,
+            ),
+            Action::new("State change events", "E", ClusterCommand::OpenEvents),
+            Action::new(
+                "Pause / resume automatic refresh",
+                "P",
+                ClusterCommand::TogglePause,
+            ),
+            Action::new(
+                "Recent and pinned host directories",
+                "b",
+                ClusterCommand::OpenPlaces,
+            ),
+            Action::new(
+                "Pin / unpin configured work directory",
+                "B",
+                ClusterCommand::PinPlace,
+            ),
             Action::new("Help", "?", ClusterCommand::OpenHelp),
         ];
         if self.mode == ClusterMode::Detail {
@@ -990,6 +1249,11 @@ impl ClusterApp {
             });
         }
         for action in &mut actions {
+            let (group, description, keywords) =
+                crate::actions::metadata(action.command.action_id());
+            action.group = group;
+            action.description = description;
+            action.keywords = keywords;
             action.key = crate::bindings::label(
                 &self.keymap,
                 self.key_context(),
@@ -1030,6 +1294,195 @@ impl ClusterApp {
 
     pub fn actions(&self) -> Option<&crate::actions::ActionMenu<ClusterCommand>> {
         self.actions.as_ref()
+    }
+
+    pub fn set_places(&mut self, places: crate::places::Places) {
+        self.places = places;
+        self.rebuild_places();
+    }
+    pub fn place_choices(&self) -> &[HostPlace] {
+        &self.place_choices
+    }
+    pub fn place_cursor(&self) -> usize {
+        self.place_cursor
+    }
+    pub fn place_query(&self) -> &str {
+        &self.place_query
+    }
+    pub fn place_message(&self) -> Option<&str> {
+        self.place_message.as_deref()
+    }
+    pub fn places_enabled(&self) -> bool {
+        self.places.is_enabled()
+    }
+    pub fn pending_workbench(&self) -> Option<&HostConfig> {
+        self.pending_workbench.as_ref()
+    }
+
+    fn rebuild_places(&mut self) {
+        let mut choices =
+            self.places
+                .entries()
+                .iter()
+                .map(|place| HostPlace {
+                    host: place.host.clone(),
+                    identity: place.identity.clone(),
+                    path: place.path.clone(),
+                    pinned: place.pinned,
+                    valid: self.hosts.iter().any(|host| {
+                        host.place_scope() == (place.host.clone(), place.identity.clone())
+                    }),
+                    configured: false,
+                })
+                .collect::<Vec<_>>();
+        for host in &self.hosts {
+            let Some(path) = host.workdir().filter(|path| Path::new(path).is_absolute()) else {
+                continue;
+            };
+            let (scope, identity) = host.place_scope();
+            if let Some(place) = choices.iter_mut().find(|place| {
+                place.host == scope && place.identity == identity && place.path == Path::new(path)
+            }) {
+                place.configured = true;
+            } else {
+                choices.push(HostPlace {
+                    host: scope,
+                    identity,
+                    path: path.into(),
+                    pinned: false,
+                    valid: true,
+                    configured: true,
+                });
+            }
+        }
+        let selected = self.selected_host().map(HostConfig::place_scope);
+        // Stable sorting preserves the store's recency order within each group.
+        choices.sort_by_key(|place| {
+            (
+                selected.as_ref() != Some(&(place.host.clone(), place.identity.clone())),
+                !place.pinned,
+            )
+        });
+        let query = self.place_query.to_lowercase();
+        choices.retain(|place| {
+            format!("{} {}", place.host, place.path.display())
+                .to_lowercase()
+                .contains(&query)
+        });
+        self.place_choices = choices;
+        self.place_cursor = self
+            .place_cursor
+            .min(self.place_choices.len().saturating_sub(1));
+    }
+
+    fn pin_configured_place(&mut self) {
+        let Some(host) = self.selected_host().cloned() else {
+            return;
+        };
+        let Some(path) = host.workdir().filter(|path| Path::new(path).is_absolute()) else {
+            self.log("Set an absolute workdir in the host inventory before pinning");
+            return;
+        };
+        let (scope, identity) = host.place_scope();
+        let result = self.places.toggle_pin(&scope, &identity, Path::new(path));
+        match result {
+            Ok(()) => self.log(if self.places.is_enabled() {
+                "Updated workdir pin"
+            } else {
+                "Places history is disabled"
+            }),
+            Err(error) => self.log(format!("Places: {error}")),
+        }
+        self.rebuild_places();
+    }
+
+    fn handle_place_action(&mut self, action: &str) -> Option<ClusterCommand> {
+        let choice = self.place_choices.get(self.place_cursor).cloned();
+        match action {
+            "cancel" => {
+                self.mode = ClusterMode::Normal;
+                self.pending_workbench = None;
+            }
+            "down" => {
+                self.place_cursor = self
+                    .place_cursor
+                    .saturating_add(1)
+                    .min(self.place_choices.len().saturating_sub(1))
+            }
+            "up" => self.place_cursor = self.place_cursor.saturating_sub(1),
+            "first" => self.place_cursor = 0,
+            "last" => self.place_cursor = self.place_choices.len().saturating_sub(1),
+            "backspace" => {
+                self.place_query.pop();
+                self.place_cursor = 0;
+                self.rebuild_places();
+            }
+            "submit" => {
+                if let Some(choice) = choice {
+                    let host = self
+                        .hosts
+                        .iter()
+                        .find(|host| {
+                            host.place_scope() == (choice.host.clone(), choice.identity.clone())
+                        })
+                        .cloned();
+                    if let Some(mut host) = host {
+                        if host.kind == HostKind::Local && !choice.path.is_dir() {
+                            self.place_message = Some(
+                                "Directory is missing or unavailable; choose another place".into(),
+                            );
+                            return None;
+                        }
+                        host.workdir = choice.path.to_str().map(str::to_owned);
+                        self.pending_workbench = Some(host);
+                        self.mode = ClusterMode::Normal;
+                        return Some(ClusterCommand::OpenWorkbench);
+                    }
+                    self.place_message = Some(
+                        "Saved host identity no longer matches inventory; remove this entry".into(),
+                    );
+                }
+            }
+            "pin_place" | "remove_place" => {
+                if let Some(choice) = choice {
+                    let result = if action == "pin_place" {
+                        self.places
+                            .toggle_pin(&choice.host, &choice.identity, &choice.path)
+                    } else {
+                        self.places
+                            .remove(&choice.host, &choice.identity, &choice.path)
+                    };
+                    self.place_message = Some(match result {
+                        Ok(()) if !self.places.is_enabled() => "Places history is disabled".into(),
+                        Ok(()) if action == "remove_place" && choice.configured => {
+                            "Saved entry removed; configured workdir remains available".into()
+                        }
+                        Ok(()) => "Saved place updated".into(),
+                        Err(error) => error.to_string(),
+                    });
+                    self.rebuild_places();
+                }
+            }
+            "clear_recent" => {
+                if let Some(choice) = choice {
+                    self.place_message = Some(
+                        match self.places.clear_recent(&choice.host, &choice.identity) {
+                            Ok(()) => {
+                                format!("Recent places cleared for {}; pins kept", choice.host)
+                            }
+                            Err(error) => error.to_string(),
+                        },
+                    );
+                    self.rebuild_places();
+                } else {
+                    self.place_message = Some(
+                        "Select a place to choose which host's recent entries to clear".into(),
+                    );
+                }
+            }
+            _ => {}
+        }
+        None
     }
     pub fn history_for(&self, alias: &str) -> Option<&VecDeque<crate::metrics::MetricSample>> {
         self.history.get(alias)
@@ -1091,9 +1544,10 @@ impl ClusterApp {
         let mut visible = (0..self.hosts.len())
             .filter(|index| {
                 let host = &self.hosts[*index];
-                [host.alias(), host.address(), host.role()]
-                    .iter()
-                    .any(|s| s.to_lowercase().contains(&query))
+                (!self.attention_only || self.needs_attention(host.alias()))
+                    && [host.alias(), host.address(), host.role()]
+                        .iter()
+                        .any(|s| s.to_lowercase().contains(&query))
             })
             .collect::<Vec<_>>();
         let metric = |index: usize| -> Option<f64> {
@@ -1197,16 +1651,97 @@ impl ClusterApp {
     }
 
     pub fn offline_count(&self) -> usize {
-        self.host_snapshots()
-            .filter(|snapshot| {
-                matches!(
-                    snapshot.connection,
-                    ConnectionState::Offline
-                        | ConnectionState::Timeout
-                        | ConnectionState::AuthFailed
-                )
-            })
-            .count()
+        self.count_state(ConnectionState::Offline)
+    }
+
+    pub fn failed_count(&self) -> usize {
+        self.offline_count()
+            + self.count_state(ConnectionState::Timeout)
+            + self.count_state(ConnectionState::AuthFailed)
+    }
+
+    pub fn attention_only(&self) -> bool {
+        self.attention_only
+    }
+    pub fn refresh_paused(&self) -> bool {
+        self.refresh_paused
+    }
+    pub fn events(&self) -> &VecDeque<HostEvent> {
+        &self.events
+    }
+    pub fn set_event_limit(&self, limit: usize) {
+        self.event_limit.set(limit);
+    }
+    pub fn observation_count(&self, alias: &str) -> u64 {
+        self.observations.get(alias).copied().unwrap_or(0)
+    }
+    pub fn data_age(&self, alias: &str) -> Option<Duration> {
+        self.last_good_at
+            .get(alias)
+            .map(|at| at.elapsed().unwrap_or_default())
+    }
+    /// Update freshness-derived visibility without starting a probe.
+    pub fn tick_freshness(&mut self) -> bool {
+        if !self.update_expired_data() {
+            return false;
+        }
+        self.rebuild_view();
+        true
+    }
+
+    fn update_expired_data(&mut self) -> bool {
+        let now = SystemTime::now();
+        let mut changed = false;
+        for (alias, at) in &self.last_good_at {
+            if now.duration_since(*at).unwrap_or_default() > Duration::from_secs(45) {
+                if !self.expired_data.contains(alias) {
+                    self.expired_data.insert(alias.clone());
+                    changed = true;
+                }
+            } else {
+                changed |= self.expired_data.remove(alias);
+            }
+        }
+        changed
+    }
+    pub fn set_disk_threshold(&mut self, threshold: u16) -> Result<()> {
+        anyhow::ensure!(threshold <= 100, "disk threshold must be from 0 to 100");
+        self.disk_threshold = threshold;
+        self.rebuild_view();
+        Ok(())
+    }
+    pub fn attention_reason(&self, alias: &str) -> Option<String> {
+        let snapshot = self.snapshots.get(alias)?;
+        let state = if snapshot.connection == ConnectionState::Checking {
+            self.final_states
+                .get(alias)
+                .copied()
+                .unwrap_or(ConnectionState::Unknown)
+        } else {
+            snapshot.connection
+        };
+        if state != ConnectionState::Online {
+            return Some(format!("{}; inspect details", state.label()));
+        }
+        if snapshot.report.is_empty() {
+            return Some("metrics unknown; no valid observation yet".into());
+        }
+        if self.expired_data.contains(alias) {
+            return Some("last data is over 45s old; refresh when ready".into());
+        }
+        if let Some(disk) = snapshot
+            .report
+            .storage
+            .as_deref()
+            .and_then(crate::metrics::percent)
+            && disk >= self.disk_threshold
+        {
+            return Some(format!("disk {disk}% >= {}%", self.disk_threshold));
+        }
+        None
+    }
+    pub fn needs_attention(&self, alias: &str) -> bool {
+        self.attention_reason(alias).is_some()
     }
 
     pub fn checking_count(&self) -> usize {
@@ -1233,11 +1768,43 @@ impl ClusterApp {
     }
 
     fn refresh_due(&self, interval: Duration) -> bool {
-        !self.is_refreshing()
-            && self
-                .last_refresh_started
-                .map(|started| started.elapsed() >= interval)
-                .unwrap_or(true)
+        !self.refresh_paused
+            && self.active_probes.len() < MAX_CONCURRENT_PROBES
+            && !self.scheduled_aliases(interval).is_empty()
+    }
+
+    fn scheduled_aliases(&self, interval: Duration) -> Vec<String> {
+        if self.refresh_paused {
+            return Vec::new();
+        }
+        let now = Instant::now();
+        let selected = self.selected_host().map(HostConfig::alias);
+        let mut aliases = self
+            .hosts
+            .iter()
+            .filter(|host| {
+                !self.active_probes.contains_key(host.alias())
+                    && self
+                        .next_due
+                        .get(host.alias())
+                        .map(|due| *due <= now)
+                        .unwrap_or_else(|| {
+                            self.last_attempt
+                                .get(host.alias())
+                                .is_none_or(|at| at.elapsed() >= interval)
+                        })
+            })
+            .map(|host| host.alias().to_owned())
+            .collect::<Vec<_>>();
+        // Never-probed and oldest-attempt hosts win. The selected host wins a
+        // tie, so priority cannot starve hosts in a larger inventory.
+        aliases.sort_by_key(|alias| {
+            (
+                self.last_attempt.get(alias).copied(),
+                selected != Some(alias.as_str()),
+            )
+        });
+        aliases
     }
 
     fn count_state(&self, state: ConnectionState) -> usize {
@@ -1368,19 +1935,33 @@ fn run_inventory_with_keymap(
     inventory: ClusterInventory,
     keymap: crate::keymap::Keymap,
 ) -> Result<()> {
+    let disk_threshold = parse_disk_threshold(env::var("TERSH_DISK_WARN").ok().as_deref())?;
     let guard = TerminalGuard::enter()?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
     let mut app = ClusterApp::from_inventory(inventory);
+    app.set_disk_threshold(disk_threshold)?;
+    match crate::places::Places::load_default() {
+        Ok(places) => app.set_places(places),
+        Err(error) => {
+            app.set_places(crate::places::Places::disabled());
+            app.log(format!("Places unavailable: {error}"));
+        }
+    }
     app.set_keymap(keymap);
     let (tx, rx) = mpsc::channel();
-    start_refresh_all(&mut app, tx.clone());
+    let mut workers = ProbeWorkers::default();
+    start_scheduled_refresh(&mut app, tx.clone(), &mut workers);
     let mut dirty = true;
     let animation_started = Instant::now();
     let motion = crate::theme::motion_enabled();
 
     while !app.should_quit() {
+        workers.reap();
+        if app.tick_freshness() {
+            dirty = true;
+        }
         if app.animate(animation_started.elapsed(), motion) {
             dirty = true;
         }
@@ -1392,7 +1973,7 @@ fn run_inventory_with_keymap(
         }
 
         if app.refresh_due(DEFAULT_REFRESH_INTERVAL) {
-            start_refresh_all(&mut app, tx.clone());
+            start_scheduled_refresh(&mut app, tx.clone(), &mut workers);
             dirty = true;
         }
 
@@ -1405,23 +1986,25 @@ fn run_inventory_with_keymap(
                 Event::Key(key) => {
                     dirty = true;
                     match app.handle_key(key) {
-                        Some(ClusterCommand::RefreshAll) => start_refresh_all(&mut app, tx.clone()),
+                        Some(ClusterCommand::RefreshAll) => {
+                            start_refresh_all(&mut app, tx.clone(), &mut workers)
+                        }
                         Some(ClusterCommand::RefreshSelected) => {
-                            start_refresh_selected(&mut app, tx.clone())
+                            start_refresh_selected(&mut app, tx.clone(), &mut workers)
                         }
                         Some(ClusterCommand::OpenSession) => {
                             terminal.show_cursor()?;
                             open_selected_session(&mut app, &guard)?;
                             terminal.clear()?;
                             drain_snapshots(&mut app, &rx);
-                            start_refresh_selected(&mut app, tx.clone());
+                            start_refresh_selected(&mut app, tx.clone(), &mut workers);
                         }
                         Some(ClusterCommand::OpenWorkbench) => {
                             terminal.show_cursor()?;
                             open_selected_workbench(&mut app, &guard)?;
                             terminal.clear()?;
                             drain_snapshots(&mut app, &rx);
-                            start_refresh_selected(&mut app, tx.clone());
+                            start_refresh_selected(&mut app, tx.clone(), &mut workers);
                         }
                         _ => {}
                     }
@@ -1447,12 +2030,23 @@ fn drain_snapshots(app: &mut ClusterApp, rx: &mpsc::Receiver<ProbeSnapshot>) -> 
 }
 
 pub fn collect_host_snapshot(host: &HostConfig) -> HostSnapshot {
+    collect_host_snapshot_cancellable(host, &AtomicBool::new(false))
+}
+
+fn collect_host_snapshot_cancellable(host: &HostConfig, cancel: &AtomicBool) -> HostSnapshot {
     let started = Instant::now();
-    let result = if host.kind == HostKind::Local {
-        run_local_probe()
+    let mut command = if host.kind == HostKind::Local {
+        let (program, args) = local_probe_shell();
+        let mut command = ProcessCommand::new(program);
+        command.args(args).arg(PROBE_SCRIPT);
+        command
     } else {
-        run_ssh_probe(host)
+        let mut command = ProcessCommand::new("ssh");
+        command.args(ssh_probe_args(host));
+        command
     };
+    command.stdin(Stdio::null());
+    let result = run_command_with_cancellation(command, PROBE_TIMEOUT, cancel);
     match result {
         Ok(output) => HostSnapshot::online(
             host.alias(),
@@ -1463,34 +2057,53 @@ pub fn collect_host_snapshot(host: &HostConfig) -> HostSnapshot {
     }
 }
 
-fn start_refresh_all(app: &mut ClusterApp, tx: mpsc::Sender<ProbeSnapshot>) {
+fn start_refresh_all(
+    app: &mut ClusterApp,
+    tx: mpsc::Sender<ProbeSnapshot>,
+    workers: &mut ProbeWorkers,
+) {
     let hosts = app.hosts().to_vec();
     let aliases = hosts
         .iter()
         .map(|host| host.alias().to_string())
         .collect::<Vec<_>>();
-    let started = app
-        .begin_refresh(&aliases)
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-    for host in hosts {
+    let started = app.begin_refresh(&aliases);
+    spawn_probes(app, started, tx, workers);
+}
+
+fn start_scheduled_refresh(
+    app: &mut ClusterApp,
+    tx: mpsc::Sender<ProbeSnapshot>,
+    workers: &mut ProbeWorkers,
+) {
+    let aliases = app.scheduled_aliases(DEFAULT_REFRESH_INTERVAL);
+    let started = app.begin_refresh_ordered(&aliases, false);
+    spawn_probes(app, started, tx, workers);
+}
+
+fn spawn_probes(
+    app: &ClusterApp,
+    aliases: Vec<String>,
+    tx: mpsc::Sender<ProbeSnapshot>,
+    workers: &mut ProbeWorkers,
+) {
+    let started = aliases.into_iter().collect::<BTreeSet<_>>();
+    for host in app.hosts() {
         if !started.contains(host.alias()) {
             continue;
         }
         let Some(token) = app.refresh_token(host.alias()) else {
             continue;
         };
-        let tx = tx.clone();
-        thread::spawn(move || {
-            let _ = tx.send(ProbeSnapshot {
-                token,
-                snapshot: collect_host_snapshot(&host),
-            });
-        });
+        workers.spawn(host.clone(), token, tx.clone());
     }
 }
 
-fn start_refresh_selected(app: &mut ClusterApp, tx: mpsc::Sender<ProbeSnapshot>) {
+fn start_refresh_selected(
+    app: &mut ClusterApp,
+    tx: mpsc::Sender<ProbeSnapshot>,
+    workers: &mut ProbeWorkers,
+) {
     let Some(host) = app.selected_host().cloned() else {
         return;
     };
@@ -1500,26 +2113,7 @@ fn start_refresh_selected(app: &mut ClusterApp, tx: mpsc::Sender<ProbeSnapshot>)
     let Some(token) = app.refresh_token(host.alias()) else {
         return;
     };
-    thread::spawn(move || {
-        let _ = tx.send(ProbeSnapshot {
-            token,
-            snapshot: collect_host_snapshot(&host),
-        });
-    });
-}
-
-fn run_local_probe() -> Result<String> {
-    let (program, mut args) = local_probe_shell();
-    let mut command = ProcessCommand::new(program);
-    command.args(args.drain(..));
-    command.arg(PROBE_SCRIPT);
-    run_command_with_timeout(command, PROBE_TIMEOUT)
-}
-
-fn run_ssh_probe(host: &HostConfig) -> Result<String> {
-    let mut command = ProcessCommand::new("ssh");
-    command.args(ssh_probe_args(host));
-    run_command_with_timeout(command, PROBE_TIMEOUT)
+    workers.spawn(host, token, tx);
 }
 
 pub fn ssh_probe_args(host: &HostConfig) -> Vec<String> {
@@ -1532,15 +2126,15 @@ pub fn ssh_probe_args(host: &HostConfig) -> Vec<String> {
         "-o".to_string(),
         "PermitLocalCommand=no".to_string(),
         "-o".to_string(),
-        "ConnectTimeout=3".to_string(),
+        "ConnectTimeout=15".to_string(),
         "-o".to_string(),
         "ConnectionAttempts=1".to_string(),
         "-o".to_string(),
         "StrictHostKeyChecking=yes".to_string(),
         "-o".to_string(),
-        "ServerAliveInterval=2".to_string(),
+        "ServerAliveInterval=10".to_string(),
         "-o".to_string(),
-        "ServerAliveCountMax=1".to_string(),
+        "ServerAliveCountMax=2".to_string(),
     ];
     if let Some(proxy_jump) = host.proxy_jump() {
         args.push("-J".to_string());
@@ -1555,6 +2149,7 @@ pub fn ssh_probe_args(host: &HostConfig) -> Vec<String> {
 pub struct SessionCommand {
     program: String,
     args: Vec<String>,
+    environment: Vec<(String, String)>,
 }
 
 impl SessionCommand {
@@ -1583,12 +2178,14 @@ pub fn host_session_command(host: &HostConfig, local_shell: Option<&str>) -> Ses
         return SessionCommand {
             program: shell.to_string(),
             args: Vec::new(),
+            environment: Vec::new(),
         };
     }
 
     SessionCommand {
         program: "ssh".to_string(),
         args: ssh_session_args(host),
+        environment: Vec::new(),
     }
 }
 
@@ -1617,12 +2214,17 @@ pub fn host_workbench_command(host: &HostConfig, local_tersh_program: &str) -> S
         return SessionCommand {
             program: program.to_string(),
             args,
+            environment: vec![
+                ("TERSH_HOST_ALIAS".into(), "local".into()),
+                ("TERSH_HOST_ID".into(), "local".into()),
+            ],
         };
     }
 
     SessionCommand {
         program: "ssh".to_string(),
         args: ssh_workbench_args(host),
+        environment: Vec::new(),
     }
 }
 
@@ -1633,7 +2235,7 @@ pub fn ssh_workbench_args(host: &HostConfig) -> Vec<String> {
         args.push(host.proxy_jump_target().unwrap_or(proxy_jump).to_string());
     }
     args.push(host.ssh_target().to_string());
-    args.push(remote_workbench_command(host.workdir()));
+    args.push(remote_workbench_command(host));
     args
 }
 
@@ -1654,7 +2256,11 @@ fn open_selected_session(app: &mut ClusterApp, guard: &TerminalGuard) -> Result<
 }
 
 fn open_selected_workbench(app: &mut ClusterApp, guard: &TerminalGuard) -> Result<()> {
-    let Some(host) = app.selected_host().cloned() else {
+    let Some(host) = app
+        .pending_workbench
+        .take()
+        .or_else(|| app.selected_host().cloned())
+    else {
         return Ok(());
     };
     let current_tersh = current_tersh_program();
@@ -1662,8 +2268,23 @@ fn open_selected_workbench(app: &mut ClusterApp, guard: &TerminalGuard) -> Resul
 
     app.log(format!("opening tersh: {}", host.alias()));
     let result = guard.suspend(|| run_session_command(&command))?;
+    // The child workbench may also have saved local places. Reload before an
+    // explicit visit so the parent never overwrites a concurrent state change.
+    if let Ok(places) = crate::places::Places::load_default() {
+        app.set_places(places);
+    }
     match result {
-        Ok(status) => app.log(format!("tersh closed: {} ({status})", host.alias())),
+        Ok(status) => {
+            app.log(format!("tersh closed: {} ({status})", host.alias()));
+            if status.success()
+                && let Some(path) = host.workdir().filter(|path| Path::new(path).is_absolute())
+            {
+                let (scope, identity) = host.place_scope();
+                if let Err(error) = app.places.visit(&scope, &identity, Path::new(path)) {
+                    app.log(format!("Places: {error}"));
+                }
+            }
+        }
         Err(err) => app.log(format!("tersh failed: {}: {err}", host.alias())),
     }
     Ok(())
@@ -1672,6 +2293,7 @@ fn open_selected_workbench(app: &mut ClusterApp, guard: &TerminalGuard) -> Resul
 fn run_session_command(command: &SessionCommand) -> Result<std::process::ExitStatus> {
     ProcessCommand::new(command.program())
         .args(command.args())
+        .envs(command.environment.iter().cloned())
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -1686,7 +2308,7 @@ fn current_tersh_program() -> String {
         .unwrap_or_else(|| "tersh".to_string())
 }
 
-fn remote_workbench_command(workdir: Option<&str>) -> String {
+fn remote_workbench_command(host: &HostConfig) -> String {
     let mut script = format!(
         "{}; if ! command -v tersh >/dev/null 2>&1; then printf '%s\\n' {} >&2; exit 127; fi",
         PATH_BOOTSTRAP_SCRIPT,
@@ -1694,15 +2316,47 @@ fn remote_workbench_command(workdir: Option<&str>) -> String {
             "tersh is not installed or not in PATH. Install: cargo install --locked --git https://github.com/QiushanHuang/Tersh.git --bin tersh --force"
         )
     );
-    if let Some(workdir) = workdir.map(str::trim).filter(|workdir| !workdir.is_empty()) {
+    if let Some(workdir) = host.workdir().filter(|workdir| !workdir.trim().is_empty()) {
         script.push_str(&format!(
             "; cd -- {} || {{ printf '%s\\n' {} >&2; exit 1; }}",
             shell_quote(workdir),
             shell_quote(&format!("tersh workdir not found: {workdir}"))
         ));
     }
+    for (key, value) in presentation_environment() {
+        script.push_str(&format!("; {key}={}; export {key}", shell_quote(&value)));
+    }
+    let (scope, identity) = host.place_scope();
+    for (key, value) in [("TERSH_HOST_ALIAS", scope), ("TERSH_HOST_ID", identity)] {
+        script.push_str(&format!("; {key}={}; export {key}", shell_quote(&value)));
+    }
     script.push_str("; exec tersh");
     remote_probe_command(&script)
+}
+
+fn presentation_environment() -> Vec<(&'static str, String)> {
+    // Only validated presentation enums cross the SSH boundary. In particular,
+    // never forward arbitrary environment, paths, credentials or keymap files.
+    let allowed: &[(&str, &[&str])] = &[
+        ("TERSH_THEME", &["btop", "aurora", "contrast", "mono"]),
+        ("TERSH_BORDER", &["ascii", "rounded", "thick"]),
+        ("TERSH_FOOTER", &["auto", "compact", "full"]),
+        ("TERSH_GLYPHS", &["ascii", "unicode"]),
+        ("TERSH_MOTION", &["off", "0", "reduced", "on", "1"]),
+        ("TERSH_COLOR", &["off", "on"]),
+        ("TERSH_CLIPBOARD", &["off", "on"]),
+    ];
+    let mut values = allowed
+        .iter()
+        .filter_map(|(key, valid)| {
+            let value = env::var(key).ok()?.to_ascii_lowercase();
+            valid.contains(&value.as_str()).then_some((*key, value))
+        })
+        .collect::<Vec<_>>();
+    if env::var_os("NO_COLOR").is_some() {
+        values.push(("NO_COLOR", "1".into()));
+    }
+    values
 }
 
 fn remote_probe_command(script: &str) -> String {
@@ -1723,7 +2377,17 @@ fn local_probe_shell() -> (&'static str, Vec<String>) {
     ("cmd", vec!["/C".to_string()])
 }
 
-fn run_command_with_timeout(mut command: ProcessCommand, timeout: Duration) -> Result<String> {
+#[cfg(test)]
+fn run_command_with_timeout(command: ProcessCommand, timeout: Duration) -> Result<String> {
+    run_command_with_cancellation(command, timeout, &AtomicBool::new(false))
+}
+
+fn run_command_with_cancellation(
+    mut command: ProcessCommand,
+    timeout: Duration,
+    cancel: &AtomicBool,
+) -> Result<String> {
+    anyhow::ensure!(!cancel.load(Ordering::Acquire), "probe cancelled");
     configure_probe_command(&mut command);
     let mut child = command
         .stdout(Stdio::piped())
@@ -1742,6 +2406,7 @@ fn run_command_with_timeout(mut command: ProcessCommand, timeout: Duration) -> R
         let mut status = None;
         let started = Instant::now();
         loop {
+            anyhow::ensure!(!cancel.load(Ordering::Acquire), "probe cancelled");
             let previous_bytes = stdout_bytes.len() + stderr_bytes.len();
             if !stdout_done {
                 stdout_done = drain_probe_pipe(&mut stdout, "stdout", &mut stdout_bytes)?;
@@ -1972,6 +2637,12 @@ fn normalize_optional(value: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn normalize_workdir(value: Option<String>) -> Option<String> {
+    // Whitespace can be part of a real path. Only an all-whitespace setting
+    // means no configured directory; never rewrite a nonempty path.
+    value.filter(|value| !value.trim().is_empty())
+}
+
 fn validate_hosts(hosts: &[HostConfig]) -> Result<()> {
     let mut aliases = BTreeSet::new();
     let jump_aliases = hosts
@@ -2128,6 +2799,230 @@ mod tests {
     static PROBE_TEMP_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
+    fn freshness_crossing_updates_paused_attention_once() {
+        let mut app = ClusterApp::new(vec![test_host("host")]);
+        app.apply_snapshot(HostSnapshot::online(
+            "host",
+            ProbeReport::parse("load=1"),
+            1,
+        ));
+        app.apply(ClusterCommand::TogglePause);
+        app.apply(ClusterCommand::ToggleAttention);
+        assert_eq!(app.visible_count(), 0);
+        // Advance just the observation age; no sleeping or remote I/O.
+        app.last_good_at
+            .insert("host".into(), SystemTime::now() - Duration::from_secs(46));
+        assert!(
+            app.tick_freshness(),
+            "crossing freshness threshold needs one render"
+        );
+        assert_eq!(app.visible_count(), 1);
+        assert!(app.needs_attention("host"));
+        assert!(
+            !app.tick_freshness(),
+            "unchanged stale data must not continuously redraw"
+        );
+        assert!(!app.refresh_due(DEFAULT_REFRESH_INTERVAL));
+    }
+
+    #[test]
+    fn online_connection_with_empty_metrics_still_needs_attention() {
+        let mut app = ClusterApp::new(vec![test_host("host")]);
+        app.apply_snapshot(HostSnapshot::online("host", ProbeReport::default(), 1));
+        assert_eq!(
+            app.snapshot_for("host").unwrap().connection,
+            ConnectionState::Online
+        );
+        assert!(app.data_age("host").is_none());
+        assert!(
+            app.needs_attention("host"),
+            "online connection is not a valid metric observation"
+        );
+        app.apply(ClusterCommand::ToggleAttention);
+        assert_eq!(app.visible_count(), 1);
+    }
+
+    #[cfg(unix)]
+    fn wait_for_fixture_pid(path: &Path) -> libc::pid_t {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Ok(contents) = fs::read_to_string(path)
+                && let Ok(pid) = contents.trim().parse::<libc::pid_t>()
+                && pid > 0
+            {
+                return pid;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fixture did not publish a complete PID"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelling_active_probe_reaps_process_promptly() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let child_cancel = cancel.clone();
+        let dir = tempfile::tempdir().unwrap();
+        let pid_path = dir.path().join("pid");
+        let child_pid_path = pid_path.clone();
+        let worker = thread::spawn(move || {
+            let mut command = ProcessCommand::new("sh");
+            command
+                .args(["-c", "echo $$ > \"$1\"; exec sleep 0.4", "sh"])
+                .arg(child_pid_path);
+            run_command_with_cancellation(command, Duration::from_secs(1), &child_cancel)
+        });
+        let pid = wait_for_fixture_pid(&pid_path);
+        let started = Instant::now();
+        cancel.store(true, Ordering::Release);
+        let error = worker.join().unwrap().unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
+        assert!(started.elapsed() < Duration::from_millis(300));
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            -1,
+            "probe process survived cancellation"
+        );
+    }
+
+    #[test]
+    fn automatic_refresh_pause_and_other_hosts_are_independent_of_inflight_batch() {
+        let mut app = ClusterApp::new(
+            (0..17)
+                .map(|n| test_host(&format!("host-{n:02}")))
+                .collect(),
+        );
+        app.apply(ClusterCommand::TogglePause);
+        assert!(
+            !app.refresh_due(DEFAULT_REFRESH_INTERVAL),
+            "paused means no automatic probes"
+        );
+        app.apply(ClusterCommand::TogglePause);
+        app.begin_refresh(&["host-00".into()]);
+        assert!(
+            app.refresh_due(DEFAULT_REFRESH_INTERVAL),
+            "one slow host must not delay others"
+        );
+    }
+
+    #[test]
+    fn scheduler_prioritizes_selected_ties_and_visits_every_host_before_repeats() {
+        let mut app = ClusterApp::new(
+            (0..40)
+                .map(|n| test_host(&format!("host-{n:02}")))
+                .collect(),
+        );
+        for _ in 0..30 {
+            app.apply(ClusterCommand::Down);
+        }
+        let mut seen = BTreeSet::new();
+        for batch in 0..3 {
+            let aliases = app.scheduled_aliases(DEFAULT_REFRESH_INTERVAL);
+            if batch == 0 {
+                assert_eq!(aliases[0], "host-30");
+            }
+            let started = app.begin_refresh_ordered(&aliases, false);
+            assert!(started.len() <= MAX_CONCURRENT_PROBES);
+            for alias in started {
+                assert!(
+                    seen.insert(alias.clone()),
+                    "scheduler repeated {alias} before inventory complete"
+                );
+                app.apply_completed_refresh_snapshot(HostSnapshot::online(
+                    alias,
+                    ProbeReport::parse("load=1"),
+                    1,
+                ));
+            }
+        }
+        assert_eq!(seen.len(), 40);
+        assert!(app.scheduled_aliases(DEFAULT_REFRESH_INTERVAL).is_empty());
+    }
+
+    #[test]
+    fn failed_hosts_back_off_but_manual_refresh_remains_available_when_paused() {
+        let mut app = ClusterApp::new(vec![test_host("host")]);
+        for seconds in [30, 60, 120, 120] {
+            app.apply_completed_refresh_snapshot(HostSnapshot::failed("host", "probe timed out"));
+            let remaining = app.next_due["host"].saturating_duration_since(Instant::now());
+            assert!(
+                remaining >= Duration::from_secs(seconds - 1)
+                    && remaining <= Duration::from_secs(seconds)
+            );
+            assert!(app.scheduled_aliases(DEFAULT_REFRESH_INTERVAL).is_empty());
+        }
+        app.apply(ClusterCommand::TogglePause);
+        assert_eq!(app.begin_refresh(&["host".into()]), vec!["host"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dashboard_probe_owner_drop_cancels_fake_ssh_and_reaps_it() {
+        const TEST: &str =
+            "cluster::tests::dashboard_probe_owner_drop_cancels_fake_ssh_and_reaps_it";
+        const MARKER: &str = "TERSH_FAKE_SSH_PID";
+        if env::var_os(MARKER).is_none() {
+            use std::os::unix::fs::PermissionsExt;
+            let temp = tempfile::tempdir().unwrap();
+            let script = temp.path().join("ssh");
+            fs::write(
+                &script,
+                "#!/bin/sh\necho $$ > \"$TERSH_FAKE_SSH_PID\"\nexec /bin/sleep 5\n",
+            )
+            .unwrap();
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+            let output = ProcessCommand::new(env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env("PATH", temp.path())
+                .env(MARKER, temp.path().join("pid"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let pid_file = PathBuf::from(env::var_os(MARKER).unwrap());
+        let (tx, _rx) = mpsc::channel();
+        let mut workers = ProbeWorkers::default();
+        workers.spawn(test_host("fake"), 1, tx);
+        let pid = wait_for_fixture_pid(&pid_file);
+        let started = Instant::now();
+        drop(workers);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+    }
+
+    #[test]
+    fn slow_jump_probe_remains_checking_until_its_budget_expires() {
+        let mut app = ClusterApp::new(vec![test_host("slow-jump")]);
+        app.begin_refresh(&["slow-jump".to_string()]);
+        // Advance the probe age without sleeping. A measured healthy jump
+        // handshake took nearly ten seconds, before metrics collection.
+        *app.refresh_deadlines.get_mut("slow-jump").unwrap() -= Duration::from_secs(10);
+        assert!(!app.mark_timed_out_refreshes());
+        assert_eq!(
+            app.snapshot_for("slow-jump").unwrap().connection,
+            ConnectionState::Checking
+        );
+        app.refresh_deadlines.insert(
+            "slow-jump".to_string(),
+            Instant::now() - Duration::from_secs(1),
+        );
+        assert!(app.mark_timed_out_refreshes());
+        assert_eq!(
+            app.snapshot_for("slow-jump").unwrap().connection,
+            ConnectionState::Timeout
+        );
+    }
+
+    #[test]
     fn begin_refresh_empty_aliases_does_not_reset_refresh_timer() {
         let mut app = ClusterApp::new(Vec::new());
 
@@ -2172,7 +3067,10 @@ mod tests {
         app.last_refresh_started = Some(Instant::now() - Duration::from_secs(120));
 
         app.mark_timed_out_refreshes();
-        assert!(app.refresh_due(Duration::from_secs(60)));
+        assert!(
+            !app.refresh_due(Duration::from_secs(60)),
+            "timeout must stay accounted until worker cleanup"
+        );
         assert!(app.begin_refresh(&aliases).is_empty());
 
         assert!(!app.refresh_due(Duration::from_secs(60)));

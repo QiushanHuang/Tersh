@@ -37,6 +37,55 @@ pub fn draw(frame: &mut Frame, app: &ClusterApp) {
     if app.mode() == ClusterMode::Help {
         draw_help(frame, centered_rect(85, 80, area), app, theme);
     }
+    if app.mode() == ClusterMode::Events {
+        let rect = centered_rect(96, 90, area);
+        let mut lines = app
+            .events()
+            .iter()
+            .rev()
+            .flat_map(|event| {
+                let age = event.at.elapsed().unwrap_or_default().as_secs();
+                wrap_display(
+                    &format!(
+                        "{age}s ago {}: {} -> {} | {}",
+                        ascii_safe(&event.alias),
+                        event.previous.label(),
+                        event.current.label(),
+                        ascii_safe(&event.message)
+                    ),
+                    rect.width.saturating_sub(2) as usize,
+                )
+            })
+            .collect::<Vec<_>>();
+        if lines.is_empty() {
+            lines.push(Line::from("No completed state changes yet"));
+        }
+        let limit = lines
+            .len()
+            .saturating_sub(rect.height.saturating_sub(2) as usize);
+        app.set_event_limit(limit);
+        frame.render_widget(Clear, rect);
+        frame.render_widget(
+            Paragraph::new(lines)
+                .scroll((
+                    app.help_offset().min(limit).min(u16::MAX as usize) as u16,
+                    0,
+                ))
+                .block(panel_block(
+                    theme,
+                    format!(
+                        "Events {} / 100 | {} close",
+                        app.events().len(),
+                        cluster_key(app, "help", "cancel")
+                    ),
+                    Tone::Active,
+                )),
+            rect,
+        );
+    }
+    if app.mode() == ClusterMode::Places {
+        draw_places(frame, area, app, theme);
+    }
     if app.mode() == ClusterMode::Filter {
         let rect = Rect::new(
             area.x,
@@ -67,6 +116,87 @@ pub fn draw(frame: &mut Frame, app: &ClusterApp) {
     }
 }
 
+fn draw_places(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
+    let rect = centered_rect(96, 88, area);
+    let mut lines = vec![Line::from(format!(
+        "Find host/path: {}",
+        crate::fs_core::escape_display(app.place_query())
+    ))];
+    lines.push(Line::from(if app.places_enabled() {
+        "Enter opens the shown host and directory"
+    } else {
+        "History disabled; configured directories remain available"
+    }));
+    let capacity = rect.height.saturating_sub(6) as usize;
+    let start = visible_start(app.place_cursor(), app.place_choices().len(), capacity);
+    for (index, place) in app
+        .place_choices()
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(capacity)
+    {
+        let line = format!(
+            "{} {} {} {} {}",
+            if index == app.place_cursor() {
+                ">"
+            } else {
+                " "
+            },
+            if place.pinned { "*" } else { " " },
+            if !place.valid {
+                "[invalid]"
+            } else if place.configured {
+                "[config]"
+            } else {
+                "[recent]"
+            },
+            place.host,
+            place.path.display()
+        );
+        lines.push(Line::from(Span::styled(
+            truncate_to_width(&ascii_safe(&line), rect.width.saturating_sub(2) as usize),
+            if index == app.place_cursor() {
+                theme.selected()
+            } else if !place.valid {
+                theme.danger()
+            } else {
+                theme.fg(theme.palette().text)
+            },
+        )));
+    }
+    if app.place_choices().is_empty() {
+        lines.push(Line::from(
+            "Set an absolute host workdir, or save a local workbench place.",
+        ));
+    }
+    if let Some(message) = app.place_message() {
+        lines.push(Line::from(Span::styled(
+            ascii_safe(message),
+            theme.fg(theme.palette().warn),
+        )));
+    }
+    lines.push(Line::from(format!(
+        "{} pin | {} remove | {} clear recent",
+        cluster_key(app, "places", "pin_place"),
+        cluster_key(app, "places", "remove_place"),
+        cluster_key(app, "places", "clear_recent")
+    )));
+    frame.render_widget(Clear, rect);
+    frame.render_widget(
+        Paragraph::new(lines).block(panel_block(
+            theme,
+            format!(
+                "Places {} | {} back",
+                app.place_choices().len(),
+                cluster_key(app, "places", "cancel")
+            ),
+            Tone::Active,
+        )),
+        rect,
+    );
+}
+
 fn draw_header(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
     let palette = theme.palette();
     if area.width < 60 {
@@ -85,7 +215,7 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
             Span::raw(" "),
             chip(
                 "FAIL",
-                app.offline_count(),
+                app.failed_count(),
                 theme.chip(palette.text, palette.danger),
             ),
             Span::raw(" "),
@@ -96,11 +226,14 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
             ),
         ]);
         frame.render_widget(
-            Paragraph::new(stats).block(
-                base_block()
-                    .borders(Borders::ALL)
-                    .title(panel_title(theme, "Tersh --c")),
-            ),
+            Paragraph::new(stats).block(base_block().borders(Borders::ALL).title(panel_title(
+                theme,
+                if app.refresh_paused() {
+                    "Tersh --c | PAUSED"
+                } else {
+                    "Tersh --c"
+                },
+            ))),
             area,
         );
         return;
@@ -129,7 +262,7 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
         Span::raw(" "),
         chip(
             "FAIL",
-            app.offline_count(),
+            app.failed_count(),
             theme.chip(palette.text, palette.danger),
         ),
         Span::raw(" "),
@@ -143,7 +276,14 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
             theme.chip(palette.text, palette.accent),
         ),
         Span::styled(" | ", theme.fg(palette.separator)),
-        Span::styled("src ", theme.fg(palette.key)),
+        Span::styled(
+            if app.refresh_paused() {
+                "PAUSED | src "
+            } else {
+                "src "
+            },
+            theme.fg(palette.key),
+        ),
         Span::styled(ascii_safe(&app.inventory_label()), theme.fg(palette.muted)),
     ])];
     let paragraph = Paragraph::new(lines).block(base_block().borders(Borders::ALL));
@@ -175,7 +315,7 @@ fn draw_hosts(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
         if area.width < 56 {
             "state  alias         probe  mem% disk%"
         } else {
-            "state  alias           role     probe  mem   disk  address"
+            "state  alias           role       probe  mem  disk  address"
         },
         theme.fg_bold(theme.palette().key),
     ))];
@@ -205,20 +345,20 @@ fn draw_hosts(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
         let row = if area.width < 56 {
             let alias_width = area.width.saturating_sub(29) as usize;
             format!(
-                "{cursor} {:<5} {:alias_width$} {:>6} {:>4} {:>4}",
+                "{cursor} {:<5} {} {:>6} {:>4} {:>4}",
                 state_short(state),
-                truncate_to_width(&ascii_safe(host.alias()), alias_width),
+                fit_column(&ascii_safe(host.alias()), alias_width),
                 truncate_to_width(&latency, 6),
                 memory,
                 storage
             )
         } else {
             format!(
-                "{cursor} {:<5} {:<15} {:<8} {:<6} {:<5} {:<5} {}",
+                "{cursor} {:<5} {} {} {:>6} {:>4} {:>4} {}",
                 state_short(state),
-                ascii_safe(host.alias()),
-                host.kind().label(),
-                latency,
+                fit_column(&ascii_safe(host.alias()), 15),
+                fit_column(&ascii_safe(host.role()), 10),
+                truncate_to_width(&latency, 6),
                 memory,
                 storage,
                 ascii_safe(host.address())
@@ -240,13 +380,18 @@ fn draw_hosts(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
         )));
     }
     let title = format!(
-        "Hosts {}/{} | {} actions | {}{}",
+        "Hosts {}/{}{} | {} actions | {}{}",
         if app.visible_count() == 0 {
             0
         } else {
             app.cursor() + 1
         },
         app.visible_count(),
+        if app.attention_only() {
+            " attention"
+        } else {
+            ""
+        },
         cluster_key(app, app.key_context(), "open_actions"),
         app.sort_label(),
         if app.filter().is_empty() {
@@ -473,6 +618,16 @@ fn draw_detail_panel(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: The
     } else {
         vec![]
     };
+    if !trends.is_empty() {
+        // Each resource's current value and trend share one row. Keep tasks/GPU
+        // and system metadata, but do not repeat load/memory/storage elsewhere.
+        lines.retain(|line| {
+            let text = line.to_string();
+            !["CPU load:", "Memory:", "Storage:"]
+                .iter()
+                .any(|label| text.starts_with(label))
+        });
+    }
     // Put observations before system/log metadata without hiding current health.
     let insert_at = lines
         .iter()
@@ -528,7 +683,17 @@ fn trend_lines(app: &ClusterApp, width: u16, theme: Theme) -> Vec<Line<'static>>
     let mut lines = vec![
         section_line(theme, "Trends"),
         Line::from(Span::styled(
-            format!("{} samples / {}s; gaps = missing", samples.len(), duration),
+            format!("{} samples / {}s; gaps=missing", samples.len(), duration),
+            theme.fg(theme.palette().muted),
+        )),
+        Line::from(Span::styled(
+            format!(
+                "Observation #{}-{}; equal spacing",
+                app.observation_count(host.alias())
+                    .saturating_sub(samples.len() as u64)
+                    .saturating_add(1),
+                app.observation_count(host.alias())
+            ),
             theme.fg(theme.palette().muted),
         )),
     ];
@@ -553,15 +718,42 @@ fn trend_lines(app: &ClusterApp, width: u16, theme: Theme) -> Vec<Line<'static>>
                 .fold(0.0_f64, f64::max)
                 .max(1.0)
         };
-        let latest = values
-            .last()
-            .copied()
-            .flatten()
+        let latest_observation = values.last().copied().flatten();
+        let retained = app.selected_snapshot().and_then(|snapshot| match metric {
+            0 => snapshot
+                .report
+                .cpu_load
+                .as_deref()?
+                .split_whitespace()
+                .next()?
+                .parse::<f64>()
+                .ok(),
+            1 => snapshot
+                .report
+                .memory
+                .as_deref()
+                .and_then(crate::metrics::memory_used)
+                .map(f64::from),
+            2 => snapshot
+                .report
+                .storage
+                .as_deref()
+                .and_then(crate::metrics::percent)
+                .map(f64::from),
+            _ => values.iter().rev().find_map(|value| *value),
+        });
+        let latest = latest_observation
+            .or(retained)
             .map(|v| {
-                if metric == 0 {
+                let value = if metric == 0 {
                     format!("{v:.2}")
                 } else {
                     format!("{v:.0}{unit}")
+                };
+                if latest_observation.is_none() {
+                    format!("{value} old")
+                } else {
+                    value
                 }
             })
             .unwrap_or_else(|| "--".into());
@@ -577,26 +769,10 @@ fn trend_lines(app: &ClusterApp, width: u16, theme: Theme) -> Vec<Line<'static>>
             Span::styled(format!(" {latest} /{scale}"), theme.fg(palette.value)),
         ]));
     }
-    if let Some(good) = history
-        .iter()
-        .rev()
-        .find(|sample| sample.values.iter().any(Option::is_some))
-    {
-        let seconds = good
-            .at
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        lines.push(Line::from(Span::styled(
-            format!(
-                "Last data {:02}:{:02}:{:02} UTC | load != CPU %",
-                seconds / 3600 % 24,
-                seconds / 60 % 60,
-                seconds % 60
-            ),
-            theme.fg(palette.muted),
-        )));
-    }
+    lines.push(Line::from(Span::styled(
+        "Load != CPU %; old = retained data",
+        theme.fg(palette.muted),
+    )));
     lines
 }
 
@@ -612,6 +788,20 @@ fn detail_lines(app: &ClusterApp, include_logs: bool, theme: Theme) -> Vec<Line<
     ])];
     if let Some(snapshot) = snapshot {
         push_snapshot_lines(&mut lines, snapshot, theme);
+        let data = app
+            .data_age(host.alias())
+            .map(|age| format!("{}s ago; age at draw", age.as_secs()))
+            .unwrap_or_else(|| "no valid observation yet".into());
+        lines.insert(2.min(lines.len()), kv_line(theme, "Data age", data));
+        if let Some(reason) = app.attention_reason(host.alias()) {
+            lines.insert(
+                3.min(lines.len()),
+                Line::from(Span::styled(
+                    format!("Attention: {reason}"),
+                    theme.fg(palette.warn),
+                )),
+            );
+        }
         if let Some(hint) = action_hint(snapshot) {
             lines.push(Line::from(Span::styled(
                 format!("Hint: {hint}"),
@@ -819,6 +1009,43 @@ fn cluster_key(app: &ClusterApp, context: &str, action: &str) -> String {
 }
 fn draw_footer(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
     let context = app.key_context();
+    if area.width < 50 && matches!(context, "cluster" | "cluster_detail") {
+        let mut pieces = vec![
+            crate::bindings::hint(
+                app.keymap(),
+                context,
+                if context == "cluster" {
+                    "quit"
+                } else {
+                    "cancel"
+                },
+                if context == "cluster" { "quit" } else { "back" },
+            )
+            .unwrap_or_default(),
+        ];
+        if app.selected_host().is_some() {
+            pieces.push(
+                crate::bindings::hint(app.keymap(), context, "open_workbench", "tersh")
+                    .unwrap_or_default(),
+            );
+        }
+        pieces.push(
+            crate::bindings::hint(app.keymap(), context, "open_actions", "actions")
+                .unwrap_or_default(),
+        );
+        pieces.push("^C".into());
+        frame.render_widget(
+            Paragraph::new(footer_rows(
+                theme,
+                &pieces.join(" | "),
+                area.width,
+                area.height.saturating_sub(1) as usize,
+            ))
+            .block(base_block().borders(Borders::TOP)),
+            area,
+        );
+        return;
+    }
     let compact = footer_compact(area.width, 64);
     let mut pieces = if area.width < 50 && context == "cluster" {
         Vec::new()
@@ -864,6 +1091,12 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
             add("submit", "apply");
             add("backspace", "erase");
         }
+        "places" => {
+            add("cancel", "back");
+            add("submit", "open");
+            add("pin_place", "pin");
+            add("remove_place", "remove");
+        }
         _ => {
             if context == "cluster" {
                 add("quit", "quit");
@@ -884,6 +1117,10 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
             add("refresh_all", "refresh");
             add("open_filter", "filter");
             add("cycle_sort", "sort");
+            add("toggle_attention", "attention");
+            add("toggle_pause", "pause");
+            add("open_events", "events");
+            add("open_places", "places");
             if app.selected_host().is_some() {
                 add("open_workbench", "tersh");
                 add("open_session", "shell/ssh");
@@ -938,7 +1175,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
 fn action_hint(snapshot: &HostSnapshot) -> Option<&'static str> {
     match snapshot.connection {
         ConnectionState::AuthFailed => Some("check SSH auth and trusted host key"),
-        ConnectionState::Timeout => Some("check VPN, jump host, and network route"),
+        ConnectionState::Timeout => Some("probe timed out; SSH may still work"),
         ConnectionState::Offline => Some("inspect the probe error and host availability"),
         ConnectionState::Stale => Some("refresh failed; showing last good metrics"),
         ConnectionState::Unknown => Some("refresh selected host"),
@@ -1053,17 +1290,57 @@ fn truncate_to_width(value: &str, width: usize) -> String {
     truncated
 }
 
-fn ascii_safe(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii() && !ch.is_control() {
-                ch
-            } else {
-                '?'
+fn fit_column(value: &str, width: usize) -> String {
+    let value = truncate_to_width(value, width);
+    let pad = width.saturating_sub(UnicodeWidthStr::width(value.as_str()));
+    format!("{value}{}", " ".repeat(pad))
+}
+
+fn wrap_display(value: &str, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    let mut used = 0;
+    for word in value.split_whitespace() {
+        if !line.is_empty() && used + 1 + UnicodeWidthStr::width(word) > width {
+            lines.push(Line::from(std::mem::take(&mut line)));
+            used = 0;
+        }
+        if !line.is_empty() {
+            line.push(' ');
+            used += 1;
+        }
+        for ch in word.chars() {
+            let cells = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if used + cells > width && !line.is_empty() {
+                lines.push(Line::from(std::mem::take(&mut line)));
+                used = 0;
             }
-        })
-        .collect()
+            line.push(ch);
+            used += cells;
+        }
+    }
+    if !line.is_empty() {
+        lines.push(Line::from(line));
+    }
+    lines
+}
+
+fn ascii_safe(value: &str) -> String {
+    if crate::theme::unicode_graphs() {
+        crate::fs_core::escape_display(value)
+    } else {
+        value
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii() && !ch.is_control() {
+                    ch
+                } else {
+                    '?'
+                }
+            })
+            .collect()
+    }
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {

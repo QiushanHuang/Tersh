@@ -1,0 +1,258 @@
+{
+  "version": "1.3.0-dev.1",
+  "source_baseline": "e25f709",
+  "status": "passed",
+  "runtime_dependencies_added": 0,
+  "native_checks": {
+    "macos_arm64": {
+      "rust_tests": 364,
+      "python_tests": 113,
+      "clippy": "passed",
+      "keyboard_pty": "passed",
+      "installed_sha256": "80224f59a92458fec17df2e56b78fed0261a565df5b37005eafe0c2ba2a2188f",
+      "binary_bytes": 1748384
+    },
+    "ubuntu_24_04_x86_64": {
+      "rust_tests": 365,
+      "python_tests": 113,
+      "clippy": "passed",
+      "keyboard_pty": "passed",
+      "file_safety_pty": "passed",
+      "installed_sha256": "5640f963c80a7b7992ae8af21987d4331df9d26de95de51ab9d8fbb2d87ef259",
+      "binary_bytes": 1942088
+    }
+  },
+  "real_ssh": {
+    "status": "passed",
+    "positive_probe": true,
+    "unicode_editing": true,
+    "direct_resize_columns": [
+      40,
+      80,
+      120
+    ],
+    "nested_resize_columns": [
+      40,
+      80,
+      120
+    ],
+    "workbench_roundtrip": true,
+    "shell_roundtrip": true,
+    "local_configuration_restored": true,
+    "remote_configuration_restored": true,
+    "controlled_shell_without_user_rc": true,
+    "darwin_transient_pendin_recorded_separately": true
+  },
+  "linux_matched_comparison": {
+    "compiler": "Rust 1.95.0",
+    "target": "x86_64-unknown-linux-gnu",
+    "profile": "opt-level=s; lto=fat",
+    "baseline": {
+      "1000_files": {
+        "runs": 30,
+        "startup_ms_p50": 10.731221176683903,
+        "startup_ms_p95": 13.293281197547913,
+        "menu_response_ms_p95": 1.2131985276937485,
+        "rss_kib_median": 4584.0,
+        "rss_kib_max_sample": 4596
+      },
+      "10000_files": {
+        "startup_ms": 50.53485184907913,
+        "menu_response_ms": 0.7783882319927216,
+        "rss_kib_sample": 11756
+      },
+      "100000_files": {
+        "startup_ms": 461.1696694046259,
+        "menu_response_ms": 1.498788595199585,
+        "rss_kib_sample": 83808
+      },
+      "idle_stability": {
+        "seconds": 10,
+        "output_bytes": 0,
+        "rss_kib_samples": [
+          4596,
+          4596
+        ],
+        "rss_delta_kib": 0,
+        "cpu_seconds_delta": 0.0,
+        "cpu_time_source": "ps time; display precision limits apply"
+      }
+    },
+    "optimized_sample": {
+      "1000_files": {
+        "runs": 30,
+        "startup_ms_p50": 27.35794149339199,
+        "startup_ms_p95": 29.222263023257256,
+        "menu_response_ms_p95": 2.1636374294757843,
+        "rss_kib_median": 4776.0,
+        "rss_kib_max_sample": 4916
+      },
+      "10000_files": {
+        "startup_ms": 51.750654354691505,
+        "menu_response_ms": 1.7313044518232346,
+        "rss_kib_sample": 10868
+      },
+      "100000_files": {
+        "startup_ms": 450.3682628273964,
+        "menu_response_ms": 1.1386852711439133,
+        "rss_kib_sample": 71320
+      },
+      "idle_stability": {
+        "seconds": 10,
+        "output_bytes": 0,
+        "rss_kib_samples": [
+          4704,
+          4704
+        ],
+        "rss_delta_kib": 0,
+        "cpu_seconds_delta": 0.0,
+        "cpu_time_source": "ps time; display precision limits apply"
+      }
+    },
+    "final_candidate": {
+      "1000_files": {
+        "runs": 30,
+        "startup_ms_p50": 27.89321169257164,
+        "startup_ms_p95": 38.30353170633316,
+        "menu_response_ms_p95": 2.141837030649185,
+        "rss_kib_median": 4782.0,
+        "rss_kib_max_sample": 4856
+      },
+      "10000_files": {
+        "startup_ms": 48.15780743956566,
+        "menu_response_ms": 1.74628384411335,
+        "rss_kib_sample": 10928
+      },
+      "100000_files": {
+        "startup_ms": 449.3326973170042,
+        "menu_response_ms": 1.597413793206215,
+        "rss_kib_sample": 71200
+      },
+      "idle_stability": {
+        "seconds": 600,
+        "output_bytes": 0,
+        "rss_kib_samples": [
+          4760,
+          4760,
+          4760,
+          4760,
+          4760,
+          4760,
+          4760,
+          4760,
+          4760,
+          4760,
+          4760,
+          4760
+        ],
+        "rss_delta_kib": 0,
+        "cpu_seconds_delta": 0.0,
+        "cpu_time_source": "ps time; display precision limits apply"
+      }
+    },
+    "baseline_binary_bytes": 1656688,
+    "final_binary_bytes": 1942088,
+    "sampled_rss_change_percent": 4.32
+  },
+  "measurement_limits": [
+    "process-cold, OS-warm cache",
+    "sampled RSS, not peak",
+    "large-directory values are single runs",
+    "CPU readings use ps display precision",
+    "controlled SSH fixtures and shell; no GUI/mobile appearance or arbitrary user rc claim"
+  ],
+  "final_installed_measurements": {
+    "macos_arm64": {
+      "binary_bytes": 1748384,
+      "scenarios": {
+        "1000_files": {
+          "runs": 30,
+          "startup_ms_p50": 28.09808349775267,
+          "startup_ms_p95": 28.801874999771826,
+          "menu_response_ms_p95": 0.8378340062336065,
+          "rss_kib_median": 4976.0,
+          "rss_kib_max_sample": 5184
+        },
+        "10000_files": {
+          "startup_ms": 49.51070799870649,
+          "menu_response_ms": 0.7594170019729063,
+          "rss_kib_sample": 11472
+        },
+        "100000_files": {
+          "startup_ms": 319.84933400235604,
+          "menu_response_ms": 0.7399999958579428,
+          "rss_kib_sample": 85184
+        },
+        "idle_stability": {
+          "seconds": 600,
+          "output_bytes": 0,
+          "rss_kib_samples": [
+            5072,
+            5072,
+            5072,
+            5072,
+            5072,
+            5072,
+            5072,
+            5072,
+            5072,
+            5072,
+            5072,
+            5072
+          ],
+          "rss_delta_kib": 0,
+          "cpu_seconds_delta": 0.04,
+          "cpu_time_source": "ps time; display precision limits apply"
+        }
+      }
+    },
+    "ubuntu_24_04_x86_64": {
+      "binary_bytes": 1942088,
+      "scenarios": {
+        "1000_files": {
+          "runs": 30,
+          "startup_ms_p50": 27.89321169257164,
+          "startup_ms_p95": 38.30353170633316,
+          "menu_response_ms_p95": 2.141837030649185,
+          "rss_kib_median": 4782.0,
+          "rss_kib_max_sample": 4856
+        },
+        "10000_files": {
+          "startup_ms": 48.15780743956566,
+          "menu_response_ms": 1.74628384411335,
+          "rss_kib_sample": 10928
+        },
+        "100000_files": {
+          "startup_ms": 449.3326973170042,
+          "menu_response_ms": 1.597413793206215,
+          "rss_kib_sample": 71200
+        },
+        "idle_stability": {
+          "seconds": 600,
+          "output_bytes": 0,
+          "rss_kib_samples": [
+            4760,
+            4760,
+            4760,
+            4760,
+            4760,
+            4760,
+            4760,
+            4760,
+            4760,
+            4760,
+            4760,
+            4760
+          ],
+          "rss_delta_kib": 0,
+          "cpu_seconds_delta": 0.0,
+          "cpu_time_source": "ps time; display precision limits apply"
+        }
+      }
+    }
+  },
+  "linux_renderer": {
+    "cases": 12,
+    "worst_p95_ms": 1.195673
+  }
+}

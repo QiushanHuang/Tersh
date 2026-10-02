@@ -170,7 +170,7 @@ fn ssh_probe_args_are_non_interactive_and_use_configured_proxy_jump() {
     );
     assert!(
         args.windows(2)
-            .any(|pair| pair == ["-o", "ConnectTimeout=3"])
+            .any(|pair| pair == ["-o", "ConnectTimeout=15"])
     );
     assert!(
         args.windows(2)
@@ -591,7 +591,7 @@ fn inventory_rejects_unknown_json_fields() {
 }
 
 #[test]
-fn inventory_trims_stored_connection_and_display_fields() {
+fn inventory_trims_labels_but_preserves_the_workdir_path() {
     let json = r#"
 {
   "servers": [
@@ -613,7 +613,7 @@ fn inventory_trims_stored_connection_and_display_fields() {
     assert_eq!(host.address(), "203.0.113.10");
     assert_eq!(host.user(), Some("ops"));
     assert_eq!(host.role(), "Remote server");
-    assert_eq!(host.workdir(), Some("/srv/app"));
+    assert_eq!(host.workdir(), Some(" /srv/app "));
     assert_eq!(host.ssh_target(), "ops@203.0.113.10");
 }
 
@@ -724,9 +724,8 @@ fn cluster_render_tiny_keeps_exit_visible() {
         .map(|cell| cell.symbol())
         .collect::<String>();
     assert!(buffer.contains("q quit"));
-    assert!(buffer.contains("? help"));
-    assert!(buffer.contains("l detail"));
-    assert!(buffer.contains("^G"));
+    assert!(buffer.contains("t tersh"));
+    assert!(buffer.contains("o actions"));
     assert!(buffer.contains("^C"));
 }
 
@@ -1198,4 +1197,33 @@ fn cluster_render_narrow_detail_mode_shows_metrics() {
     assert!(buffer.contains("Memory"));
     assert!(buffer.contains("Storage"));
     assert!(buffer.contains("Tasks"));
+}
+
+#[test]
+fn timeout_detail_does_not_claim_ssh_is_unavailable() {
+    let inventory =
+        ClusterInventory::from_json(r#"{"servers":[{"alias":"slow","campus_ip":"slow.invalid"}]}"#)
+            .unwrap();
+    let mut app = ClusterApp::new(inventory.hosts().to_vec());
+    app.apply_snapshot(HostSnapshot::failed("slow", "probe timed out after 30s"));
+    app.apply(ClusterCommand::OpenDetail);
+    let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+    terminal
+        .draw(|frame| cluster_ui::draw(frame, &app))
+        .unwrap();
+    let text = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect::<String>();
+    assert!(text.contains("SSH may still work"));
+    assert_eq!(
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('s'),
+            crossterm::event::KeyModifiers::NONE
+        )),
+        Some(ClusterCommand::OpenSession)
+    );
 }

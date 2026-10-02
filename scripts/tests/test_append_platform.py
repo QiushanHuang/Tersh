@@ -5705,9 +5705,10 @@ class AppendPlatformProjectionTests(unittest.TestCase):
             candidate = root_path / "candidate"
             candidate.mkdir()
             nested = candidate / "formal"
-            nested.mkdir()
+            # Projection capabilities must stay private under permissive umasks.
+            nested.mkdir(mode=0o700)
             staging = root_path / "staging"
-            staging.mkdir()
+            staging.mkdir(mode=0o700)
             model = host_module.AppendPlatformHostModel()
             with self.assertRaises(core.EvidenceError):
                 model.install_projection_policy(
@@ -5717,7 +5718,7 @@ class AppendPlatformProjectionTests(unittest.TestCase):
                 )
 
             formal = root_path / "formal"
-            formal.mkdir()
+            formal.mkdir(mode=0o700)
             model.install_projection_policy(
                 formal_root=formal,
                 staging_root=staging,

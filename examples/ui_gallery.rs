@@ -111,7 +111,7 @@ fn main() {
             45 + n
         ));
         let mut snapshot = if n == 18 {
-            HostSnapshot::failed("compute-a", "synthetic timeout")
+            HostSnapshot::failed("compute-a", "synthetic probe timed out")
         } else {
             HostSnapshot::online("compute-a", report, 20 + n)
         };
@@ -125,7 +125,7 @@ fn main() {
     ));
     cluster.apply_snapshot(HostSnapshot::failed(
         "archive",
-        "synthetic timeout; no connection attempted",
+        "synthetic probe timed out; no connection attempted",
     ));
     export("cluster-wide", 160, 38, out, |f| {
         tersh::cluster_ui::draw(f, &cluster)
@@ -153,5 +153,54 @@ fn main() {
     export("cluster-filtered", 100, 28, out, |f| {
         tersh::cluster_ui::draw(f, &cluster)
     });
+    cluster.apply(ClusterCommand::ClearFilter);
+    cluster.apply(ClusterCommand::ToggleAttention);
+    export("cluster-attention", 120, 30, out, |f| {
+        tersh::cluster_ui::draw(f, &cluster)
+    });
+    cluster.apply(ClusterCommand::OpenEvents);
+    export("cluster-events", 100, 28, out, |f| {
+        tersh::cluster_ui::draw(f, &cluster)
+    });
+
+    let mut files = App::new(fixture.path().into()).unwrap();
+    let mut places = tersh::places::Places::memory();
+    places
+        .visit("local", "local", &fixture.path().join("analysis"))
+        .unwrap();
+    places
+        .toggle_pin("local", "local", &fixture.path().join("results"))
+        .unwrap();
+    files.set_places(places);
+    files.handle_command(Command::OpenPlaces);
+    export("places", 100, 28, out, |f| tersh::ui::draw(f, &files));
+
+    let mut structured = App::new(fixture.path().join("config.json")).unwrap();
+    structured.handle_command(Command::ToggleStructured);
+    export("structured-json", 100, 28, out, |f| {
+        tersh::ui::draw(f, &structured)
+    });
+    let log_path = fixture.path().join("build.log");
+    fs::write(
+        &log_path,
+        (0..45)
+            .map(|n| format!("12:30:{n:02} INFO  Completed item {n}; local demo data\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+    let mut logs = App::new(log_path).unwrap();
+    logs.handle_command(Command::OpenLog);
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while logs.log_snapshot().is_none() {
+        logs.poll_readers();
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    export("log-follow", 120, 30, out, |f| tersh::ui::draw(f, &logs));
+    logs.handle_command(Command::ToggleLogPause);
+    export("log-paused-phone", 40, 18, out, |f| {
+        tersh::ui::draw(f, &logs)
+    });
+    logs.handle_command(Command::Cancel);
     println!("Offline synthetic UI cell buffers: {}", out.display());
 }

@@ -11,6 +11,7 @@ import pty
 import re
 import select
 import signal
+import shutil
 import struct
 import subprocess
 import sys
@@ -19,6 +20,9 @@ import termios
 import time
 
 BINARY = str(Path(sys.argv[1]).resolve())
+PS = shutil.which("ps")
+if PS is None:
+    raise RuntimeError("ps is required for sampled RSS; install procps or provide ps on PATH")
 
 
 class Screen:
@@ -94,6 +98,10 @@ class Session:
         env["TERSH_CLIPBOARD"] = "off"
         # Do not inherit a real user's config into the fixture.
         env["XDG_CONFIG_HOME"] = str(Path(tempdir) / "empty-config")
+        env["XDG_STATE_HOME"] = str(Path(tempdir) / "state")
+        env.pop("TERSH_PLACES_FILE", None)
+        env.pop("TERSH_HOST_ALIAS", None)
+        env.pop("TERSH_HOST_ID", None)
         self.process = subprocess.Popen([BINARY, "--ui-profile", "ssh", *map(str, args)],
                                         stdin=self.slave, stdout=self.slave, stderr=self.slave,
                                         env=env, start_new_session=True)
@@ -116,11 +124,19 @@ class Session:
         os.write(self.master, data)
         return self.read(settle) if settle else b""
 
+    def wait_for_exit(self, timeout=5):
+        # Drain final frames/restoration while waiting; finite PTY buffers can
+        # otherwise leave the child blocked in write instead of reaching exit.
+        deadline = time.monotonic() + timeout
+        while self.process.poll() is None and time.monotonic() < deadline:
+            self.read(.02)
+        assert self.process.poll() is not None, "TUI did not exit while output was drained: " + self.screen.text
+
     def close(self):
         try:
             if self.process.poll() is None:
-                self.send(b"\x03", .3)
-            self.process.wait(timeout=5)
+                self.send(b"\x03", settle=0)
+            self.wait_for_exit()
             assert self.process.returncode == 0
             assert termios.tcgetattr(self.slave) == self.original
         finally:
@@ -166,7 +182,7 @@ with tempfile.TemporaryDirectory(prefix="tersh-workflow-pty-") as tempdir:
         session.send(str(target_dir).encode()+b"\r", settle=0)
         until(lambda: target.exists() and target.stat().st_size >= 128*1024, session)
         session.send(b"\x03", .5)
-        session.process.wait(timeout=5)
+        session.wait_for_exit()
         assert not target.exists()
         results["cancel_copy"] = {"bytes_observed_before_cancel": observed,
                                   "partial_target_removed": True, "source_preserved": True,
@@ -227,7 +243,7 @@ with tempfile.TemporaryDirectory(prefix="tersh-workflow-pty-") as tempdir:
         fcntl.ioctl(session.slave, termios.TIOCSWINSZ, struct.pack("HHHH", 18, 40, 0, 0))
         os.kill(session.process.pid, signal.SIGWINCH)
         assert session.read(.2)
-        rss = int(subprocess.check_output(["/bin/ps", "-o", "rss=", "-p", str(session.process.pid)]).strip())
+        rss = int(subprocess.check_output([PS, "-o", "rss=", "-p", str(session.process.pid)]).strip())
         idle = session.read(2)
         assert not idle
         results["cluster_local"] = {"filter_clear_sort": True, "resize_40_columns": True,
@@ -237,7 +253,8 @@ with tempfile.TemporaryDirectory(prefix="tersh-workflow-pty-") as tempdir:
         session.close()
 
 receipt = {"binary_bytes": Path(BINARY).stat().st_size, "checks": results,
+           "platform": os.uname().sysname, "architecture": os.uname().machine, "python_version": sys.version.split()[0],
            "terminal_modes_restored": True,
-           "limits": "Local macOS PTY smoke checks; RSS is a point sample. No remote or Linux runtime tested."}
+           "limits": f"{os.uname().sysname} native subprocess PTY smoke checks; RSS is a point sample. These scenarios do not exercise SSH transport or other operating systems."}
 Path(sys.argv[2]).write_text(json.dumps(receipt, indent=2))
 print(json.dumps(receipt, indent=2))

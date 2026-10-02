@@ -25,6 +25,8 @@ const MODAL_CONTEXTS: &[&str] = &[
     "cluster_filter",
     "trash",
     "jobs",
+    "places",
+    "log",
 ];
 
 type Config = BTreeMap<String, BTreeMap<String, Vec<String>>>;
@@ -96,6 +98,36 @@ impl Default for Keymap {
 }
 
 impl Keymap {
+    pub fn completions(&self, context: &str, sequence: &[KeyEvent]) -> Vec<(String, String)> {
+        if sequence.is_empty() || sequence.len() >= MAX_CHORD_KEYS {
+            return Vec::new();
+        }
+        let strokes = sequence
+            .iter()
+            .map(|e| normalize(e.code, e.modifiers))
+            .collect::<Vec<_>>();
+        self.contexts
+            .get(context)
+            .into_iter()
+            .flat_map(|actions| actions.iter())
+            .flat_map(|(action, bindings)| {
+                bindings
+                    .iter()
+                    .filter(|b| b.keys.len() > strokes.len() && b.keys.starts_with(&strokes))
+                    .map(|b| {
+                        (
+                            b.keys[strokes.len()..]
+                                .iter()
+                                .map(stroke_label)
+                                .collect::<Vec<_>>()
+                                .join(" "),
+                            action.clone(),
+                        )
+                    })
+            })
+            .take(8)
+            .collect()
+    }
     /// Apply an atomic set of per-action overrides to the built-in defaults.
     pub fn from_json(json: &str) -> Result<Self> {
         if json.len() as u64 > MAX_CONFIG_BYTES {
@@ -437,6 +469,11 @@ fn default_config() -> Config {
         ("parent", &["h", "Backspace"]),
         ("open", &["Enter", "l"]),
         ("open_goto", &[":"]),
+        ("open_places", &["b"]),
+        ("pin_place", &["B"]),
+        ("toggle_inspector", &["I"]),
+        ("open_log", &["L"]),
+        ("toggle_structured", &["f"]),
         ("open_filter", &["/"]),
         ("toggle_hidden", &["."]),
         ("toggle_select", &["Space"]),
@@ -467,6 +504,8 @@ fn default_config() -> Config {
         ("open_trash", &["u"]),
     ]);
     let preview = map(&[
+        ("open_log", &["L"]),
+        ("toggle_structured", &["f"]),
         ("down", &["Down", "Ctrl+f"]),
         ("up", &["Up", "Ctrl+b"]),
         ("half_down", &["j", "PageDown", "Space"]),
@@ -525,6 +564,11 @@ fn default_config() -> Config {
         ("cycle_sort", &["v"]),
         ("reverse_sort", &["V"]),
         ("clear_filter", &["Backspace"]),
+        ("toggle_attention", &["a"]),
+        ("open_events", &["E"]),
+        ("toggle_pause", &["P"]),
+        ("open_places", &["b"]),
+        ("pin_place", &["B"]),
     ]);
     let mut detail = cluster.clone();
     detail.insert("quit".to_owned(), Vec::new());
@@ -545,6 +589,11 @@ fn default_config() -> Config {
         ("force_quit", &["Q", "Ctrl+c"]),
     ]);
     let jobs = map(&[
+        ("previous_job", &["["]),
+        ("next_job", &["]"]),
+        ("retry_job", &["r"]),
+        ("export_job", &["e"]),
+        ("toggle_job_filter", &["f"]),
         ("down", &["j", "Down"]),
         ("up", &["k", "Up"]),
         ("first", &["g g", "Home"]),
@@ -553,7 +602,37 @@ fn default_config() -> Config {
         ("cancel", &["Esc", "Ctrl+g", "q", "Enter"]),
         ("force_quit", &["Q", "Ctrl+c"]),
     ]);
+    let places = map(&[
+        ("down", &["Down", "Tab"]),
+        ("up", &["Up", "BackTab"]),
+        ("first", &["Home"]),
+        ("last", &["End"]),
+        ("submit", &["Enter"]),
+        ("cancel", &["Esc", "Ctrl+g"]),
+        ("backspace", &["Backspace"]),
+        ("pin_place", &["Ctrl+b"]),
+        ("remove_place", &["Ctrl+d"]),
+        ("clear_recent", &["Ctrl+l"]),
+        ("force_quit", &["Ctrl+c"]),
+    ]);
+    let log = map(&[
+        ("down", &["Down"]),
+        ("up", &["Up"]),
+        ("half_down", &["j", "PageDown"]),
+        ("half_up", &["k", "PageUp"]),
+        ("first", &["Home", "g g"]),
+        ("last", &["End", "G"]),
+        ("toggle_log_pause", &["Space"]),
+        ("open_preview_search", &["/"]),
+        ("preview_search_next", &["n"]),
+        ("preview_search_prev", &["N"]),
+        ("open_actions", &["o"]),
+        ("cancel", &["Esc", "Ctrl+g", "q", "Enter"]),
+        ("force_quit", &["Ctrl+c"]),
+    ]);
     [
+        ("places", places),
+        ("log", log),
         ("files", files),
         ("preview", preview),
         ("input", input.clone()),
