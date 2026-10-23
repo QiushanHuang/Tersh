@@ -9,6 +9,24 @@ use std::path::PathBuf;
     about = "Tersh is a lightweight terminal file workbench for local and SSH shell sessions."
 )]
 struct Cli {
+    #[arg(long, group = "install_patch_mode",
+        conflicts_with_all = ["cluster_status", "path", "print_cwd", "dump_keymap", "keymap", "ui_profile", "theme", "no_motion"],
+        help = "Apply local WSL connection lifecycle patches with backups; no remote access")]
+    install_patches: bool,
+
+    #[arg(long, group = "install_patch_mode",
+        conflicts_with_all = ["cluster_status", "path", "print_cwd", "dump_keymap", "keymap", "ui_profile", "theme", "no_motion"],
+        help = "Check local WSL installation patches without writing; exits nonzero if needed")]
+    check_install_patches: bool,
+
+    #[arg(
+        long,
+        value_name = "FILE",
+        requires = "install_patch_mode",
+        help = "SSH configuration to patch/check (default: ~/.ssh/config; select included files explicitly)"
+    )]
+    patch_ssh_config: Option<PathBuf>,
+
     #[arg(
         long,
         value_name = "FILE",
@@ -58,6 +76,9 @@ struct Cli {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if cli.install_patches || cli.check_install_patches {
+        return tersh::install_patches::run(cli.install_patches, cli.patch_ssh_config.as_deref());
+    }
     let keymap = load_keymap(cli.keymap.as_deref())?;
     if cli.dump_keymap {
         println!("{}", keymap.to_json()?);

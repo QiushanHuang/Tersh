@@ -99,6 +99,15 @@ The installer uses an existing Tersh location or a writable user bin directory.
 Set `TERSH_INSTALL_DIR` to choose a location. For remote file work, install Tersh
 on the remote host and run it after connecting through your SSH client.
 
+The current development installer also applies the [WSL SSH lifecycle patch](docs/wsl-ssh.md)
+to recognizable local WSL forwarding routes and an existing Tersh-only WSL SSH
+endpoint. Release archives built from this revision include `./install.sh` with
+the same hook. Cargo and manual binary copies have no post-install hook: after
+installing a build that supports this patch, run `tersh --install-patches`, and
+use `tersh --check-install-patches` to verify it. The older v1.2.0 tag does not
+contain these commands. Install on both the SSH client/gateway and the WSL host;
+the patch does not connect to or update remote devices automatically.
+
 ## Start here
 
 ```sh
@@ -133,7 +142,7 @@ Tersh uses `$VISUAL`, `$EDITOR`, then `nano` for editing. For a visual `cd`, sou
 
 ## Locations, logs and recent results (development)
 
-The current development version is `1.3.0-dev.1`. These additions are not included
+The current development version is `1.3.0-dev.2`. These additions are not included
 in the v1.2.0 tag. See the [workflow update](docs/product-evolution.md#english) for
 demo screens, default controls, limits and measured local results.
 
@@ -367,7 +376,7 @@ tersh --ui-profile ssh
 
 ### 地点、日志与最近结果（开发版）
 
-当前开发版本为 `1.3.0-dev.1`，以下新增功能不包含在 v1.2.0 标签中。[工作流程更新说明](docs/product-evolution.md#中文)介绍了演示画面、默认操作、功能边界与本地测量。
+当前开发版本为 `1.3.0-dev.2`，以下新增功能不包含在 v1.2.0 标签中。[工作流程更新说明](docs/product-evolution.md#中文)介绍了演示画面、默认操作、功能边界与本地测量。
 
 - `b` 查找最近/固定的主机目录，`B` 固定当前位置。
 - `L` 跟随当前日志，Space 暂停/继续，`/` 查找时保留阅读位置；`f` 切换原文与 JSON、CSV、diff 结构化预览。

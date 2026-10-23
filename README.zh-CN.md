@@ -75,6 +75,13 @@ cd Tersh
 ./scripts/install.sh
 ```
 
+当前开发版安装器会自动应用 [WSL SSH 连接生命周期补丁](docs/wsl-ssh.md)：
+修复可识别的本地 WSL 转发配置及已有的 Tersh 专用 WSL SSH 端点。
+从本次代码构建的发布包也提供 `./install.sh`。Cargo 安装和直接复制程序
+没有安装后钩子，安装支持补丁的新程序后须执行 `tersh --install-patches`，
+用 `tersh --check-install-patches` 检查；旧版 v1.2.0 不含这些命令。
+客户端、网关和 WSL 端分别安装，安装器不会自动连接或修改远端设备。
+
 脚本优先使用已有安装位置，否则选择可写的用户 bin 目录。
 可用 `TERSH_INSTALL_DIR` 指定位置。远程文件操作需在服务器上安装 Tersh，
 然后通过常用 SSH 客户端登录运行。
@@ -113,7 +120,7 @@ tersh --ui-profile ssh
 
 ## 地点、日志与最近结果（开发版）
 
-当前开发版本为 `1.3.0-dev.1`，以下新增功能不包含在 v1.2.0 标签中。[工作流程更新说明](docs/product-evolution.md#中文)介绍了演示画面、默认操作、功能边界与本地测量。
+当前开发版本为 `1.3.0-dev.2`，以下新增功能不包含在 v1.2.0 标签中。[工作流程更新说明](docs/product-evolution.md#中文)介绍了演示画面、默认操作、功能边界与本地测量。
 
 - `b` 查找最近/固定的主机目录，`B` 固定当前位置。
 - `L` 跟随当前日志，Space 暂停/继续，`/` 查找时保留阅读位置；`f` 切换原文与 JSON、CSV、diff 结构化预览。
