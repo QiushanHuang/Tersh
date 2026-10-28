@@ -6,6 +6,7 @@ pub mod cluster;
 pub mod cluster_ui;
 pub mod fs_core;
 pub mod fs_ops;
+pub mod hardware;
 pub mod install_patches;
 pub mod job_history;
 pub mod jobs;

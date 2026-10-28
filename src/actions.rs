@@ -128,6 +128,11 @@ pub fn metadata(id: &str) -> (&'static str, &'static str, &'static str) {
             "Review bounded host state changes",
             "event change history 事件 变化",
         ),
+        "open_hardware" => (
+            "Hosts",
+            "Inspect CPU, GPU and memory inventory and current usage",
+            "hardware cpu gpu ram memory device 硬件 设备 内存 显卡",
+        ),
         "toggle_pause" => (
             "Hosts",
             "Pause or resume automatic refresh",

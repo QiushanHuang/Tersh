@@ -555,6 +555,7 @@ fn default_config() -> Config {
         ("open_session", &["s"]),
         ("open_workbench", &["t"]),
         ("open_detail", &["l"]),
+        ("open_hardware", &["H"]),
         ("open_help", &["?"]),
         ("quit", &["q"]),
         ("force_quit", &["Q", "Ctrl+c"]),

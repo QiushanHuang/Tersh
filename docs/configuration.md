@@ -67,7 +67,7 @@ combinations; keep a simple alternative on mobile keyboards.
 | `help` | Scrollable binding help |
 | `actions` | Searchable action picker |
 | `cluster` | Host list |
-| `cluster_detail` | Expanded host detail |
+| `cluster_detail` | Expanded host detail and hardware manager |
 | `cluster_filter` | Host filter input |
 | `trash` | Recovery list |
 | `jobs` | File-job progress/results |
@@ -98,6 +98,11 @@ selected remote host, and `workdir` controls where that workbench starts.
 
 Filters affect visible hosts only. `r` refreshes the configured inventory;
 automatic probing remains capped and rotated. No history is written to disk.
+
+Press `H` for the [hardware manager](hardware-manager.md). The `open_hardware`
+action is available in `cluster` and `cluster_detail`; override both contexts
+to use the same custom shortcut in the host list, detail and hardware views.
+Hardware readings use the same inventory, refresh, pause and SSH trust settings.
 
 ## File-operation boundaries
 

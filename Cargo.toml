@@ -1,6 +1,6 @@
 [package]
 name = "tersh"
-version = "1.3.0-dev.2"
+version = "1.3.0"
 edition = "2024"
 rust-version = "1.88"
 description = "A lightweight terminal file workbench for local and SSH shell sessions."

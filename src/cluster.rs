@@ -47,36 +47,7 @@ pub struct HostEvent {
     pub message: String,
 }
 
-const PROBE_SCRIPT: &str = r#"
-PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/local/cuda/bin:$PATH"
-export PATH
-printf 'hostname=%s\n' "$(hostname 2>/dev/null || echo unknown)"
-printf 'system=%s\n' "$(uname -srm 2>/dev/null || uname -a 2>/dev/null || echo unknown)"
-printf 'uptime=%s\n' "$(uptime 2>/dev/null | sed 's/^ *//')"
-if [ -r /proc/loadavg ]; then
-  awk '{printf "load=%s %s %s\n", $1, $2, $3}' /proc/loadavg
-else
-  printf 'load=%s\n' "$(sysctl -n vm.loadavg 2>/dev/null | tr -d '{}')"
-fi
-if command -v free >/dev/null 2>&1; then
-  free -m | awk '/^Mem:/ {printf "memory=%s/%s MB (%d%%)\n", $3, $2, ($3 * 100) / $2}'
-elif command -v memory_pressure >/dev/null 2>&1; then
-  memory_pressure 2>/dev/null | awk '/System-wide memory free percentage/ {printf "memory=%s free\n", $5}'
-else
-  printf 'memory=unknown\n'
-fi
-df -hP / 2>/dev/null | awk 'NR==2 {printf "storage=%s/%s %s used\n", $3, $2, $5}'
-if command -v ps >/dev/null 2>&1; then
-  printf 'tasks=%s processes\n' "$(ps -e 2>/dev/null | wc -l | tr -d ' ')"
-else
-  printf 'tasks=unknown\n'
-fi
-if command -v nvidia-smi >/dev/null 2>&1; then
-  printf 'gpu=%s\n' "$(nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null | paste -sd ';' -)"
-else
-  printf 'gpu=none\n'
-fi
-"#;
+const PROBE_SCRIPT: &str = include_str!("hardware_probe.sh");
 
 const PATH_BOOTSTRAP_SCRIPT: &str = r#"PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/local/cuda/bin:$PATH"; export PATH"#;
 
@@ -327,6 +298,7 @@ struct ServerRecord {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProbeReport {
+    pub hardware: crate::hardware::HardwareInfo,
     pub hostname: Option<String>,
     pub system: Option<String>,
     pub uptime: Option<String>,
@@ -339,7 +311,10 @@ pub struct ProbeReport {
 
 impl ProbeReport {
     pub fn parse(output: &str) -> Self {
-        let mut report = Self::default();
+        let mut report = Self {
+            hardware: crate::hardware::HardwareInfo::parse(output),
+            ..Self::default()
+        };
         for line in output.lines() {
             let Some((key, value)) = line.split_once('=') else {
                 continue;
@@ -372,6 +347,7 @@ impl ProbeReport {
             && self.storage.is_none()
             && self.tasks.is_none()
             && self.gpu.is_none()
+            && self.hardware.is_empty()
     }
 }
 
@@ -541,6 +517,7 @@ impl HostSnapshot {
 pub enum ClusterMode {
     Normal,
     Detail,
+    Hardware,
     Help,
     Filter,
     Events,
@@ -558,6 +535,7 @@ pub enum ClusterCommand {
     OpenSession,
     OpenWorkbench,
     OpenDetail,
+    OpenHardware,
     OpenHelp,
     Cancel,
     Quit,
@@ -585,7 +563,7 @@ macro_rules! cluster_actions {
     }
 }
 cluster_actions! { Down=>"down",Up=>"up",First=>"first",Last=>"last",RefreshAll=>"refresh_all",RefreshSelected=>"refresh_selected",
-OpenSession=>"open_session",OpenWorkbench=>"open_workbench",OpenDetail=>"open_detail",OpenHelp=>"open_help",Cancel=>"cancel",
+OpenSession=>"open_session",OpenWorkbench=>"open_workbench",OpenDetail=>"open_detail",OpenHardware=>"open_hardware",OpenHelp=>"open_help",Cancel=>"cancel",
 Quit=>"quit",ForceQuit=>"force_quit",DetailDown=>"detail_down",DetailUp=>"detail_up",OpenFilter=>"open_filter",ClearFilter=>"clear_filter",
 CycleSort=>"cycle_sort",ReverseSort=>"reverse_sort",OpenActions=>"open_actions",
 ToggleAttention=>"toggle_attention",OpenEvents=>"open_events",TogglePause=>"toggle_pause",
@@ -648,6 +626,7 @@ pub struct ClusterApp {
     history: BTreeMap<String, VecDeque<crate::metrics::MetricSample>>,
     detail_offset: u16,
     detail_limit: std::cell::Cell<u16>,
+    hardware_page_step: std::cell::Cell<u16>,
     animation_frame: u64,
     hosts: Vec<HostConfig>,
     visible: Vec<usize>,
@@ -723,6 +702,7 @@ impl ClusterApp {
             history: BTreeMap::new(),
             detail_offset: 0,
             detail_limit: std::cell::Cell::new(0),
+            hardware_page_step: std::cell::Cell::new(1),
             animation_frame: 0,
             snapshots,
             last_good_reports: BTreeMap::new(),
@@ -765,6 +745,11 @@ impl ClusterApp {
     }
 
     pub fn apply(&mut self, command: ClusterCommand) {
+        let detail_step = if self.mode == ClusterMode::Hardware {
+            self.hardware_page_step.get()
+        } else {
+            5
+        };
         if matches!(self.mode, ClusterMode::Help | ClusterMode::Events) {
             let max_offset = if self.mode == ClusterMode::Events {
                 self.event_limit.get()
@@ -842,16 +827,28 @@ impl ClusterApp {
             ClusterCommand::DetailDown => {
                 self.detail_offset = self
                     .detail_offset()
-                    .saturating_add(5)
+                    .saturating_add(detail_step)
                     .min(self.detail_limit.get())
             }
-            ClusterCommand::DetailUp => self.detail_offset = self.detail_offset().saturating_sub(5),
+            ClusterCommand::DetailUp => {
+                self.detail_offset = self.detail_offset().saturating_sub(detail_step)
+            }
             ClusterCommand::Down => self.move_cursor(1),
             ClusterCommand::Up => self.move_cursor(-1),
-            ClusterCommand::First => self.cursor = 0,
-            ClusterCommand::Last => self.cursor = self.visible.len().saturating_sub(1),
+            ClusterCommand::First => {
+                self.cursor = 0;
+                self.detail_offset = 0;
+            }
+            ClusterCommand::Last => {
+                self.cursor = self.visible.len().saturating_sub(1);
+                self.detail_offset = 0;
+            }
             ClusterCommand::OpenDetail => {
                 self.mode = ClusterMode::Detail;
+                self.detail_offset = 0;
+            }
+            ClusterCommand::OpenHardware => {
+                self.mode = ClusterMode::Hardware;
                 self.detail_offset = 0;
             }
             ClusterCommand::OpenHelp => {
@@ -881,6 +878,7 @@ impl ClusterApp {
                     self.mode,
                     ClusterMode::Help
                         | ClusterMode::Detail
+                        | ClusterMode::Hardware
                         | ClusterMode::Events
                         | ClusterMode::Places
                 ) {
@@ -1174,7 +1172,7 @@ impl ClusterApp {
         }
         match self.mode {
             ClusterMode::Normal => "cluster",
-            ClusterMode::Detail => "cluster_detail",
+            ClusterMode::Detail | ClusterMode::Hardware => "cluster_detail",
             ClusterMode::Help | ClusterMode::Events => "help",
             ClusterMode::Filter => "cluster_filter",
             ClusterMode::Places => "places",
@@ -1198,6 +1196,7 @@ impl ClusterApp {
             Action::new("Open Tersh workbench", "t", ClusterCommand::OpenWorkbench),
             Action::new("Open shell / SSH", "s", ClusterCommand::OpenSession),
             Action::new("Host detail and trends", "l", ClusterCommand::OpenDetail),
+            Action::new("Hardware manager", "H", ClusterCommand::OpenHardware),
             Action::new("Filter hosts", "/", ClusterCommand::OpenFilter),
             Action::new(
                 "Clear host filter",
@@ -1230,7 +1229,7 @@ impl ClusterApp {
             ),
             Action::new("Help", "?", ClusterCommand::OpenHelp),
         ];
-        if self.mode == ClusterMode::Detail {
+        if matches!(self.mode, ClusterMode::Detail | ClusterMode::Hardware) {
             actions.extend([
                 Action::new("Scroll detail down", "PgDn", ClusterCommand::DetailDown),
                 Action::new("Scroll detail up", "PgUp", ClusterCommand::DetailUp),
@@ -1245,6 +1244,7 @@ impl ClusterApp {
                         | ClusterCommand::OpenSession
                         | ClusterCommand::OpenWorkbench
                         | ClusterCommand::OpenDetail
+                        | ClusterCommand::OpenHardware
                 )
             });
         }
@@ -1492,6 +1492,9 @@ impl ClusterApp {
     }
     pub fn set_detail_limit(&self, limit: u16) {
         self.detail_limit.set(limit);
+    }
+    pub fn set_hardware_viewport(&self, rows: u16) {
+        self.hardware_page_step.set(rows.saturating_sub(1).max(1));
     }
     pub fn activity_symbol(&self) -> char {
         ['|', '/', '-', '\\'][(self.animation_frame % 4) as usize]
