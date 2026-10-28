@@ -1,11 +1,10 @@
 # Changelog
 
-## Unreleased
+## v1.3.0 - 2026-10-28
 
-The development source reports `1.3.0-dev.1`; no new tag or release is implied.
-These additions are not in the v1.2.0 tag. See the
-[workflow update](docs/product-evolution.md#english) for controls, limits and
-local measurements.
+- Add an `H` hardware manager to `tersh --c`, with CPU inventory and interval usage, RAM capacity/occupancy, per-GPU utilization/VRAM/temperature, explicit stale and unknown readings, and responsive device navigation. Collect through existing bounded probes on macOS and Linux, including available WSL NVIDIA counters.
+
+This release includes the hardware manager and the workflow improvements developed after v1.2.0. See the [release notes](docs/releases/v1.3.0.md), [hardware guide](docs/hardware-manager.md) and [workflow update](docs/product-evolution.md#english).
 
 - Keep directory, preview verification, recovery listing and on-demand log reads off the interactive thread with bounded workers and stale-result rejection.
 - Preserve navigation focus and failed path input; add scoped recent/pinned places with bounded private state and opt-out.
@@ -20,6 +19,8 @@ local measurements.
 - Use size optimization and fat LTO for release-profile builds. The measured macOS candidate is 5.6% smaller; small-directory startup is about 20 ms slower than the baseline.
 
 - Allow slow jump-host connections 15 seconds to connect and 30 seconds for cluster probes; clarify that a probe timeout does not prove SSH is unavailable.
+
+- Apply the reviewed WSL SSH lifecycle protection during installation, with backups, bounded relay/heartbeat behavior and a read-only `--check-install-patches` command. Include `install.sh` in release archives.
 
 - Stabilize the Python CI process-readiness fixture with atomic PID publication; no runtime behavior changes.
 

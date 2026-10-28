@@ -84,7 +84,7 @@ Download a binary for your platform from [Releases](https://github.com/QiushanHu
 or build from source with **Rust 1.88 or newer**:
 
 ```sh
-cargo install --locked --git https://github.com/QiushanHuang/Tersh.git --tag v1.2.0 --bin tersh
+cargo install --locked --git https://github.com/QiushanHuang/Tersh.git --tag v1.3.0 --bin tersh
 ```
 
 To update an existing Cargo installation, add `--force`. For a local checkout:
@@ -99,7 +99,7 @@ The installer uses an existing Tersh location or a writable user bin directory.
 Set `TERSH_INSTALL_DIR` to choose a location. For remote file work, install Tersh
 on the remote host and run it after connecting through your SSH client.
 
-The current development installer also applies the [WSL SSH lifecycle patch](docs/wsl-ssh.md)
+The v1.3.0 installer also applies the [WSL SSH lifecycle patch](docs/wsl-ssh.md)
 to recognizable local WSL forwarding routes and an existing Tersh-only WSL SSH
 endpoint. Release archives built from this revision include `./install.sh` with
 the same hook. Cargo and manual binary copies have no post-install hook: after
@@ -140,10 +140,9 @@ menus, help and footer hints.
 Tersh uses `$VISUAL`, `$EDITOR`, then `nano` for editing. For a visual `cd`, source
 [scripts/tersh-cd.sh](scripts/tersh-cd.sh) in your shell and use `tersh-cd`.
 
-## Locations, logs and recent results (development)
+## Locations, logs and recent results
 
-The current development version is `1.3.0-dev.2`. These additions are not included
-in the v1.2.0 tag. See the [workflow update](docs/product-evolution.md#english) for
+These workflows are included in `v1.3.0` alongside the hardware manager. See the [workflow update](docs/product-evolution.md#english) for
 demo screens, default controls, limits and measured local results.
 
 - `b` finds recent/pinned host directories; `B` pins the current location.
@@ -195,6 +194,7 @@ non-interactive SSH with already trusted host keys and existing credentials.
 | Cycle sort / reverse | `v` · `V` |
 | Refresh all / refresh selected | `r` · Enter |
 | Expand detail / scroll detail | `l` · PageUp/PageDown |
+| Hardware manager: CPU, GPU and RAM | `H` |
 | Open shell or SSH / open Tersh | `s` · `t` |
 
 Use filtering and sorting to find the hosts you care about while health checks
@@ -204,6 +204,10 @@ its file workbench, and return to the dashboard when you finish.
 See the latest 60 observations for each host to follow changes in load, memory,
 storage and probe duration. Graphs show the elapsed span and gaps for missing
 data, reusing existing probe results to keep monitoring lightweight.
+
+Press `H` for CPU inventory and current usage, RAM capacity/occupancy, and each
+GPU's utilization, VRAM and available temperature readings. See the
+[hardware manager](docs/hardware-manager.md) for controls and platform limits.
 
 ## Make it yours
 
@@ -245,7 +249,7 @@ python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 ```
 
 [Contributing](CONTRIBUTING.md) · [Changelog](CHANGELOG.md) ·
-[v1.2.0 release notes](docs/releases/v1.2.0.md)
+[v1.3.0 release notes](docs/releases/v1.3.0.md)
 
 Maintained by [QiushanHuang](https://github.com/QiushanHuang).
 See [contributors and attribution](CONTRIBUTORS.md). Tersh is licensed under the
@@ -327,7 +331,7 @@ Tersh 把“选主机 → 检查文件 → 执行操作 → 查看结果与恢�
 或使用 **Rust 1.88 及以上版本**从源码安装：
 
 ```sh
-cargo install --locked --git https://github.com/QiushanHuang/Tersh.git --tag v1.2.0 --bin tersh
+cargo install --locked --git https://github.com/QiushanHuang/Tersh.git --tag v1.3.0 --bin tersh
 ```
 
 更新已有 Cargo 安装时加 `--force`。也可以克隆后运行安装脚本：
@@ -374,9 +378,9 @@ tersh --ui-profile ssh
 需要可视化 `cd` 时，在 shell 中加载 [tersh-cd.sh](scripts/tersh-cd.sh)，
 然后使用 `tersh-cd`。
 
-### 地点、日志与最近结果（开发版）
+### 地点、日志与最近结果
 
-当前开发版本为 `1.3.0-dev.2`，以下新增功能不包含在 v1.2.0 标签中。[工作流程更新说明](docs/product-evolution.md#中文)介绍了演示画面、默认操作、功能边界与本地测量。
+以下工作流程与硬件管理器一同包含在 `v1.3.0` 中。[工作流程更新说明](docs/product-evolution.md#中文)介绍了演示画面、默认操作、功能边界与本地测量。
 
 - `b` 查找最近/固定的主机目录，`B` 固定当前位置。
 - `L` 跟随当前日志，Space 暂停/继续，`/` 查找时保留阅读位置；`f` 切换原文与 JSON、CSV、diff 结构化预览。
@@ -417,6 +421,7 @@ tersh --c --cluster-config examples/servers.json
 | 切换排序 / 反转 | `v` · `V` |
 | 刷新全部 / 刷新选中主机 | `r` · Enter |
 | 展开详情 / 滚动详情 | `l` · PageUp/PageDown |
+| 硬件管理器：CPU、GPU、内存 | `H` |
 | 打开 shell/SSH / 打开远端 Tersh | `s` · `t` |
 
 用筛选和排序快速找到关注的主机，完整清单的健康检查会继续进行。
@@ -424,6 +429,10 @@ tersh --c --cluster-config examples/servers.json
 
 每台主机展示最近 60 次观测，帮助你快速了解负载、内存、磁盘和探测耗时的变化。
 图中标明时间跨度，并用缺口区分缺失数据；趋势直接使用已有探测结果，保持轻量。
+
+按 `H` 查看 CPU 型号与使用率、内存容量与占用，以及每块 GPU 的利用率、显存和
+可用温度读数。`j`/`k` 切换设备，PageUp/PageDown 滚动，Enter 刷新，`q` 返回。
+采集范围与统计口径见[硬件管理器说明](docs/hardware-manager.md)。
 
 ### 配色与键位
 
@@ -463,7 +472,7 @@ python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 ```
 
 [贡献指南](CONTRIBUTING.md) · [更新记录](CHANGELOG.md) ·
-[v1.2.0 说明](docs/releases/v1.2.0.md)
+[v1.3.0 说明](docs/releases/v1.3.0.md)
 
 维护者：[QiushanHuang](https://github.com/QiushanHuang)。
 贡献署名见 [CONTRIBUTORS.md](CONTRIBUTORS.md)。采用 [MIT 许可](LICENSE)。

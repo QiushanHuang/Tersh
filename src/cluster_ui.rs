@@ -27,7 +27,9 @@ pub fn draw(frame: &mut Frame, app: &ClusterApp) {
         .split(area);
 
     draw_header(frame, rows[0], app, theme);
-    if app.mode() == ClusterMode::Detail {
+    if app.mode() == ClusterMode::Hardware {
+        draw_hardware(frame, rows[1], app, theme);
+    } else if app.mode() == ClusterMode::Detail {
         draw_dashboard(frame, rows[1], app, theme, true);
     } else {
         draw_body(frame, rows[1], app, theme);
@@ -308,6 +310,257 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
     } else {
         draw_hosts(frame, area, app, theme);
     }
+}
+
+fn hardware_usage(theme: Theme, label: &str, value: Option<u16>) -> Line<'static> {
+    let mut spans = vec![Span::styled(
+        format!("{label}: "),
+        theme.fg(theme.palette().key),
+    )];
+    spans.extend(resource_bar(theme, value, 10));
+    spans.push(Span::raw(
+        value
+            .map(|v| format!(" {v}%"))
+            .unwrap_or_else(|| " unknown".into()),
+    ));
+    Line::from(spans)
+}
+
+fn draw_hardware(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
+    use crate::hardware::bytes_label;
+    let content = if area.width >= 100 {
+        let columns = Layout::horizontal([Constraint::Length(37), Constraint::Min(1)]).split(area);
+        let capacity = columns[0].height.saturating_sub(4) as usize;
+        let start = visible_start(app.cursor(), app.visible_count(), capacity);
+        let mut hosts = vec![
+            Line::from(format!(
+                "  {:<3} {} {:>4} {:>4} {:>4}",
+                "St",
+                fit_column("Device", 11),
+                "CPU",
+                "GPU",
+                "RAM"
+            )),
+            Line::from(Span::styled(
+                "  GPU = highest device usage",
+                theme.fg(theme.palette().muted),
+            )),
+        ];
+        for (index, host) in app.visible_hosts().enumerate().skip(start).take(capacity) {
+            let snapshot = app.snapshot_for(host.alias());
+            let hardware = snapshot.map(|s| &s.report.hardware);
+            let state = snapshot
+                .map(|s| s.connection)
+                .unwrap_or(ConnectionState::Unknown);
+            let status = match state {
+                ConnectionState::Online => "OK",
+                ConnectionState::Stale => "OLD",
+                ConnectionState::Checking => "CHK",
+                ConnectionState::Unknown => "--",
+                _ => "ERR",
+            };
+            let percent = |value: Option<u16>| {
+                value
+                    .map(|v| format!("{v}%"))
+                    .unwrap_or_else(|| "--".into())
+            };
+            let text = format!(
+                "{} {:<3} {} {:>4} {:>4} {:>4}",
+                if index == app.cursor() { ">" } else { " " },
+                status,
+                fit_column(&ascii_safe(host.alias()), 11),
+                percent(hardware.and_then(|h| h.cpu_usage_percent)),
+                percent(hardware.and_then(|h| h.gpus.iter().filter_map(|g| g.usage_percent).max())),
+                percent(hardware.and_then(|h| h.memory_percent())),
+            );
+            hosts.push(Line::from(Span::styled(
+                text,
+                if index == app.cursor() {
+                    theme.selected()
+                } else {
+                    state_style(theme, state)
+                },
+            )));
+        }
+        frame.render_widget(
+            Paragraph::new(hosts).block(panel_block(
+                theme,
+                format!(
+                    "Devices | {}/{} select",
+                    cluster_key(app, "cluster_detail", "down"),
+                    cluster_key(app, "cluster_detail", "up")
+                ),
+                Tone::Inactive,
+            )),
+            columns[0],
+        );
+        columns[1]
+    } else {
+        area
+    };
+    let mut lines = Vec::new();
+    if let Some(host) = app.selected_host() {
+        let snapshot = app.selected_snapshot();
+        let state = snapshot
+            .map(|s| s.connection)
+            .unwrap_or(ConnectionState::Unknown);
+        lines.push(Line::from(vec![
+            Span::styled(
+                ascii_safe(host.alias()),
+                theme.fg_bold(theme.palette().path),
+            ),
+            Span::styled(format!(" | {}", state.label()), state_style(theme, state)),
+        ]));
+        lines.push(kv_line(
+            theme,
+            "Last good",
+            app.data_age(host.alias())
+                .map(|age| {
+                    format!(
+                        "{}s ago{}",
+                        age.as_secs(),
+                        if state == ConnectionState::Online {
+                            ""
+                        } else {
+                            "; retained reading"
+                        }
+                    )
+                })
+                .unwrap_or_else(|| "no completed observation".into()),
+        ));
+        if let Some(error) = snapshot.and_then(|s| s.error.as_deref()) {
+            lines.push(kv_line(theme, "Error", ascii_safe(error)));
+        }
+        let empty = crate::cluster::ProbeReport::default();
+        let report = snapshot.map(|s| &s.report).unwrap_or(&empty);
+        let hardware = &report.hardware;
+        let text = |value: Option<&str>| ascii_safe(value.unwrap_or("unknown"));
+        lines.push(kv_line(theme, "Machine", text(hardware.model.as_deref())));
+        lines.push(kv_line(theme, "System", text(report.system.as_deref())));
+        lines.push(kv_line(
+            theme,
+            "Architecture",
+            text(hardware.architecture.as_deref()),
+        ));
+        lines.push(section_line(theme, "CPU"));
+        lines.push(kv_line(theme, "Model", text(hardware.cpu_model.as_deref())));
+        lines.push(kv_line(
+            theme,
+            "Topology",
+            format!(
+                "{} cores / {} threads",
+                hardware
+                    .cpu_cores
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "unknown".into()),
+                hardware
+                    .cpu_threads
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "unknown".into())
+            ),
+        ));
+        lines.push(hardware_usage(theme, "CPU use", hardware.cpu_usage_percent));
+        lines.push(kv_line(
+            theme,
+            "Load 1/5/15m",
+            text(report.cpu_load.as_deref()),
+        ));
+        lines.push(section_line(theme, "Memory"));
+        lines.push(kv_line(
+            theme,
+            "RAM used/total",
+            format!(
+                "{} / {}",
+                bytes_label(hardware.memory_used_bytes),
+                bytes_label(hardware.memory_total_bytes)
+            ),
+        ));
+        lines.push(hardware_usage(theme, "RAM use", hardware.memory_percent()));
+        lines.push(kv_line(
+            theme,
+            "Basis",
+            text(hardware.memory_basis.as_deref()),
+        ));
+        lines.push(section_line(theme, "GPU"));
+        if hardware.gpus.is_empty() {
+            lines.push(kv_line(theme, "GPU", "unknown; no supported driver data"));
+            if let Some(reason) = hardware.gpu_status.as_deref() {
+                lines.push(kv_line(theme, "Reason", ascii_safe(reason)));
+            }
+        }
+        for gpu in &hardware.gpus {
+            lines.push(Line::from(Span::styled(
+                format!("GPU {}: {}", ascii_safe(&gpu.id), ascii_safe(&gpu.name)),
+                theme.fg_bold(theme.palette().accent),
+            )));
+            lines.push(hardware_usage(theme, "GPU use", gpu.usage_percent));
+            if gpu.shared_memory {
+                lines.push(kv_line(
+                    theme,
+                    "Shared RAM",
+                    format!(
+                        "{} in use (driver); shared with CPU",
+                        bytes_label(gpu.memory_used_bytes)
+                    ),
+                ));
+            } else {
+                lines.push(kv_line(
+                    theme,
+                    "VRAM used/total",
+                    format!(
+                        "{} / {}",
+                        bytes_label(gpu.memory_used_bytes),
+                        bytes_label(gpu.memory_total_bytes)
+                    ),
+                ));
+            }
+            lines.push(kv_line(
+                theme,
+                "Temperature",
+                gpu.temperature_c
+                    .map(|v| format!("{v} C"))
+                    .unwrap_or_else(|| "unknown".into()),
+            ));
+        }
+        lines.push(section_line(theme, "Storage / uptime"));
+        lines.push(kv_line(theme, "Root disk", text(report.storage.as_deref())));
+        lines.push(kv_line(theme, "Uptime", text(report.uptime.as_deref())));
+    } else {
+        lines.push(Line::from("No matching device; clear the host filter"));
+    }
+    // Wrap before computing the scroll limit so long names/diagnostics remain
+    // reachable even at 40 columns. Preserve styled rows when no wrap is needed.
+    let width = content.width.saturating_sub(2).max(1) as usize;
+    let lines = lines
+        .into_iter()
+        .flat_map(|line| {
+            if line.width() <= width {
+                vec![line]
+            } else {
+                wrap_display(&line.to_string(), width)
+            }
+        })
+        .collect::<Vec<_>>();
+    let limit = lines
+        .len()
+        .saturating_sub(content.height.saturating_sub(2) as usize)
+        .min(u16::MAX as usize) as u16;
+    app.set_detail_limit(limit);
+    app.set_hardware_viewport(content.height.saturating_sub(2));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .scroll((app.detail_offset().min(limit), 0))
+            .block(panel_block(
+                theme,
+                format!(
+                    "Hardware | {}/{} scroll",
+                    cluster_key(app, "cluster_detail", "detail_up"),
+                    cluster_key(app, "cluster_detail", "detail_down")
+                ),
+                Tone::Active,
+            )),
+        content,
+    );
 }
 
 fn draw_hosts(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
@@ -1009,6 +1262,37 @@ fn cluster_key(app: &ClusterApp, context: &str, action: &str) -> String {
 }
 fn draw_footer(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
     let context = app.key_context();
+    if app.mode() == ClusterMode::Hardware && app.actions().is_none() {
+        let mut pieces = vec![
+            format!("{} back", cluster_key(app, context, "cancel")),
+            format!("{} scroll", cluster_key(app, context, "detail_down")),
+            format!("{} device", cluster_key(app, context, "down")),
+            "^C".into(),
+        ];
+        if area.width >= 80 || area.height >= 3 {
+            for (action, label) in [
+                ("refresh_selected", "refresh"),
+                ("toggle_pause", "pause"),
+                ("open_actions", "actions"),
+                ("open_detail", "detail"),
+            ] {
+                if let Some(hint) = crate::bindings::hint(app.keymap(), context, action, label) {
+                    pieces.push(hint);
+                }
+            }
+        }
+        frame.render_widget(
+            Paragraph::new(footer_rows(
+                theme,
+                &pieces.join(" | "),
+                area.width,
+                area.height.saturating_sub(1) as usize,
+            ))
+            .block(base_block().borders(Borders::TOP)),
+            area,
+        );
+        return;
+    }
     if area.width < 50 && matches!(context, "cluster" | "cluster_detail") {
         let mut pieces = vec![
             crate::bindings::hint(
@@ -1112,6 +1396,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
                 add("clear_filter", "clear filter");
             }
             if app.selected_host().is_some() {
+                add("open_hardware", "hardware");
                 add("open_detail", "detail");
             }
             add("refresh_all", "refresh");

@@ -8,8 +8,7 @@ Choose a host, return to a working directory, inspect its output, then handle th
 result of a file operation. These changes make that everyday Tersh workflow
 easier to continue without re-entering paths or losing your place.
 
-This guide describes **development version `1.3.0-dev.1`**. These additions are
-**not included in the v1.2.0 tag** and do not constitute a new tagged release.
+These workflows are included in **v1.3.0**, alongside the [hardware manager](hardware-manager.md). The measurements below are historical development-version checks; see the [v1.3.0 release notes](releases/v1.3.0.md) for the release scope and validation.
 
 ## Try the new controls
 
@@ -136,7 +135,7 @@ usability acceptance.
 | Real SSH workflow validation | Passed over an existing jump route: Unicode input/editing, direct and nested 40/80/120-column resize, `--c → t/s → dashboard`, positive host probe, and local/remote terminal configuration restoration. |
 <!-- publication-validation-en:end -->
 
-Check out the development PR branch before building these additions. To check it locally:
+Check out `v1.3.0` or a newer source revision to build these additions. To check it locally:
 
 ```sh
 cargo test --locked --all-targets
@@ -157,7 +156,7 @@ are synthetic fixtures.
 
 选一台主机，回到工作目录，查看输出，再处理文件操作的结果。这次更新让这些日常步骤更容易接着做，减少重复输入路径和重新寻找位置。
 
-本文介绍**开发版本 `1.3.0-dev.1`**。这些新增功能**不包含在 v1.2.0 标签中**，也不代表已经发布新的正式版本。
+这些工作流程与[硬件管理器](hardware-manager.md)一同包含在 **v1.3.0** 中。下文保留开发版的历史测量；本次发布范围与验证见 [v1.3.0 更新说明](releases/v1.3.0.md)。
 
 ## 新的常用操作
 

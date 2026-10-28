@@ -143,6 +143,34 @@ fn main() {
     export("cluster-detail-phone", 40, 24, out, |f| {
         tersh::cluster_ui::draw(f, &cluster)
     });
+    let mut hardware = ClusterApp::new(cluster.hosts().to_vec());
+    hardware.apply_snapshot(HostSnapshot::online("compute-a", ProbeReport::parse(
+        "hostname=compute-a\nsystem=Linux x86_64\nhardware_model=Demo workstation\narchitecture=x86_64\n\
+        cpu_model=Example 32-core CPU\ncpu_cores=32\ncpu_threads=64\ncpu_usage=55\nload=6.25 5.10 4.80\n\
+        memory_total_bytes=137438953472\nmemory_used_bytes=68719476736\n\
+        memory_basis=Linux MemTotal - MemAvailable (reclaimable cache excluded)\n\
+        hardware_gpu=0|NVIDIA GPU A|72|6442450944|25769803776|58|dedicated\n\
+        hardware_gpu=1|NVIDIA GPU B|18|10737418240|25769803776|40|dedicated\n\
+        storage=128G/1T 13% used\nuptime=up 8 days\n"
+    ), 1200));
+    hardware.apply_snapshot(HostSnapshot::online("compute-b", ProbeReport::parse(
+        "cpu_usage=15\nmemory_total_bytes=68719476736\nmemory_used_bytes=17179869184\nhardware_gpu=0|Apple Demo|22|2147483648|||shared\n"
+    ), 1500));
+    hardware.apply_snapshot(HostSnapshot::failed(
+        "compute-b",
+        "synthetic timeout; retaining readings",
+    ));
+    hardware.apply(ClusterCommand::OpenHardware);
+    export("hardware-wide", 130, 38, out, |f| {
+        tersh::cluster_ui::draw(f, &hardware)
+    });
+    export("hardware-phone", 40, 24, out, |f| {
+        tersh::cluster_ui::draw(f, &hardware)
+    });
+    hardware.apply(ClusterCommand::DetailDown);
+    export("hardware-phone-gpus", 40, 24, out, |f| {
+        tersh::cluster_ui::draw(f, &hardware)
+    });
     cluster.apply(ClusterCommand::Cancel);
     cluster.apply(ClusterCommand::OpenFilter);
     for ch in "compute".chars() {
