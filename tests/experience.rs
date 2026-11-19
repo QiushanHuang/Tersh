@@ -110,7 +110,7 @@ fn resource_parsing_rejects_invalid_percentages_and_graph_preserves_missing_samp
     assert_eq!(metrics::memory_used("42% used"), Some(42));
     let values = [Some(0.0), None, Some(100.0)];
     assert_eq!(metrics::sparkline(&values, 100.0, false), "_ #");
-    assert_eq!(metrics::sparkline(&values, 100.0, true), "▁ █");
+    assert_eq!(metrics::sparkline(&values, 100.0, true), "▁ ▆");
 }
 
 #[test]

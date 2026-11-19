@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.4.0 - 2026-11-20
+
+- Distribute a private device inventory with an explicit local identity or an unregistered observer. Inspect effective routes with `tersh --c --list-hosts`.
+- Install stable macOS/Linux/WSL release packages from one entry point. Check each interactive launch in the background and ask before installing a verified newer binary.
+- Add an interactive SSH topology, named selection, three direct dashboard views, Ghostty chart/contrast improvements and a revised macOS RAM estimate.
+- See the [release notes](docs/releases/v1.4.0.md) and [fleet deployment guide](docs/shared-fleet.md).
+
 ## v1.3.0 - 2026-10-28
 
 - Add an `H` hardware manager to `tersh --c`, with CPU inventory and interval usage, RAM capacity/occupancy, per-GPU utilization/VRAM/temperature, explicit stale and unknown readings, and responsive device navigation. Collect through existing bounded probes on macOS and Linux, including available WSL NVIDIA counters.

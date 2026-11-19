@@ -55,7 +55,7 @@ class Session:
         env = os.environ.copy()
         for name in ['TERSH_KEYMAP', 'TERSH_HOST_ALIAS', 'TERSH_HOST_ID', 'NO_COLOR']:
             env.pop(name, None)
-        env.update(XDG_CONFIG_HOME=str(state/'config'), XDG_STATE_HOME=str(state/'state'), TERSH_PLACES='off', TERSH_CLIPBOARD='off')
+        env.update(XDG_CONFIG_HOME=str(state/'config'), XDG_STATE_HOME=str(state/'state'), TERSH_PLACES='off', TERSH_CLIPBOARD='off', TERSH_UPDATE_CHECK='off')
         self.started = time.perf_counter()
         self.process = subprocess.Popen([binary, '--ui-profile', 'ssh', str(path)], stdin=self.slave, stdout=self.slave, stderr=self.slave, env=env, start_new_session=True)
 

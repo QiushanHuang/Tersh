@@ -14,11 +14,10 @@ if [ -r /proc/loadavg ]; then
 else
   printf 'load=%s\n' "$(sysctl -n vm.loadavg 2>/dev/null | tr -d '{}')"
 fi
-if command -v free >/dev/null 2>&1; then
+tersh_os=$(uname -s 2>/dev/null)
+if [ "$tersh_os" != Darwin ] && command -v free >/dev/null 2>&1; then
   free -m | awk '/^Mem:/ && $2 > 0 {printf "memory=%s/%s MB (%d%%)\n", $3, $2, ($3 * 100) / $2}'
-elif command -v memory_pressure >/dev/null 2>&1; then
-  memory_pressure 2>/dev/null | awk '/System-wide memory free percentage/ {printf "memory=%s free\n", $5}'
-else
+elif [ "$tersh_os" != Darwin ]; then
   printf 'memory=unknown\n'
 fi
 df -hP / 2>/dev/null | awk 'NR==2 {printf "storage=%s/%s %s used\n", $3, $2, $5}'
@@ -28,7 +27,6 @@ else
   printf 'tasks=unknown\n'
 fi
 
-tersh_os=$(uname -s 2>/dev/null)
 case "$tersh_os" in
   Linux)
     printf 'hardware_model=%s\n' "$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
@@ -61,14 +59,22 @@ case "$tersh_os" in
     printf 'cpu_threads=%s\n' "$(sysctl -n hw.logicalcpu 2>/dev/null)"
     tersh_ram=$(sysctl -n hw.memsize 2>/dev/null)
     printf 'memory_total_bytes=%s\n' "$tersh_ram"
+    # vm_stat prints Pages free after excluding speculative pages. Subtract
+    # the printed free and file-backed counts once each from physical capacity.
     vm_stat 2>/dev/null | awk -v total="$tersh_ram" '
-      /page size of/ {for(i=1;i<=NF;i++) if($i=="of") page=$(i+1)}
-      /^Pages free:/ {free=$3+0; have_free=1}
-      /^Pages speculative:/ {speculative=$3+0}
-      END {if (total > 0 && page > 0 && have_free && (free+speculative)*page <= total)
-        printf "memory_used_bytes=%.0f\n", total-(free+speculative)*page}
+      /page size of/ {for (i=1;i<NF;i++) if ($i=="of" && $(i+1) ~ /^[0-9]+$/) page=$(i+1)+0}
+      /^Pages free:[[:space:]]+[0-9]+[.]?$/ {free=$NF+0; have_free=1}
+      /^File-backed pages:[[:space:]]+[0-9]+[.]?$/ {files=$NF+0; have_files=1}
+      END {
+        used=total-(free+files)*page
+        if (total ~ /^[0-9]+$/ && total+0 > 0 && page > 0 && have_free && have_files &&
+            used >= 0 && used <= total+0) {
+          printf "memory_used_bytes=%.0f\n", used
+          printf "memory=%.0f/%.0f MiB (%.0f%%)\n", used/1048576, total/1048576, int(used*100/total+0.5)
+        } else print "memory=unknown"
+      }
     '
-    printf 'memory_basis=macOS physical occupied; includes caches, not memory pressure\n'
+    printf 'memory_basis=macOS estimate: physical RAM minus (free + file-backed pages) x page size\n'
     # top sample 1 is since boot; sample 2 is the requested one-second interval.
     top -l 2 -s 1 -n 0 2>/dev/null | awk '
       /^CPU usage:/ {samples++; for(i=1;i<=NF;i++) if($i=="idle") {idle=$(i-1); sub(/%$/, "", idle)}}

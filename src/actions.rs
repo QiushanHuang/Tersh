@@ -1,12 +1,14 @@
 //! A small, in-process action picker. It dispatches existing commands only.
-use crate::theme::{Theme, base_block, panel_title};
+use crate::theme::{Theme, Tone, draw_query, panel_block};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     Frame,
     layout::Rect,
     text::{Line, Span},
-    widgets::{Borders, Clear, Paragraph},
+    widgets::{Clear, Paragraph},
 };
+
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Shared task vocabulary for menus and help. Labels/keys remain caller-owned.
 pub fn metadata(id: &str) -> (&'static str, &'static str, &'static str) {
@@ -127,6 +129,41 @@ pub fn metadata(id: &str) -> (&'static str, &'static str, &'static str) {
             "Hosts",
             "Review bounded host state changes",
             "event change history 事件 变化",
+        ),
+        "open_topology" => (
+            "Hosts",
+            "Switch between the host list and the SSH route map",
+            "network map topology route jump proxy 网络 拓扑 跳板",
+        ),
+        "show_overview" => (
+            "Hosts",
+            "Show the host table and compact route map",
+            "overview list hosts 概览 列表",
+        ),
+        "show_topology_trends" => (
+            "Hosts",
+            "Show device routes with observation trends",
+            "split topology history charts 分栏 拓扑 趋势",
+        ),
+        "show_topology_meters" => (
+            "Hosts",
+            "Use the full width for the selected device’s usage meters",
+            "full width meters graph 全宽 用量 仪表",
+        ),
+        "toggle_topology_trends" => (
+            "Hosts",
+            "Switch between full-width usage meters and the split view with trends",
+            "history usage meters charts layout 用量 趋势 布局",
+        ),
+        "topology_parent" => (
+            "Hosts",
+            "Select the configured parent on this SSH route",
+            "jump upstream 上级 跳板",
+        ),
+        "topology_child" => (
+            "Hosts",
+            "Select the first visible child on this SSH route",
+            "downstream 下级",
         ),
         "open_hardware" => (
             "Hosts",
@@ -280,6 +317,8 @@ impl<C: Clone> ActionMenu<C> {
                     .min(self.matches().len().saturating_sub(1))
             }
             "up" => self.cursor = self.cursor.saturating_sub(1),
+            "first" => self.cursor = 0,
+            "last" => self.cursor = self.matches().len().saturating_sub(1),
             "backspace" => {
                 self.query.pop();
                 self.cursor = 0;
@@ -290,188 +329,228 @@ impl<C: Clone> ActionMenu<C> {
     }
 
     pub fn matches(&self) -> Vec<&Action<C>> {
+        if self.query.is_empty() {
+            return self.actions.iter().collect();
+        }
         let query = self.query.to_lowercase();
-        self.actions
-            .iter()
-            .filter(|a| {
-                a.label.to_lowercase().contains(&query)
-                    || a.key.to_ascii_lowercase() == query
-                    || a.keywords.to_lowercase().contains(&query)
-                    || a.description.to_lowercase().contains(&query)
-            })
-            .collect()
+        let mut matches = Vec::new();
+        for action in &self.actions {
+            let label = action.label.to_lowercase();
+            let rank = if action.key == self.query || label == query {
+                0
+            } else if label.starts_with(&query) {
+                1
+            } else if label.contains(&query) || action.key.eq_ignore_ascii_case(&query) {
+                2
+            } else if action.keywords.to_lowercase().contains(&query)
+                || action.description.to_lowercase().contains(&query)
+            {
+                3
+            } else {
+                continue;
+            };
+            matches.push((rank, action));
+        }
+        matches.sort_by_key(|(rank, _)| *rank);
+        matches.into_iter().map(|(_, action)| action).collect()
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> MenuResult<C> {
-        if key.code == KeyCode::Esc
-            || (key.modifiers.contains(KeyModifiers::CONTROL)
-                && matches!(key.code, KeyCode::Char('g' | 'G')))
-        {
-            return MenuResult::Cancel;
-        }
-        match key.code {
-            KeyCode::Enter => {
-                if let Some(action) = self.matches().get(self.cursor)
-                    && action.disabled_reason.is_none()
-                {
-                    return MenuResult::Run(action.command.clone());
+        let action = match key.code {
+            KeyCode::Esc => "cancel",
+            KeyCode::Char('g' | 'G') if key.modifiers.contains(KeyModifiers::CONTROL) => "cancel",
+            KeyCode::Enter => "submit",
+            KeyCode::Down | KeyCode::Tab => "down",
+            KeyCode::Up | KeyCode::BackTab => "up",
+            KeyCode::Home => "first",
+            KeyCode::End => "last",
+            KeyCode::Backspace => "backspace",
+            _ => {
+                if let Some(ch) = crate::bindings::printable(key) {
+                    self.input_char(ch);
                 }
+                return MenuResult::Pending;
             }
-            KeyCode::Down | KeyCode::Tab => {
-                self.cursor = self
-                    .cursor
-                    .saturating_add(1)
-                    .min(self.matches().len().saturating_sub(1))
-            }
-            KeyCode::Up | KeyCode::BackTab => self.cursor = self.cursor.saturating_sub(1),
-            KeyCode::Backspace => {
-                self.query.pop();
-                self.cursor = 0;
-            }
-            KeyCode::Char(ch)
-                if !ch.is_control()
-                    && !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-                    && self.query.chars().count() < 64 =>
-            {
-                self.query.push(ch);
-                self.cursor = 0;
-            }
-            _ => {}
-        }
-        MenuResult::Pending
+        };
+        self.handle_action(action)
     }
 }
 
 pub fn draw<C: Clone>(frame: &mut Frame, area: Rect, menu: &ActionMenu<C>, theme: Theme) {
-    let width = area.width.saturating_sub(2).min(84);
-    let height = area.height.saturating_sub(2).min(24);
+    let width = if area.width < 48 {
+        area.width
+    } else {
+        area.width.saturating_sub(4).min(84)
+    };
+    let height = if area.height < 12 {
+        area.height
+    } else {
+        area.height.saturating_sub(2).min(24)
+    };
     let rect = Rect::new(
-        area.x + area.width.saturating_sub(width) / 2,
-        area.y + area.height.saturating_sub(height) / 2,
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
         width,
         height,
     );
-    frame.render_widget(Clear, rect);
     let actions = menu.matches();
-    let inner_width = width.saturating_sub(2) as usize;
-    let capacity = height.saturating_sub(7) as usize;
+    let position = if actions.is_empty() {
+        0
+    } else {
+        menu.cursor + 1
+    };
+    let mut block = panel_block(
+        theme,
+        format!("Actions {position}/{}", actions.len()),
+        Tone::Active,
+    );
+    let close = format!(" {} close ", menu.cancel_label);
+    if width as usize >= 20 + close.width() {
+        block = block
+            .title_top(Line::from(Span::styled(close, theme.style(Tone::Key))).right_aligned());
+    }
+    let inner = block.inner(rect);
+    frame.render_widget(Clear, rect);
+    frame.render_widget(block, rect);
+    if inner.is_empty() {
+        return;
+    }
+
+    let row = |y| Rect::new(inner.x, y, inner.width, 1);
+    draw_query(frame, row(inner.y), theme, "Find: ", &menu.query);
+    let selected = actions.get(menu.cursor);
+    let show_hint = inner.height >= 5;
+    let show_description = inner.height >= 4 && selected.is_some();
+    let list_y = inner.y + 1;
+    let capacity =
+        usize::from(inner.height - 1 - u16::from(show_hint) - u16::from(show_description));
     let mut rows = Vec::new();
-    let mut previous = "";
     let mut focused_row = 0;
+    let mut previous = "";
+    let query = menu.query.to_ascii_lowercase();
+    // Keep an action visible even when the terminal has room for a single result.
     for (index, action) in actions.iter().enumerate() {
-        if menu.query.is_empty() && action.group != previous {
+        if capacity >= 3 && query.is_empty() && action.group != previous {
             rows.push(Line::from(Span::styled(
                 action.group,
-                theme.fg_bold(theme.palette().accent),
+                theme.bold(Tone::Title),
             )));
             previous = action.group;
         }
-        if index == menu.cursor {
+        let focused = index == menu.cursor;
+        if focused {
             focused_row = rows.len();
         }
-        let style = if index == menu.cursor {
-            theme.selected()
-        } else if action.disabled_reason.is_some() {
-            theme.fg(theme.palette().muted)
-        } else if action.danger {
-            theme.danger()
-        } else {
-            theme.fg(theme.palette().text)
-        };
-        let key = clip(&action.key, 10);
-        let prefix = format!(
-            "{} {:<10} {}",
-            if index == menu.cursor { ">" } else { " " },
-            key,
-            if action.disabled_reason.is_some() {
-                "- "
-            } else if action.danger {
-                "! "
-            } else {
-                ""
-            }
-        );
-        let label = clip(
-            action.label,
-            inner_width.saturating_sub(unicode_width::UnicodeWidthStr::width(prefix.as_str())),
-        );
-        let mut spans = vec![Span::styled(prefix, style)];
-        let query = menu.query.to_ascii_lowercase();
-        if !query.is_empty() && query.is_ascii() {
-            if let Some(at) = label.to_ascii_lowercase().find(&query) {
-                spans.extend([
-                    Span::styled(label[..at].to_owned(), style),
-                    Span::styled(
-                        label[at..at + query.len()].to_owned(),
-                        style.add_modifier(ratatui::style::Modifier::UNDERLINED),
-                    ),
-                    Span::styled(label[at + query.len()..].to_owned(), style),
-                ]);
-            } else {
-                spans.push(Span::styled(label, style));
-            }
-        } else {
-            spans.push(Span::styled(label, style));
-        }
-        rows.push(Line::from(spans));
+        rows.push(action_row(
+            action,
+            focused,
+            &query,
+            usize::from(inner.width),
+            theme,
+        ));
+    }
+    if actions.is_empty() {
+        rows.push(Line::from("No matches"));
     }
     let start = focused_row.saturating_add(1).saturating_sub(capacity);
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled("Find: ", theme.fg_bold(theme.palette().accent)),
-            Span::raw(menu.query.clone()),
-        ]),
-        Line::from(Span::styled(
-            clip(
-                &format!("{} select | {} run", menu.down_label, menu.submit_label),
-                inner_width,
-            ),
-            theme.fg(theme.palette().muted),
-        )),
-    ];
-    lines.extend(rows.into_iter().skip(start).take(capacity));
-    if actions.is_empty() {
-        lines.push(Line::from("No matches; edit query or cancel"));
-    }
-    if let Some(action) = actions.get(menu.cursor) {
-        lines.push(Line::from(""));
-        let description = action.disabled_reason.unwrap_or(action.description);
-        lines.push(Line::from(Span::styled(
-            clip(&format!("{}: {description}", action.group), inner_width),
-            theme.fg(if action.disabled_reason.is_some() {
-                theme.palette().warn
-            } else {
-                theme.palette().muted
-            }),
-        )));
-    }
     frame.render_widget(
-        Paragraph::new(lines).block(
-            base_block()
-                .borders(Borders::ALL)
-                .border_style(theme.fg(theme.palette().accent))
-                .title(panel_title(
-                    theme,
-                    format!(
-                        "Actions {}/{} | {} close",
-                        if actions.is_empty() {
-                            0
-                        } else {
-                            menu.cursor + 1
-                        },
-                        actions.len(),
-                        menu.cancel_label
-                    ),
-                )),
+        Paragraph::new(
+            rows.into_iter()
+                .skip(start)
+                .take(capacity)
+                .collect::<Vec<_>>(),
         ),
-        rect,
+        Rect::new(inner.x, list_y, inner.width, capacity as u16),
     );
+    if let Some(action) = selected.filter(|_| show_description) {
+        let (description, tone) = match action.disabled_reason {
+            Some(reason) => (reason, Tone::Warn),
+            None if action.danger => (action.description, Tone::Danger),
+            None => (action.description, Tone::Muted),
+        };
+        frame.render_widget(
+            Line::from(Span::styled(
+                clip(description, inner.width as usize),
+                theme.style(tone),
+            )),
+            row(inner.bottom() - 1 - u16::from(show_hint)),
+        );
+    }
+    if show_hint {
+        let hint = format!("{} select | {} run", menu.down_label, menu.submit_label);
+        frame.render_widget(
+            Line::from(Span::styled(
+                clip(&hint, inner.width as usize),
+                theme.style(Tone::Key),
+            )),
+            row(inner.bottom() - 1),
+        );
+    }
+}
+
+fn action_row<C>(
+    action: &Action<C>,
+    focused: bool,
+    query: &str,
+    width: usize,
+    theme: Theme,
+) -> Line<'static> {
+    let style = if focused {
+        theme.selected()
+    } else if action.disabled_reason.is_some() {
+        theme.style(Tone::Muted)
+    } else if action.danger {
+        theme.danger()
+    } else {
+        theme.style(Tone::Text)
+    };
+    let marker = if action.disabled_reason.is_some() {
+        "- "
+    } else if action.danger {
+        "! "
+    } else {
+        ""
+    };
+    let lead = if focused { "> " } else { "  " };
+    let key = if width >= 20 {
+        clip(&action.key, (width / 3).min(16))
+    } else {
+        String::new()
+    };
+    let label_space = width
+        .saturating_sub(lead.len() + marker.len() + key.width() + usize::from(!key.is_empty()));
+    let label = clip(action.label, label_space);
+    let mut spans = vec![Span::raw(lead), Span::raw(marker)];
+    if !query.is_empty()
+        && query.is_ascii()
+        && let Some(at) = label.to_ascii_lowercase().find(query)
+    {
+        spans.push(Span::raw(label[..at].to_owned()));
+        spans.push(Span::styled(
+            label[at..at + query.len()].to_owned(),
+            ratatui::style::Modifier::UNDERLINED,
+        ));
+        spans.push(Span::raw(label[at + query.len()..].to_owned()));
+    } else {
+        spans.push(Span::raw(label.clone()));
+    }
+    if !key.is_empty() {
+        spans.push(Span::raw(
+            " ".repeat(label_space.saturating_sub(label.width()) + 1),
+        ));
+        spans.push(Span::styled(
+            key,
+            if focused {
+                style
+            } else {
+                theme.bold(Tone::Key)
+            },
+        ));
+    }
+    Line::from(spans).style(style)
 }
 
 fn clip(text: &str, width: usize) -> String {
-    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
     if text.width() <= width {
         return text.into();
     }

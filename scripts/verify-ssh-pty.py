@@ -175,7 +175,7 @@ signal.signal(signal.SIGWINCH,resized);resized()
 env=os.environ.copy()
 for key in list(env):
     if key.startswith('TERSH_'):env.pop(key,None)
-env.update(TERM='xterm-ghostty',LC_ALL='C.UTF-8',HISTFILE='/dev/null',XDG_CONFIG_HOME=str(root/'config'),XDG_STATE_HOME=str(root/'state'),TERSH_PLACES_FILE=str(root/'state'/'places.json'),TERSH_CLIPBOARD='off',TERSH_MOTION='off',INPUTRC=str(root/'inputrc'))
+env.update(TERM='xterm-ghostty',LC_ALL='C.UTF-8',HISTFILE='/dev/null',XDG_CONFIG_HOME=str(root/'config'),XDG_STATE_HOME=str(root/'state'),TERSH_PLACES_FILE=str(root/'state'/'places.json'),TERSH_CLIPBOARD='off',TERSH_UPDATE_CHECK='off',TERSH_MOTION='off',INPUTRC=str(root/'inputrc'))
 if a.kind=='direct':
     env.update(TERSH_HOST_ALIAS=a.host,TERSH_HOST_ID='ssh-qa:'+a.host)
     command=[a.binary,'--ui-profile','ssh',a.path]
@@ -380,7 +380,7 @@ class Run:
         for key in list(self.env):
             if key.startswith("TERSH_") or key == "NO_COLOR": self.env.pop(key, None)
         self.env.update(TERM="xterm-ghostty", HISTFILE="/dev/null", XDG_CONFIG_HOME=str(local_root / "config"),
-                        XDG_STATE_HOME=str(local_root / "state"), TERSH_CLIPBOARD="off")
+                        XDG_STATE_HOME=str(local_root / "state"), TERSH_CLIPBOARD="off", TERSH_UPDATE_CHECK="off")
 
     def saved(self, name):
         files = self.remote.read(self.root, name)

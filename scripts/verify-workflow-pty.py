@@ -96,6 +96,7 @@ class Session:
         env.pop("NO_COLOR", None)
         env.pop("TERSH_KEYMAP", None)
         env["TERSH_CLIPBOARD"] = "off"
+        env["TERSH_UPDATE_CHECK"] = "off"
         # Do not inherit a real user's config into the fixture.
         env["XDG_CONFIG_HOME"] = str(Path(tempdir) / "empty-config")
         env["XDG_STATE_HOME"] = str(Path(tempdir) / "state")

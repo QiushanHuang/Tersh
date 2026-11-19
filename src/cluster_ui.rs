@@ -1,8 +1,8 @@
 use crate::{
-    cluster::{ClusterApp, ClusterMode, ConnectionState, HostKind, HostSnapshot},
+    cluster::{ClusterApp, ClusterMode, ConnectionState, HostKind, HostSnapshot, ProbeReport},
     theme::{
-        Theme, Tone, base_block, chip, footer_compact, footer_height, footer_rows, kv_line,
-        panel_block, panel_title, resource_bar, section_line,
+        Theme, Tone, base_block, chip, draw_query, footer_compact, footer_height, footer_rows,
+        kv_line, panel_block, resource_bar, section_line,
     },
 };
 use ratatui::{
@@ -15,7 +15,10 @@ use ratatui::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 pub fn draw(frame: &mut Frame, app: &ClusterApp) {
-    let area = frame.area();
+    draw_in(frame, frame.area(), app);
+}
+
+pub(crate) fn draw_in(frame: &mut Frame, area: Rect, app: &ClusterApp) {
     let theme = Theme::current();
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -26,11 +29,17 @@ pub fn draw(frame: &mut Frame, app: &ClusterApp) {
         ])
         .split(area);
 
-    draw_header(frame, rows[0], app, theme);
+    if app.mode() == ClusterMode::Filter {
+        draw_filter(frame, rows[0], app, theme);
+    } else {
+        draw_header(frame, rows[0], app, theme);
+    }
     if app.mode() == ClusterMode::Hardware {
         draw_hardware(frame, rows[1], app, theme);
     } else if app.mode() == ClusterMode::Detail {
         draw_dashboard(frame, rows[1], app, theme, true);
+    } else if app.topology_active() {
+        draw_topology_page(frame, rows[1], app, theme);
     } else {
         draw_body(frame, rows[1], app, theme);
     }
@@ -88,31 +97,6 @@ pub fn draw(frame: &mut Frame, app: &ClusterApp) {
     if app.mode() == ClusterMode::Places {
         draw_places(frame, area, app, theme);
     }
-    if app.mode() == ClusterMode::Filter {
-        let rect = Rect::new(
-            area.x,
-            area.y + area.height.saturating_sub(7) / 2,
-            area.width,
-            area.height.min(5),
-        );
-        frame.render_widget(Clear, rect);
-        frame.render_widget(
-            Paragraph::new(vec![
-                Line::from(format!(
-                    "Alias, address or role; {} apply, {} cancel",
-                    cluster_key(app, "cluster_filter", "submit"),
-                    cluster_key(app, "cluster_filter", "cancel")
-                )),
-                Line::from(crate::fs_core::escape_display(app.filter())),
-            ])
-            .block(
-                base_block()
-                    .borders(Borders::ALL)
-                    .title(panel_title(theme, "Filter hosts")),
-            ),
-            rect,
-        );
-    }
     if let Some(menu) = app.actions() {
         crate::actions::draw(frame, area, menu, theme);
     }
@@ -125,9 +109,12 @@ fn draw_places(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
         crate::fs_core::escape_display(app.place_query())
     ))];
     lines.push(Line::from(if app.places_enabled() {
-        "Enter opens the shown host and directory"
+        format!(
+            "{} opens the shown host and directory",
+            cluster_key(app, "places", "submit")
+        )
     } else {
-        "History disabled; configured directories remain available"
+        "History disabled; configured directories remain available".into()
     }));
     let capacity = rect.height.saturating_sub(6) as usize;
     let start = visible_start(app.place_cursor(), app.place_choices().len(), capacity);
@@ -199,116 +186,293 @@ fn draw_places(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
     );
 }
 
+fn draw_filter(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
+    let mut title = format!(
+        "Filter hosts | {}/{}",
+        app.visible_count(),
+        app.hosts().len()
+    );
+    if app.filter().is_empty() && area.width >= 48 {
+        title.push_str(" | alias, address or role");
+    }
+    let block = panel_block(theme, title, Tone::Active);
+    let field = block.inner(area);
+    frame.render_widget(block, area);
+    draw_query(
+        frame,
+        field,
+        theme,
+        "Find: ",
+        &crate::fs_core::escape_display(app.filter()),
+    );
+}
+
 fn draw_header(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
     let palette = theme.palette();
-    if area.width < 60 {
-        let stats = Line::from(vec![
-            chip(
-                "OK",
-                app.online_count(),
-                theme.chip(palette.text, palette.ok),
-            ),
-            Span::raw(" "),
-            chip(
-                "OLD",
-                app.stale_count(),
-                theme.chip(palette.text, palette.warn),
-            ),
-            Span::raw(" "),
-            chip(
-                "FAIL",
-                app.failed_count(),
-                theme.chip(palette.text, palette.danger),
-            ),
-            Span::raw(" "),
-            chip(
-                "CHK",
-                app.checking_count(),
-                theme.chip(palette.text, palette.accent),
-            ),
-        ]);
-        frame.render_widget(
-            Paragraph::new(stats).block(base_block().borders(Borders::ALL).title(panel_title(
-                theme,
-                if app.refresh_paused() {
-                    "Tersh --c | PAUSED"
-                } else {
-                    "Tersh --c"
-                },
-            ))),
-            area,
-        );
-        return;
+    let compact = area.width < 60;
+    let mut spans = Vec::new();
+    for (label, count, color) in [
+        ("OK", app.online_count(), palette.ok),
+        ("OLD", app.stale_count(), palette.warn),
+        ("FAIL", app.failed_count(), palette.danger),
+        ("CHK", app.checking_count(), palette.accent),
+    ] {
+        let value = match (label, count, compact) {
+            ("CHK", 0, false) => format!("0/{}", app.hosts().len()),
+            ("CHK", count, false) => format!("{} {count}", app.activity_symbol()),
+            _ => count.to_string(),
+        };
+        let style = if count == 0 {
+            theme.style(Tone::Muted)
+        } else {
+            theme.chip(palette.text, color)
+        };
+        spans.push(chip(label, value, style));
+        spans.push(Span::raw(" "));
     }
-    let lines = vec![Line::from(vec![
-        Span::styled(
-            if area.width < 60 {
-                "Tersh --c"
-            } else {
-                "Cluster Status"
-            },
-            theme.fg_bold(palette.panel_title),
-        ),
-        Span::raw("  "),
-        chip(
-            "OK",
-            app.online_count(),
-            theme.chip(palette.text, palette.ok),
-        ),
-        Span::raw(" "),
-        chip(
-            "OLD",
-            app.stale_count(),
-            theme.chip(palette.text, palette.warn),
-        ),
-        Span::raw(" "),
-        chip(
-            "FAIL",
-            app.failed_count(),
-            theme.chip(palette.text, palette.danger),
-        ),
-        Span::raw(" "),
-        chip(
-            "CHK",
-            if app.checking_count() > 0 {
-                format!("{} {}", app.activity_symbol(), app.checking_count())
-            } else {
-                format!("0/{}", app.hosts().len())
-            },
-            theme.chip(palette.text, palette.accent),
-        ),
-        Span::styled(" | ", theme.fg(palette.separator)),
-        Span::styled(
-            if app.refresh_paused() {
-                "PAUSED | src "
-            } else {
-                "src "
-            },
-            theme.fg(palette.key),
-        ),
-        Span::styled(ascii_safe(&app.inventory_label()), theme.fg(palette.muted)),
-    ])];
-    let paragraph = Paragraph::new(lines).block(base_block().borders(Borders::ALL));
-    frame.render_widget(paragraph, area);
+    if !compact {
+        spans.push(Span::styled(
+            ascii_safe(&app.inventory_label()),
+            theme.style(Tone::Muted),
+        ));
+    }
+    let name = if compact {
+        "Tersh --c"
+    } else {
+        "Cluster Status"
+    };
+    let title = if app.refresh_paused() {
+        format!("{name} | PAUSED")
+    } else {
+        name.into()
+    };
+    let mut block = panel_block(theme, title, Tone::Title);
+    let context = app.key_context();
+    if matches!(context, "cluster" | "cluster_topology" | "cluster_detail") {
+        let mut tabs = Vec::new();
+        for (action, label, selected) in [
+            (
+                "show_overview",
+                if area.width >= 80 {
+                    "Overview"
+                } else {
+                    "Hosts"
+                },
+                app.mode() == ClusterMode::Normal,
+            ),
+            (
+                "show_topology_trends",
+                if area.width >= 80 {
+                    "Map + trends"
+                } else {
+                    "Trends"
+                },
+                app.mode() == ClusterMode::Topology && app.topology_shows_trends(),
+            ),
+            (
+                "show_topology_meters",
+                if area.width >= 80 {
+                    "Full meters"
+                } else {
+                    "Meters"
+                },
+                app.mode() == ClusterMode::Topology && !app.topology_shows_trends(),
+            ),
+        ] {
+            if let Some(hint) = crate::bindings::hint(app.keymap(), context, action, label) {
+                let style = if selected {
+                    theme.selected()
+                } else {
+                    theme.bold(Tone::Key)
+                };
+                tabs.push(Span::styled(format!(" {hint} "), style));
+            }
+        }
+        let switcher = Line::from(tabs);
+        if switcher.width() + name.len() + 13 <= usize::from(area.width) {
+            block = block.title_top(switcher.right_aligned());
+        } else if !app.refresh_paused()
+            && switcher.width() + 2 <= usize::from(area.width)
+            && switcher.width() > 0
+        {
+            block = base_block()
+                .borders(Borders::ALL)
+                .border_style(theme.style(Tone::Title))
+                .title(switcher);
+        }
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
 }
 
 fn draw_body(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
     if area.width >= 100 {
-        let columns = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
+        let columns = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(area);
-        draw_hosts(frame, columns[0], app, theme);
+        let list = columns[0];
+        // Keep the host table first, then spend the remaining rows on routes and history.
+        let host_rows = app.visible_count().saturating_add(3).clamp(5, 14) as u16;
+        let history = app
+            .selected_host()
+            .and_then(|host| app.history_for(host.alias()))
+            .is_some_and(|samples| samples.len() >= 2);
+        let show_map = app.hosts().len() > 1 && list.height >= 13;
+        let table_height = if show_map {
+            host_rows.min(list.height.saturating_sub(7))
+        } else {
+            host_rows
+        };
+        let show_trends = history && list.height >= table_height + 9 + if show_map { 7 } else { 0 };
+        // Tall windows have room to read both the routes and the selected
+        // machine's telemetry. Keep the table fitted to the inventory.
+        let tall = list.height >= 40 && app.selected_host().is_some() && (show_map || show_trends);
+        let telemetry_height = if tall {
+            (u32::from(list.height - table_height) * 9 / 20).clamp(12, 18) as u16
+        } else if show_trends {
+            9
+        } else {
+            0
+        };
+        let map_height = if show_map {
+            list.height.saturating_sub(table_height + telemetry_height)
+        } else {
+            0
+        };
+        let rows = Layout::vertical([
+            Constraint::Min(3),
+            Constraint::Length(map_height),
+            Constraint::Length(telemetry_height),
+        ])
+        .split(list);
+        draw_hosts(frame, rows[0], app, theme);
+        if show_map {
+            crate::topology::draw(frame, rows[1], app, false);
+        }
+        if show_trends {
+            draw_host_trends(frame, rows[2], app, theme);
+        } else if tall {
+            draw_selected_usage(frame, rows[2], app, theme);
+        }
         draw_dashboard(frame, columns[1], app, theme, false);
     } else if area.width >= 72 {
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
-            .split(area);
-        draw_hosts(frame, rows[0], app, theme);
+        let rows =
+            Layout::vertical([Constraint::Percentage(48), Constraint::Percentage(52)]).split(area);
+        if rows[0].height >= 8 && app.hosts().iter().any(|host| host.proxy_jump().is_some()) {
+            let columns =
+                Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)])
+                    .split(rows[0]);
+            draw_hosts(frame, columns[0], app, theme);
+            crate::topology::draw(frame, columns[1], app, false);
+        } else {
+            draw_hosts(frame, rows[0], app, theme);
+        }
         draw_dashboard(frame, rows[1], app, theme, false);
     } else {
         draw_hosts(frame, area, app, theme);
+    }
+}
+
+fn draw_host_trends(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
+    if let Some(host) = app.selected_host() {
+        let trends = trend_lines(
+            app,
+            area.width.saturating_sub(2),
+            area.height.saturating_sub(2),
+            theme,
+        );
+        frame.render_widget(
+            Paragraph::new(trends).block(panel_block(
+                theme,
+                format!("Trends | {}", ascii_safe(host.alias())),
+                Tone::Inactive,
+            )),
+            area,
+        );
+    }
+}
+
+fn draw_topology_page(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
+    if app.selected_host().is_none() {
+        crate::topology::draw(frame, area, app, true);
+        return;
+    }
+    let trends = app.topology_shows_trends();
+    let split = trends && area.width >= 96 && area.height >= 18;
+    let telemetry_height = if trends {
+        (area.height.saturating_mul(2) / 5).clamp(7, 22)
+    } else if area.height >= 35 {
+        9
+    } else {
+        6
+    };
+    let rows = Layout::vertical([
+        Constraint::Min(4),
+        Constraint::Length(telemetry_height.min(area.height.saturating_sub(4))),
+    ])
+    .split(area);
+    crate::topology::draw(frame, rows[0], app, true);
+    if split {
+        let columns =
+            Layout::horizontal([Constraint::Percentage(38), Constraint::Fill(1)]).split(rows[1]);
+        draw_selected_usage(frame, columns[0], app, theme);
+        draw_host_trends(frame, columns[1], app, theme);
+    } else if trends {
+        draw_host_trends(frame, rows[1], app, theme);
+    } else {
+        draw_selected_usage(frame, rows[1], app, theme);
+    }
+}
+
+fn draw_selected_usage(frame: &mut Frame, gauges: Rect, app: &ClusterApp, theme: Theme) {
+    let Some(host) = app.selected_host() else {
+        return;
+    };
+    let snapshot = app.selected_snapshot();
+    let status = snapshot.map_or(ConnectionState::Unknown, |s| s.connection);
+    let report = snapshot.map(|s| &s.report);
+    let readings = if status == ConnectionState::Online {
+        "usage"
+    } else if report.is_some_and(|r| !r.is_empty()) {
+        "last readings"
+    } else {
+        "no readings"
+    };
+    let title = format!("{} | {readings}", ascii_safe(host.alias()));
+    let meters = [
+        ("CPU", report.and_then(|r| r.hardware.cpu_usage_percent)),
+        ("RAM", report.and_then(ProbeReport::memory_used_percent)),
+        (
+            "Disk",
+            report
+                .and_then(|r| r.storage.as_deref())
+                .and_then(crate::metrics::percent),
+        ),
+        (
+            "GPU peak",
+            report.and_then(|r| r.hardware.gpus.iter().filter_map(|g| g.usage_percent).max()),
+        ),
+    ];
+    let block = panel_block(theme, title, Tone::Title);
+    let inner = block.inner(gauges);
+    frame.render_widget(block, gauges);
+    let gap = if inner.height >= 9 {
+        (inner.height - 4) / 5
+    } else {
+        0
+    };
+    for (i, (label, value)) in meters.into_iter().enumerate() {
+        let y = inner.y + gap + i as u16 * (gap + 1);
+        if y >= inner.bottom() {
+            break;
+        }
+        let mut spans = vec![Span::styled(format!("{label:<9}"), theme.style(Tone::Key))];
+        spans.extend(resource_bar(
+            theme,
+            value,
+            usize::from(inner.width.saturating_sub(16)),
+        ));
+        let used = value.map_or_else(|| " --".into(), |percent| format!(" {percent:>3}%"));
+        spans.push(Span::styled(used, theme.style(Tone::Value)));
+        frame.render_widget(Line::from(spans), Rect::new(inner.x, y, inner.width, 1));
     }
 }
 
@@ -468,7 +632,11 @@ fn draw_hardware(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) 
         lines.push(section_line(theme, "Memory"));
         lines.push(kv_line(
             theme,
-            "RAM used/total",
+            if hardware.is_macos_ram_estimate() {
+                "RAM est. used/total"
+            } else {
+                "RAM used/total"
+            },
             format!(
                 "{} / {}",
                 bytes_label(hardware.memory_used_bytes),
@@ -564,13 +732,46 @@ fn draw_hardware(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) 
 }
 
 fn draw_hosts(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
+    let width = area.width.saturating_sub(2) as usize;
+    // Reserve complete numeric columns before spending the remainder on names.
+    // Drop optional columns in narrow splits as well as on phone terminals.
+    let show_usage = width >= 27;
+    let show_probe = width >= 36;
+    let show_role = width >= 52;
+    let show_address = width >= 67;
+    let fixed = 8
+        + usize::from(show_usage) * 10
+        + usize::from(show_probe) * 7
+        + usize::from(show_role) * 12;
+    let alias_width = if show_address {
+        19
+    } else {
+        width.saturating_sub(fixed)
+    };
+    let columns = |alias: &str, role: &str, probe: &str, mem: &str, disk: &str, address: &str| {
+        let mut text = fit_column(alias, alias_width);
+        if show_role {
+            text.push_str(&format!(" {}", fit_column(role, 11)));
+        }
+        if show_probe {
+            text.push_str(&format!(" {:>6}", truncate_to_width(probe, 6)));
+        }
+        if show_usage {
+            text.push_str(&format!(" {mem:>4} {disk:>4}"));
+        }
+        if show_address {
+            let remaining = width.saturating_sub(fixed + alias_width + 1);
+            text.push_str(&format!(" {}", truncate_to_width(address, remaining)));
+        }
+        text
+    };
     let mut lines = vec![Line::from(Span::styled(
-        if area.width < 56 {
-            "state  alias         probe  mem% disk%"
-        } else {
-            "state  alias           role       probe  mem  disk  address"
-        },
-        theme.fg_bold(theme.palette().key),
+        format!(
+            "  {:<5} {}",
+            "state",
+            columns("alias", "role", "probe", "mem", "disk", "address")
+        ),
+        theme.bold(Tone::Key),
     ))];
     let capacity = area.height.saturating_sub(3) as usize;
     let start = visible_start(app.cursor(), app.visible_count(), capacity);
@@ -585,8 +786,7 @@ fn draw_hosts(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
             .map(|value| format!("{value}ms"))
             .unwrap_or_else(|| "--".to_string());
         let memory = snapshot
-            .and_then(|snapshot| snapshot.report.memory.as_deref())
-            .and_then(crate::metrics::memory_used)
+            .and_then(|s| s.report.memory_used_percent())
             .map(|value| format!("{value}%"))
             .unwrap_or_else(|| "--".to_string());
         let storage = snapshot
@@ -594,72 +794,68 @@ fn draw_hosts(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
             .and_then(percent_from_token)
             .map(|value| format!("{value}%"))
             .unwrap_or_else(|| "--".to_string());
-        let cursor = if index == app.cursor() { ">" } else { " " };
-        let row = if area.width < 56 {
-            let alias_width = area.width.saturating_sub(29) as usize;
-            format!(
-                "{cursor} {:<5} {} {:>6} {:>4} {:>4}",
-                state_short(state),
-                fit_column(&ascii_safe(host.alias()), alias_width),
-                truncate_to_width(&latency, 6),
-                memory,
-                storage
-            )
+        let selected = index == app.cursor();
+        let marker = if selected { "> " } else { "  " };
+        let fields = columns(
+            &ascii_safe(host.alias()),
+            &ascii_safe(host.role()),
+            &latency,
+            &memory,
+            &storage,
+            &ascii_safe(host.address()),
+        );
+        let state_label = format!("{:<5} ", state_short(state));
+        let line = if selected {
+            Line::styled(format!("{marker}{state_label}{fields}"), theme.selected())
         } else {
-            format!(
-                "{cursor} {:<5} {} {} {:>6} {:>4} {:>4} {}",
-                state_short(state),
-                fit_column(&ascii_safe(host.alias()), 15),
-                fit_column(&ascii_safe(host.role()), 10),
-                truncate_to_width(&latency, 6),
-                memory,
-                storage,
-                ascii_safe(host.address())
-            )
+            Line::from(vec![
+                Span::raw(marker),
+                Span::styled(state_label, state_style(theme, state)),
+                Span::styled(fields, theme.style(Tone::Text)),
+            ])
         };
-        let row = truncate_to_width(&row, area.width.saturating_sub(2) as usize);
-        let style = if index == app.cursor() {
-            theme.selected()
-        } else {
-            state_style(theme, state)
-        };
-        lines.push(Line::from(Span::styled(row, style)));
+        lines.push(line);
     }
 
     if app.visible_count() == 0 {
-        lines.push(Line::from(format!(
-            "No matching hosts; {} clears filter",
-            cluster_key(app, "cluster", "clear_filter")
-        )));
+        let message = if app.hosts().is_empty() {
+            "No hosts configured".into()
+        } else if app.mode() == ClusterMode::Filter {
+            "No matching hosts".into()
+        } else {
+            format!(
+                "No matching hosts; {} clears filter",
+                cluster_key(app, "cluster", "clear_filter")
+            )
+        };
+        lines.push(Line::styled(message, theme.style(Tone::Muted)));
     }
-    let title = format!(
-        "Hosts {}/{}{} | {} actions | {}{}",
-        if app.visible_count() == 0 {
-            0
-        } else {
-            app.cursor() + 1
-        },
-        app.visible_count(),
-        if app.attention_only() {
-            " attention"
-        } else {
-            ""
-        },
-        cluster_key(app, app.key_context(), "open_actions"),
-        app.sort_label(),
-        if app.filter().is_empty() {
-            String::new()
-        } else {
-            format!(" | /{}", crate::fs_core::escape_display(app.filter()))
-        }
-    );
+    let position = if app.visible_count() == 0 {
+        0
+    } else {
+        app.cursor() + 1
+    };
+    let mut title = format!("Hosts {position}/{}", app.visible_count());
+    if app.attention_only() {
+        title.push_str(" | attention");
+    }
+    if !app.filter().is_empty() && app.mode() != ClusterMode::Filter {
+        title.push_str(&format!(
+            " | /{}",
+            crate::fs_core::escape_display(app.filter())
+        ));
+    }
+    if let Some(hint) = crate::bindings::hint(app.keymap(), "cluster", "open_topology", "map") {
+        title.push_str(&format!(" | {hint}"));
+    }
+    title.push_str(&format!(" | {}", app.sort_label()));
     let paragraph = Paragraph::new(lines).block(panel_block(theme, title, Tone::Active));
     frame.render_widget(paragraph, area);
 }
 
 fn draw_dashboard(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme, active: bool) {
     if app.mode() == ClusterMode::Detail && area.height < 14 {
-        draw_detail_panel(frame, area, app, theme, active);
+        draw_detail_panel(frame, area, app, theme, active, true);
         return;
     }
     if area.height < 14 {
@@ -672,12 +868,25 @@ fn draw_dashboard(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme,
         .map(|host| route_lines(host, theme).len() as u16 + 2)
         .unwrap_or(3)
         .min(if area.height >= 18 { 7 } else { 6 });
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(route_height), Constraint::Min(5)])
-        .split(area);
+    let event_count = app.events().len().min(8) as u16;
+    let event_height = if !active && area.height >= 35 && event_count > 0 {
+        let needed = detail_lines(app, false, theme).len() as u16 + 2;
+        (event_count + 2).min(area.height.saturating_sub(route_height + needed))
+    } else {
+        0
+    };
+    let event_height = if event_height >= 4 { event_height } else { 0 };
+    let rows = Layout::vertical([
+        Constraint::Length(route_height),
+        Constraint::Min(5),
+        Constraint::Length(event_height),
+    ])
+    .split(area);
     draw_route(frame, rows[0], app, theme, active);
-    draw_detail_panel(frame, rows[1], app, theme, active);
+    draw_detail_panel(frame, rows[1], app, theme, active, event_height == 0);
+    if event_height > 0 {
+        draw_recent_events(frame, rows[2], app, theme);
+    }
 }
 
 fn draw_compact_dashboard(
@@ -781,12 +990,7 @@ fn compact_status_lines(app: &ClusterApp, theme: Theme) -> Vec<Line<'static>> {
             "CPU load: {}",
             ascii_safe(report.cpu_load.as_deref().unwrap_or("unknown"))
         )),
-        resource_line(
-            theme,
-            "Memory",
-            report.memory.as_deref(),
-            MetricKind::Memory,
-        ),
+        memory_line(theme, report),
         resource_line(
             theme,
             "Storage",
@@ -824,7 +1028,10 @@ fn route_lines(host: &crate::cluster::HostConfig, theme: Theme) -> Vec<Line<'sta
                 Span::styled("JUMP", theme.fg(palette.warn)),
             ]),
             Line::from(format!("jump: {}", ascii_safe(host.ssh_target()))),
-            Line::from(format!("command: ssh {}", ascii_safe(host.ssh_target()))),
+            Line::from(format!(
+                "command: ssh {}",
+                ascii_safe(&crate::cluster::ssh_session_args(host).join(" "))
+            )),
         ],
         HostKind::Server => {
             if let Some(jump_target) = host.proxy_jump_target().or_else(|| host.proxy_jump()) {
@@ -852,22 +1059,83 @@ fn route_lines(host: &crate::cluster::HostConfig, theme: Theme) -> Vec<Line<'sta
                         Span::styled("SERVER", theme.fg(palette.ok)),
                     ]),
                     Line::from(format!("server: {}", ascii_safe(host.ssh_target()))),
-                    Line::from(format!("command: ssh {}", ascii_safe(host.ssh_target()))),
+                    Line::from(format!(
+                        "command: ssh {}",
+                        ascii_safe(&crate::cluster::ssh_session_args(host).join(" "))
+                    )),
                 ]
             }
         }
     }
 }
 
-fn draw_detail_panel(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme, active: bool) {
-    let mut lines = detail_lines(app, true, theme);
+fn draw_recent_events(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
+    let title = crate::bindings::hint(app.keymap(), "cluster", "open_events", "all").map_or_else(
+        || "Cluster events".into(),
+        |hint| format!("Cluster events | {hint}"),
+    );
+    let arrow = if crate::theme::unicode_graphs() {
+        "→"
+    } else {
+        "->"
+    };
+    let lines = app
+        .events()
+        .iter()
+        .rev()
+        .take(usize::from(area.height.saturating_sub(2)))
+        .map(|event| {
+            let age = event.at.elapsed().unwrap_or_default().as_secs();
+            Line::from(vec![
+                Span::styled(format!("{age:>4}s  "), theme.style(Tone::Key)),
+                Span::styled(
+                    format!("{}   ", ascii_safe(&event.alias)),
+                    theme.bold(Tone::Text),
+                ),
+                Span::styled(
+                    format!("{} {arrow} ", event.previous.label()),
+                    theme.style(Tone::Muted),
+                ),
+                Span::styled(event.current.label(), state_style(theme, event.current)),
+            ])
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Paragraph::new(lines).block(panel_block(theme, title, Tone::Inactive)),
+        area,
+    );
+}
+
+fn draw_detail_panel(
+    frame: &mut Frame,
+    area: Rect,
+    app: &ClusterApp,
+    theme: Theme,
+    active: bool,
+    include_logs: bool,
+) {
+    let mut lines = detail_lines(app, include_logs, theme);
     let trends = if app.mode() == ClusterMode::Detail
         && app
             .selected_host()
             .and_then(|host| app.history_for(host.alias()))
             .is_some_and(|history| history.len() >= 2)
     {
-        trend_lines(app, area.width.saturating_sub(2), theme)
+        let mut lines = vec![section_line(theme, "Trends")];
+        let budget = if area.height >= 34 {
+            14
+        } else if area.height >= 23 {
+            10
+        } else {
+            6
+        };
+        lines.extend(trend_lines(
+            app,
+            area.width.saturating_sub(2),
+            budget,
+            theme,
+        ));
+        lines
     } else {
         vec![]
     };
@@ -911,121 +1179,155 @@ fn draw_detail_panel(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: The
     frame.render_widget(paragraph, area);
 }
 
-fn trend_lines(app: &ClusterApp, width: u16, theme: Theme) -> Vec<Line<'static>> {
+/// Load and probe duration can cluster far above zero. Label the visible
+/// vertical range, and allow a little headroom so tiny jitter stays small.
+fn trend_range(values: &[Option<f64>], metric: usize, zoom: bool) -> (f64, f64) {
+    if matches!(metric, 1 | 2) {
+        return (0.0, 100.0);
+    }
+    let (min, max) = values
+        .iter()
+        .flatten()
+        .copied()
+        .fold((f64::INFINITY, 0.0_f64), |(low, high), x| {
+            (low.min(x), high.max(x))
+        });
+    if !zoom || !min.is_finite() || min <= max * 0.5 {
+        return (0.0, max.max(1.0));
+    }
+    let min_span = if metric == 0 { 0.5 } else { 10.0 };
+    let span = (max - min).max(max * 0.03).max(min_span);
+    let step = 10.0_f64.powf((span / 4.0).log10().floor());
+    let margin = (span - (max - min)) * 0.5;
+    let low = ((min - margin).max(0.0) / step).floor() * step;
+    let high = ((max + margin) / step).ceil() * step;
+    if low.is_finite() && high.is_finite() && high > low {
+        (low, high)
+    } else {
+        (0.0, max.max(1.0))
+    }
+}
+
+fn trend_number(value: f64, metric: usize) -> String {
+    if metric == 0 {
+        format!("{value:.2}")
+    } else {
+        format!("{value:.0}")
+    }
+}
+
+fn trend_lines(app: &ClusterApp, width: u16, height: u16, theme: Theme) -> Vec<Line<'static>> {
     let Some(host) = app.selected_host() else {
         return vec![];
     };
     let Some(history) = app.history_for(host.alias()).filter(|h| !h.is_empty()) else {
-        return vec![
-            section_line(theme, "Trends"),
-            Line::from("Waiting for completed probes"),
-        ];
+        return vec![Line::from("Waiting for completed probes")];
     };
-    let graph_width = (width.saturating_sub(28).clamp(4, 60) as usize).min(history.len());
-    let samples = history
-        .iter()
-        .skip(history.len().saturating_sub(graph_width))
-        .collect::<Vec<_>>();
-    let duration = samples
-        .last()
-        .unwrap()
+    let width = usize::from(width);
+    let wide = width >= 44;
+    let value_width = if wide { 24 } else { 13 };
+    let graph_width = width.saturating_sub(10 + value_width).max(1);
+    let count = history.len().min(graph_width);
+    let samples = history.range(history.len() - count..).collect::<Vec<_>>();
+    let duration = samples[count - 1]
         .at
         .duration_since(samples[0].at)
         .unwrap_or_default()
         .as_secs();
-    let mut lines = vec![
-        section_line(theme, "Trends"),
-        Line::from(Span::styled(
-            format!("{} samples / {}s; gaps=missing", samples.len(), duration),
-            theme.fg(theme.palette().muted),
-        )),
-        Line::from(Span::styled(
-            format!(
-                "Observation #{}-{}; equal spacing",
-                app.observation_count(host.alias())
-                    .saturating_sub(samples.len() as u64)
-                    .saturating_add(1),
-                app.observation_count(host.alias())
-            ),
-            theme.fg(theme.palette().muted),
-        )),
-    ];
-    let palette = theme.palette();
-    for (metric, label, unit, color) in [
-        (0, "Load 1m", "", palette.accent),
-        (1, "Mem used", "%", palette.accent_alt),
-        (2, "Disk used", "%", palette.warn),
-        (3, "Probe", "ms", palette.ok),
+    let caption = format!("{count} samples / {duration}s");
+    let header = if wide {
+        let lead = 10 + graph_width;
+        format!("{:<lead$} {:>7}  Scale", caption, "Latest")
+    } else {
+        caption
+    };
+    let mut lines = vec![Line::styled(header, theme.style(Tone::Muted))];
+    let plot_rows = usize::from(height.saturating_sub(1));
+    let rows = (plot_rows / 4).clamp(1, 4);
+    let gutters = plot_rows.saturating_sub(4 * rows).min(3);
+    let steps = rows * 8 - 1;
+    for (metric, label, unit, tone) in [
+        (0, "Load 1m", "", Tone::Accent),
+        (1, "Mem used", "%", Tone::AccentAlt),
+        (2, "Disk used", "%", Tone::Warn),
+        (3, "Probe", "ms", Tone::Ok),
     ] {
         let values = samples
             .iter()
             .map(|sample| sample.values[metric])
             .collect::<Vec<_>>();
-        let ceiling = if metric == 1 || metric == 2 {
-            100.0
-        } else {
-            values
-                .iter()
-                .flatten()
-                .copied()
-                .fold(0.0_f64, f64::max)
-                .max(1.0)
-        };
-        let latest_observation = values.last().copied().flatten();
-        let retained = app.selected_snapshot().and_then(|snapshot| match metric {
-            0 => snapshot
-                .report
-                .cpu_load
-                .as_deref()?
-                .split_whitespace()
-                .next()?
-                .parse::<f64>()
-                .ok(),
-            1 => snapshot
-                .report
-                .memory
-                .as_deref()
-                .and_then(crate::metrics::memory_used)
-                .map(f64::from),
-            2 => snapshot
-                .report
-                .storage
-                .as_deref()
-                .and_then(crate::metrics::percent)
-                .map(f64::from),
-            _ => values.iter().rev().find_map(|value| *value),
-        });
-        let latest = latest_observation
-            .or(retained)
-            .map(|v| {
-                let value = if metric == 0 {
-                    format!("{v:.2}")
-                } else {
-                    format!("{v:.0}{unit}")
-                };
-                if latest_observation.is_none() {
-                    format!("{value} old")
-                } else {
-                    value
-                }
+        let (low, high) = trend_range(&values, metric, wide);
+        let heights = values
+            .iter()
+            .map(|v| crate::metrics::trend_level(*v, low, high, steps))
+            .collect::<Vec<_>>();
+        let current = values[count - 1];
+        let retained = || {
+            app.selected_snapshot().and_then(|snapshot| match metric {
+                0 => snapshot
+                    .report
+                    .cpu_load
+                    .as_deref()?
+                    .split_whitespace()
+                    .next()?
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|v| v.is_finite() && *v >= 0.0),
+                1 => snapshot.report.memory_used_percent().map(f64::from),
+                2 => snapshot
+                    .report
+                    .storage
+                    .as_deref()
+                    .and_then(crate::metrics::percent)
+                    .map(f64::from),
+                _ => values.iter().rev().find_map(|v| *v),
             })
-            .unwrap_or_else(|| "--".into());
-        let graph = crate::metrics::sparkline(&values, ceiling, crate::theme::unicode_graphs());
-        let scale = if metric == 0 {
-            format!("{ceiling:.2}")
-        } else {
-            format!("{ceiling:.0}{unit}")
         };
-        lines.push(Line::from(vec![
-            Span::styled(format!("{label:<9}"), theme.fg(palette.key)),
-            Span::styled(format!("{graph:graph_width$}"), theme.fg(color)),
-            Span::styled(format!(" {latest} /{scale}"), theme.fg(palette.value)),
-        ]));
+        let latest = current.or_else(retained).map_or_else(
+            || "--".into(),
+            |v| {
+                format!(
+                    "{}{unit}{}",
+                    trend_number(v, metric),
+                    if current.is_none() { " old" } else { "" }
+                )
+            },
+        );
+        let scale = if wide {
+            let bound = |v: f64| {
+                if v == v.trunc() {
+                    format!("{v:.0}")
+                } else {
+                    trend_number(v, metric)
+                }
+            };
+            format!("{}..{}{unit}", bound(low), bound(high))
+        } else {
+            format!("/{}{unit}", trend_number(high, metric))
+        };
+        let mut bands = crate::theme::trend_bands(theme, tone, &heights, graph_width, rows);
+        for (i, band) in bands.iter_mut().enumerate() {
+            let bottom = i + 1 == rows;
+            let mut spans = vec![Span::styled(
+                format!("{:<10}", if bottom { label } else { "" }),
+                theme.style(Tone::Key),
+            )];
+            spans.append(band);
+            if bottom {
+                let reading = if wide {
+                    format!(" {latest:>7}  ")
+                } else {
+                    format!(" {latest} ")
+                };
+                spans.push(Span::styled(reading, theme.style(Tone::Value)));
+                spans.push(Span::styled(scale.clone(), theme.style(Tone::Muted)));
+            }
+            lines.push(Line::from(spans));
+        }
+        if metric < gutters {
+            lines.push(Line::default());
+        }
     }
-    lines.push(Line::from(Span::styled(
-        "Load != CPU %; old = retained data",
-        theme.fg(palette.muted),
-    )));
     lines
 }
 
@@ -1140,12 +1442,15 @@ fn push_snapshot_lines(lines: &mut Vec<Line<'static>>, snapshot: &HostSnapshot, 
         "CPU load",
         ascii_safe(report.cpu_load.as_deref().unwrap_or("unknown")),
     ));
-    lines.push(resource_line(
-        theme,
-        "Memory",
-        report.memory.as_deref(),
-        MetricKind::Memory,
-    ));
+    lines.push(memory_line(theme, report));
+    if let Some(index) = report.legacy_darwin_pressure_index() {
+        lines.push(kv_line(theme, "Legacy pressure index", format!("{index}%")));
+    } else if report.hardware.memory_percent().is_some()
+        && !report.hardware.is_macos_ram_estimate()
+        && let Some(native) = report.memory.as_deref().filter(|s| *s != "unknown")
+    {
+        lines.push(kv_line(theme, "Native memory summary", ascii_safe(native)));
+    }
     lines.push(resource_line(
         theme,
         "Storage",
@@ -1188,6 +1493,38 @@ enum MetricKind {
     Gpu,
 }
 
+fn memory_line(theme: Theme, report: &ProbeReport) -> Line<'static> {
+    let hw = &report.hardware;
+    if let Some(used) = hw.memory_percent() {
+        let capacity = format!(
+            "{} / {}",
+            crate::hardware::bytes_label(hw.memory_used_bytes),
+            crate::hardware::bytes_label(hw.memory_total_bytes)
+        );
+        let suffix = if hw
+            .memory_basis
+            .as_deref()
+            .is_some_and(|basis| basis.starts_with("macOS physical occupied"))
+        {
+            "occupied incl. cache"
+        } else if hw.is_macos_ram_estimate() {
+            "est. used"
+        } else {
+            "used"
+        };
+        meter_line(theme, "Memory", &capacity, Some((used, suffix)))
+    } else if report.legacy_darwin_pressure_index().is_some() {
+        meter_line(theme, "Memory", "usage unavailable", None)
+    } else {
+        resource_line(
+            theme,
+            "Memory",
+            report.memory.as_deref(),
+            MetricKind::Memory,
+        )
+    }
+}
+
 fn resource_line(
     theme: Theme,
     label: &'static str,
@@ -1204,6 +1541,15 @@ fn resource_line(
         MetricKind::Gpu if raw.eq_ignore_ascii_case("none") => None,
         MetricKind::Gpu => gpu_metric(raw),
     };
+    meter_line(theme, label, raw, metric)
+}
+
+fn meter_line(
+    theme: Theme,
+    label: &str,
+    raw: &str,
+    metric: Option<(u16, &'static str)>,
+) -> Line<'static> {
     let bar_percent = metric.map(|(percent, _)| percent);
     let percent_text = metric
         .map(|(value, suffix)| {
@@ -1262,6 +1608,43 @@ fn cluster_key(app: &ClusterApp, context: &str, action: &str) -> String {
 }
 fn draw_footer(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
     let context = app.key_context();
+    if context == "cluster_topology" {
+        let controls = [
+            ("open_detail", "detail"),
+            ("cancel", "back"),
+            ("topology_parent", "parent"),
+            ("topology_child", "child"),
+            ("down", "next"),
+            ("up", "prev"),
+            ("open_actions", "actions"),
+            ("refresh_all", "refresh"),
+            ("open_filter", "filter"),
+        ];
+        let mut hints = controls
+            .iter()
+            .filter_map(|(id, name)| crate::bindings::hint(app.keymap(), context, id, name))
+            .collect::<Vec<_>>();
+        let shown = app.topology_shows_trends();
+        if let Some(hint) = crate::bindings::hint(
+            app.keymap(),
+            context,
+            "toggle_topology_trends",
+            if shown { "hide trends" } else { "show trends" },
+        ) {
+            hints.insert(0, hint);
+        }
+        frame.render_widget(
+            Paragraph::new(footer_rows(
+                theme,
+                &hints.join(" | "),
+                area.width,
+                area.height.saturating_sub(1) as usize,
+            ))
+            .block(base_block().borders(Borders::TOP)),
+            area,
+        );
+        return;
+    }
     if app.mode() == ClusterMode::Hardware && app.actions().is_none() {
         let mut pieces = vec![
             format!("{} back", cluster_key(app, context, "cancel")),
@@ -1272,7 +1655,14 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
         if area.width >= 80 || area.height >= 3 {
             for (action, label) in [
                 ("refresh_selected", "refresh"),
-                ("toggle_pause", "pause"),
+                (
+                    "toggle_pause",
+                    if app.refresh_paused() {
+                        "resume"
+                    } else {
+                        "pause"
+                    },
+                ),
                 ("open_actions", "actions"),
                 ("open_detail", "detail"),
             ] {
@@ -1318,6 +1708,29 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
                 .unwrap_or_default(),
         );
         pieces.push("^C".into());
+        if context == "cluster" {
+            pieces.extend(crate::bindings::hint(
+                app.keymap(),
+                context,
+                "open_filter",
+                "filter",
+            ));
+            if app.selected_host().is_some() {
+                pieces.extend(crate::bindings::hint(
+                    app.keymap(),
+                    context,
+                    "open_detail",
+                    "detail",
+                ));
+            }
+        } else {
+            pieces.extend(crate::bindings::hint(
+                app.keymap(),
+                context,
+                "detail_down",
+                "scroll",
+            ));
+        }
         frame.render_widget(
             Paragraph::new(footer_rows(
                 theme,
@@ -1331,19 +1744,14 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
         return;
     }
     let compact = footer_compact(area.width, 64);
-    let mut pieces = if area.width < 50 && context == "cluster" {
-        Vec::new()
-    } else {
-        vec![
-            match context {
-                "cluster" => "cluster",
-                "cluster_detail" => "detail",
-                "cluster_filter" => "filter",
-                other => other,
-            }
-            .into(),
-        ]
-    };
+    let mut pieces = vec![
+        match context {
+            "cluster_detail" => "detail",
+            "cluster_filter" => "filter",
+            other => other,
+        }
+        .to_owned(),
+    ];
     let mut add = |id: &str, description: &str| {
         if id == "cancel" {
             pieces.push(format!(
@@ -1371,8 +1779,10 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
             add("up", "up");
         }
         "cluster_filter" => {
-            add("cancel", "cancel");
             add("submit", "apply");
+            add("up", "previous match");
+            add("down", "next match");
+            add("cancel", "cancel");
             add("backspace", "erase");
         }
         "places" => {
@@ -1388,34 +1798,28 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
             } else {
                 add("cancel", "back");
             }
-            if area.width >= 50 || context != "cluster" {
-                add("open_actions", "actions");
-            }
+            add("open_actions", "actions");
             if context == "cluster" {
-                add("cancel", "cancel");
-                add("clear_filter", "clear filter");
-            }
-            if app.selected_host().is_some() {
-                add("open_hardware", "hardware");
-                add("open_detail", "detail");
-            }
-            add("refresh_all", "refresh");
-            add("open_filter", "filter");
-            add("cycle_sort", "sort");
-            add("toggle_attention", "attention");
-            add("toggle_pause", "pause");
-            add("open_events", "events");
-            add("open_places", "places");
-            if app.selected_host().is_some() {
-                add("open_workbench", "tersh");
-                add("open_session", "shell/ssh");
-            }
-            if context == "cluster_detail" {
+                add("open_filter", "filter");
+                if !app.filter().is_empty() || app.attention_only() {
+                    add("clear_filter", "clear filter");
+                }
+                add("cycle_sort", "sort");
+                add("refresh_selected", "refresh one");
+            } else {
                 add("detail_down", "scroll");
             }
-            if !compact {
-                add("down", "down");
-                add("up", "up");
+            add("refresh_all", "refresh");
+            if app.refresh_paused() {
+                add("toggle_pause", "resume");
+            }
+            if app.selected_host().is_some() {
+                if context == "cluster" {
+                    add("open_detail", "detail");
+                }
+                add("open_hardware", "hardware");
+                add("open_workbench", "tersh");
+                add("open_session", "shell/ssh");
             }
         }
     }
@@ -1427,7 +1831,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
             "^C force".into()
         },
     );
-    if context == "cluster" && area.width >= 50 {
+    if context == "cluster" && !app.hosts().is_empty() {
         let (id, label) = if app.selected_host().is_none() {
             ("clear_filter", "clear filter")
         } else {
@@ -1442,6 +1846,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &ClusterApp, theme: Theme) {
             }
         };
         if let Some(hint) = crate::bindings::hint(app.keymap(), context, id, label) {
+            pieces.retain(|piece| piece != &hint);
             pieces.push(format!("next: {hint}"));
         }
     }
@@ -1650,6 +2055,39 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn load_variation_uses_a_labeled_range_while_capacity_preserves_the_zero_baseline() {
+        let observations = [Some(399.67), None, Some(415.48)];
+        let (low, high) = trend_range(&observations, 0, true);
+        assert!((390.0..=399.67).contains(&low) && (415.48..425.0).contains(&high));
+        assert_eq!(trend_range(&observations, 0, false), (0.0, 415.48));
+        assert_eq!(
+            trend_range(&[Some(59.0), Some(60.0)], 1, true),
+            (0.0, 100.0)
+        );
+        let (low, high) = trend_range(&[Some(1500.0), Some(1500.0)], 3, true);
+        assert!(low < 1500.0 && high > 1500.0);
+    }
+
+    #[test]
+    fn wide_bands_preserve_missing_intervals_and_real_sample_heights() {
+        let bands = crate::theme::trend_bands(Theme::Mono, Tone::Ok, &[1, 0, 15], 60, 2);
+        let text: Vec<Vec<char>> = bands
+            .into_iter()
+            .map(|b| Line::from(b).to_string().chars().collect())
+            .collect();
+        assert!(
+            text.iter()
+                .all(|row| row.len() == 60 && row[20..40].iter().all(|&ch| ch == ' '))
+        );
+        assert!(text[0][0..20].iter().all(|&ch| ch == ' '));
+        assert!(text[1][0..19].iter().any(|&ch| ch != ' '));
+        assert!(
+            text.iter()
+                .all(|row| row[40..60].iter().any(|&ch| ch != ' '))
+        );
+    }
 
     #[test]
     fn percent_parser_handles_ascii_and_fullwidth_percent_tokens() {

@@ -741,3 +741,41 @@ fn destructive_confirmation_keeps_replaced_source_untouched() {
         assert!(app.last_job().unwrap().failed[0].error.contains("changed"));
     }
 }
+
+#[test]
+fn cancelling_a_live_filter_restores_applied_query_focus_and_marks() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["alpha.txt", "beta.txt", "third.md"] {
+        std::fs::write(dir.path().join(name), "").unwrap();
+    }
+    let mut app = App::new(dir.path().into()).unwrap();
+    app.handle_key(KeyEvent::from(KeyCode::Char('/')));
+    for ch in ".txt".chars() {
+        app.handle_key(KeyEvent::from(KeyCode::Char(ch)));
+    }
+    app.handle_key(KeyEvent::from(KeyCode::Enter));
+    app.handle_key(KeyEvent::from(KeyCode::Down));
+    app.handle_command(Command::ToggleSelect);
+    app.handle_key(KeyEvent::from(KeyCode::Char('/')));
+    app.handle_key(KeyEvent::from(KeyCode::Char('z')));
+    assert!(app.entries().is_empty());
+    app.handle_key(KeyEvent::from(KeyCode::Esc));
+    assert_eq!(app.filter(), ".txt");
+    assert_eq!(app.entries()[app.cursor()].name, "beta.txt");
+    assert!(app.is_selected(&dir.path().canonicalize().unwrap().join("beta.txt")));
+}
+
+#[test]
+fn applying_a_live_filter_discards_marks_outside_the_results() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["alpha.txt", "beta.txt"] {
+        std::fs::write(dir.path().join(name), "").unwrap();
+    }
+    let mut app = App::new(dir.path().into()).unwrap();
+    app.handle_command(Command::SelectAll);
+    app.handle_key(KeyEvent::from(KeyCode::Char('/')));
+    app.handle_key(KeyEvent::from(KeyCode::Char('b')));
+    app.handle_key(KeyEvent::from(KeyCode::Enter));
+    assert_eq!(app.selected_len(), 1);
+    assert!(app.is_selected(&app.entries()[0].path));
+}

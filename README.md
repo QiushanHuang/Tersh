@@ -80,11 +80,24 @@ additional previews or deeper resource analysis.
 
 ## Install
 
+Install the latest stable release on Apple Silicon macOS or x86-64/ARM64 Linux
+(including WSL) with the same command:
+
+```sh
+curl -fL https://raw.githubusercontent.com/QiushanHuang/Tersh/v1.4.0/scripts/install-release.sh -o install-tersh.sh
+sh install-tersh.sh
+tersh --check-update
+```
+
+Every interactive launch checks for a newer version in the background. When
+one is available, Tersh shows a notice and asks on exit before installing.
+Use `tersh --update` to check and choose immediately.
+
 Download a binary for your platform from [Releases](https://github.com/QiushanHuang/Tersh/releases),
 or build from source with **Rust 1.88 or newer**:
 
 ```sh
-cargo install --locked --git https://github.com/QiushanHuang/Tersh.git --tag v1.3.0 --bin tersh
+cargo install --locked --git https://github.com/QiushanHuang/Tersh.git --tag v1.4.0 --bin tersh
 ```
 
 To update an existing Cargo installation, add `--force`. For a local checkout:
@@ -178,7 +191,12 @@ for detailed file-operation and recovery behavior.
 
 ## Hosts and trends
 
-![Cluster detail with current metrics and bounded observation trends](docs/images/cluster.png)
+To see the same devices on another computer, distribute a private copy of the
+inventory with the receiving device's `local_alias`. Run `tersh --c --list-hosts`
+to inspect the effective roster without opening SSH connections. See the
+[fleet setup and offline installation guide](docs/shared-fleet.md).
+
+![SSH topology, selected-device resource meters and observation history](docs/images/cluster-topology.png)
 
 ```sh
 tersh --c --cluster-config examples/servers.json
@@ -192,13 +210,18 @@ non-interactive SSH with already trusted host keys and existing credentials.
 | --- | --- |
 | Filter alias, address or role / clear filter | `/` · Backspace |
 | Cycle sort / reverse | `v` · `V` |
-| Refresh all / refresh selected | `r` · Enter |
+| Refresh all / refresh selected | `r` · Enter (`R` in the topology) |
+| Expand or close the SSH topology | `m` |
+| Select a topology node / navigate parent or child | `↑` · `↓` / `←` · `→` |
+| Overview / topology with trends / topology with full-width meters | `1` / `2` / `3` |
+| Toggle the two expanded topology layouts | `Tab` |
 | Expand detail / scroll detail | `l` · PageUp/PageDown |
 | Hardware manager: CPU, GPU and RAM | `H` |
 | Open shell or SSH / open Tersh | `s` · `t` |
 
-Use filtering and sorting to find the hosts you care about while health checks
-continue across your inventory. Install Tersh on a remote host, press `t` to open
+To select a specific device, press `/`, enter its configured alias and press
+Enter. Up and Down choose among multiple matches. Press Backspace in the host
+view to restore the complete inventory with that device still selected. Install Tersh on a remote host, press `t` to open
 its file workbench, and return to the dashboard when you finish.
 
 See the latest 60 observations for each host to follow changes in load, memory,
@@ -249,7 +272,7 @@ python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 ```
 
 [Contributing](CONTRIBUTING.md) · [Changelog](CHANGELOG.md) ·
-[v1.3.0 release notes](docs/releases/v1.3.0.md)
+[v1.4.0 release notes](docs/releases/v1.4.0.md)
 
 Maintained by [QiushanHuang](https://github.com/QiushanHuang).
 See [contributors and attribution](CONTRIBUTORS.md). Tersh is licensed under the
@@ -327,11 +350,22 @@ Tersh 把“选主机 → 检查文件 → 执行操作 → 查看结果与恢�
 
 ### 安装
 
+Apple 芯片 Mac、x86-64/ARM64 Linux 和 WSL 可以使用同一入口安装最新稳定版：
+
+```sh
+curl -fL https://raw.githubusercontent.com/QiushanHuang/Tersh/v1.4.0/scripts/install-release.sh -o install-tersh.sh
+sh install-tersh.sh
+tersh --check-update
+```
+
+每次打开工作台或 `tersh --c` 都会在后台检查更新。发现新版本时显示提示，
+退出时询问是否安装，默认保留现有版本。也可随时运行 `tersh --update`。
+
 从 [Releases](https://github.com/QiushanHuang/Tersh/releases) 下载对应平台的程序，
 或使用 **Rust 1.88 及以上版本**从源码安装：
 
 ```sh
-cargo install --locked --git https://github.com/QiushanHuang/Tersh.git --tag v1.3.0 --bin tersh
+cargo install --locked --git https://github.com/QiushanHuang/Tersh.git --tag v1.4.0 --bin tersh
 ```
 
 更新已有 Cargo 安装时加 `--force`。也可以克隆后运行安装脚本：
@@ -406,7 +440,11 @@ Tersh 每次执行一项文件任务，让进度和结果更容易跟踪。
 
 ### 主机与趋势
 
-![集群详情与观测趋势](docs/images/cluster.png)
+要在另一台电脑上看到相同的设备，请同步私有清单，并用 `local_alias` 指定接收端。
+未登记的 Mac Studio 可以使用观察端安装包。用 `tersh --c --list-hosts` 可直接核对
+当前清单、本机身份和路由。见[多设备部署与离线安装](docs/shared-fleet.md#中文)。
+
+![共享设备拓扑、当前设备仪表和历史趋势](docs/images/cluster-topology.png)
 
 ```sh
 tersh --c --cluster-config examples/servers.json
@@ -419,12 +457,14 @@ tersh --c --cluster-config examples/servers.json
 | --- | --- |
 | 按别名、地址、角色筛选 / 清除 | `/` · Backspace |
 | 切换排序 / 反转 | `v` · `V` |
-| 刷新全部 / 刷新选中主机 | `r` · Enter |
+| 刷新全部 / 刷新选中主机 | `r` · Enter（拓扑中用 `R`） |
+| 直接打开概览 / 拓扑与趋势 / 拓扑与全宽用量表 | `1` / `2` / `3` |
+| 展开或收起拓扑 / 切换拓扑布局 | `m` / `Tab` |
 | 展开详情 / 滚动详情 | `l` · PageUp/PageDown |
 | 硬件管理器：CPU、GPU、内存 | `H` |
 | 打开 shell/SSH / 打开远端 Tersh | `s` · `t` |
 
-用筛选和排序快速找到关注的主机，完整清单的健康检查会继续进行。
+按 `/` 输入清单中的设备别名，方向键选择匹配项，Enter 应用。回到主机视图后按 Backspace，可在完整清单中保留当前选择。
 在目标主机安装 Tersh 后，按 `t` 即可进入它的文件工作台，退出后回到主机面板。
 
 每台主机展示最近 60 次观测，帮助你快速了解负载、内存、磁盘和探测耗时的变化。
@@ -472,7 +512,7 @@ python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 ```
 
 [贡献指南](CONTRIBUTING.md) · [更新记录](CHANGELOG.md) ·
-[v1.3.0 说明](docs/releases/v1.3.0.md)
+[v1.4.0 说明](docs/releases/v1.4.0.md)
 
 维护者：[QiushanHuang](https://github.com/QiushanHuang)。
 贡献署名见 [CONTRIBUTORS.md](CONTRIBUTORS.md)。采用 [MIT 许可](LICENSE)。

@@ -119,6 +119,142 @@ fn inventory_parses_campus_access_json_into_monitorable_hosts() {
 }
 
 #[test]
+fn shared_inventory_binds_the_observer_across_dashboard_and_ssh_entry_points() {
+    let source = serde_json::json!({
+        "main_machine": {"alias":"main","ssh_user":"owner","tailscale_ip":"main.example"},
+        "jump_host": {"alias":"gateway","ssh_user":"ops","device_name":"gw.example"},
+        "servers":[
+            {"alias":"hpc","ssh_user":"batch","campus_ip":"hpc.example","proxy_jump":"gateway"},
+            {"alias":"studio","ssh_user":"artist","campus_ip":"st.example","proxy_jump":"gateway"},
+            {"alias":"nas","campus_ip":"nas.example"}
+        ]
+    });
+    for observer in ["main", "studio", "gateway", "hpc", "nas"] {
+        let mut data = source.clone();
+        data["local_alias"] = observer.into();
+        let inventory = ClusterInventory::from_json(&data.to_string()).unwrap();
+        let hosts = inventory.hosts();
+        assert_eq!(
+            hosts.iter().map(|h| h.alias()).collect::<Vec<_>>(),
+            ["main", "gateway", "hpc", "studio", "nas"]
+        );
+        assert_eq!(
+            hosts.iter().filter(|h| h.kind() == HostKind::Local).count(),
+            1
+        );
+        for host in hosts {
+            if host.alias() == observer {
+                assert_eq!(host.kind(), HostKind::Local);
+                assert!(host.proxy_jump().is_none());
+                assert_eq!(
+                    host_session_command(host, Some("/bin/sh")).program(),
+                    "/bin/sh"
+                );
+                assert_eq!(
+                    host_workbench_command(host, "/qa/tersh").program(),
+                    "/qa/tersh"
+                );
+                continue;
+            }
+            assert_ne!(host.kind(), HostKind::Local);
+            if host.alias() == "main" {
+                assert_eq!(host.ssh_target(), "owner@main.example");
+            }
+            let indirect = matches!(host.alias(), "studio" | "hpc");
+            for args in [
+                ssh_probe_args(host),
+                ssh_session_args(host),
+                tersh::cluster::ssh_workbench_args(host),
+            ] {
+                assert!(args.contains(&host.ssh_target().to_owned()));
+                assert_eq!(
+                    args.windows(2).any(|w| w == ["-J", "ops@gw.example"]),
+                    indirect && observer != "gateway"
+                );
+                assert_eq!(
+                    args.windows(2).any(|w| w == ["-o", "ProxyJump=none"]),
+                    indirect && observer == "gateway"
+                );
+            }
+        }
+        let mut app = ClusterApp::from_inventory(inventory);
+        assert_eq!(app.selected_host().unwrap().alias(), observer);
+        let tree: Vec<_> = tersh::topology::ordered_hosts(&app)
+            .iter()
+            .map(|h| h.alias().to_owned())
+            .collect();
+        assert_eq!(tree.len(), 5);
+        assert_eq!(tree[0], observer);
+        app.apply(ClusterCommand::OpenTopology);
+        for (slot, alias) in tree.iter().enumerate().skip(1) {
+            app.apply(ClusterCommand::First);
+            for _ in 0..slot {
+                app.apply(ClusterCommand::Down);
+            }
+            assert_eq!(app.selected_host().unwrap().alias(), alias);
+            app.apply(ClusterCommand::TopologyParent);
+            let via_gateway = matches!(alias.as_str(), "hpc" | "studio") && observer != "gateway";
+            assert_eq!(
+                app.selected_host().unwrap().alias(),
+                if via_gateway { "gateway" } else { observer }
+            );
+        }
+    }
+}
+
+#[test]
+fn unregistered_observer_probes_all_registered_hosts_remotely() {
+    let data = serde_json::json!({
+        "observer_only": true,
+        "main_machine":{"alias":"desk","ssh_user":"controller","tailscale_ip":"desk.example"},
+        "jump_host":{"alias":"gateway","ssh_user":"admin","device_name":"gateway.example"},
+        "servers":[{"alias":"worker","ssh_user":"research","campus_ip":"worker.example","proxy_jump":"gateway"},
+                   {"alias":"store","campus_ip":"store.example"}]
+    });
+    let inventory = ClusterInventory::from_json(&data.to_string()).unwrap();
+    let hosts = inventory.hosts();
+    assert_eq!(hosts.len(), 4);
+    assert!(hosts.iter().all(|h| h.kind() != HostKind::Local));
+    assert_eq!(ssh_session_args(&hosts[0]), ["controller@desk.example"]);
+    for host in hosts {
+        assert_eq!(host_session_command(host, None).program(), "ssh");
+        assert_eq!(host_workbench_command(host, "tersh").program(), "ssh");
+    }
+    assert_eq!(
+        ssh_session_args(&hosts[2]),
+        ["-J", "admin@gateway.example", "research@worker.example"]
+    );
+    let mut app = ClusterApp::from_inventory(inventory);
+    app.apply(ClusterCommand::OpenTopology);
+    let mut term = Terminal::new(TestBackend::new(144, 36)).unwrap();
+    term.draw(|f| cluster_ui::draw(f, &app)).unwrap();
+    let screen = term
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect::<String>();
+    assert!(screen.contains("Local session"));
+    assert_eq!(app.visible_count(), 4);
+    assert_eq!(tersh::topology::ordered_hosts(&app).len(), 4);
+}
+#[test]
+fn invalid_local_binding_does_not_silently_choose_a_host() {
+    for input in [
+        r#"{"local_alias":"missing","main_machine":{"alias":"main"}}"#,
+        r#"{"local_alias":"","servers":[{"alias":"worker"}]}"#,
+        r#"{"local_alias":null,"main_machine":{"alias":"main"}}"#,
+        r#"{"local_alias":"local"}"#,
+        r#"{"observer_only":true}"#,
+        r#"{"observer_only":true,"local_alias":"main","main_machine":{"alias":"main"}}"#,
+        r#"{"local_alias":"self","servers":[{"alias":"self","proxy_jump":"missing"}]}"#,
+    ] {
+        assert!(ClusterInventory::from_json(input).is_err(), "{input}");
+    }
+}
+
+#[test]
 fn probe_report_parses_resource_and_task_fields() {
     let report = ProbeReport::parse(
         "hostname=starbox\nsystem=Linux x86_64\nuptime=up 4 days\nload=0.12 0.20 0.30\nmemory=512/1024 MB (50%)\nstorage=8G/20G 40% used\ntasks=72 processes\ngpu=A100, 11 %, 2048 MiB / 40960 MiB\n",

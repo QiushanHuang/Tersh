@@ -167,6 +167,9 @@ pub struct App {
     all_entries: Vec<FileEntry>,
     entries: Vec<FileEntry>,
     cursor: usize,
+    file_page_rows: std::cell::Cell<usize>,
+    file_first_row: std::cell::Cell<usize>,
+    filter_origin: Option<OsString>,
     selected: BTreeSet<PathBuf>,
     transfer_buffer: Option<TransferBuffer>,
     preview: Preview,
@@ -927,6 +930,27 @@ impl App {
             .as_ref()
             .is_some_and(|session| session.paused())
     }
+    /// Keep the focused row in view without moving the list while it is already visible.
+    pub(crate) fn file_view_start(&self, rows: usize) -> usize {
+        let rows = rows.max(1);
+        self.file_page_rows.set(rows);
+        let first = self
+            .file_first_row
+            .get()
+            .clamp(self.cursor.saturating_sub(rows - 1), self.cursor)
+            .min(self.entries.len().saturating_sub(rows));
+        self.file_first_row.set(first);
+        first
+    }
+
+    fn page_files(&mut self, down: bool) {
+        let rows = self.file_page_rows.get() as isize;
+        let delta = if down { rows } else { -rows };
+        self.file_first_row
+            .set(self.file_first_row.get().saturating_add_signed(delta));
+        self.move_cursor(delta);
+    }
+
     pub fn set_log_view_lines(&self, lines: usize) {
         self.log_view_lines.set(lines.max(1));
     }
@@ -1296,6 +1320,9 @@ impl App {
             all_entries: Vec::new(),
             entries: Vec::new(),
             cursor: 0,
+            file_page_rows: std::cell::Cell::new(10),
+            file_first_row: std::cell::Cell::new(0),
+            filter_origin: None,
             selected: BTreeSet::new(),
             transfer_buffer: None,
             preview: Preview::message(PathBuf::new(), PreviewKind::Empty, "No file selected"),
@@ -1390,6 +1417,9 @@ impl App {
             all_entries: entries.clone(),
             entries,
             cursor: 0,
+            file_page_rows: std::cell::Cell::new(10),
+            file_first_row: std::cell::Cell::new(0),
+            filter_origin: None,
             selected: BTreeSet::new(),
             transfer_buffer: None,
             preview: Preview {
@@ -1459,6 +1489,7 @@ impl App {
             }
             Command::ForceQuit => self.request_quit(),
             Command::OpenFilter => {
+                self.filter_origin = self.focused().map(|entry| entry.raw_name.clone());
                 self.mode = Mode::Filter;
                 self.input = self.filter.clone();
             }
@@ -1734,14 +1765,14 @@ impl App {
                 if self.mode == Mode::Preview || self.mode == Mode::Log {
                     self.scroll_preview(10);
                 } else {
-                    self.move_cursor(10);
+                    self.page_files(true);
                 }
             }
             Command::HalfUp => {
                 if self.mode == Mode::Preview || self.mode == Mode::Log {
                     self.scroll_preview(-10);
                 } else {
-                    self.move_cursor(-10);
+                    self.page_files(false);
                 }
             }
             Command::First => {
@@ -1841,7 +1872,6 @@ impl App {
                 self.cancel_pending_goto();
                 self.input.pop();
                 if self.mode == Mode::Filter {
-                    self.filter = self.input.clone();
                     self.refresh_visible_entries();
                     self.preview_offset = 0;
                 }
@@ -2195,7 +2225,11 @@ impl App {
     }
 
     pub fn filter(&self) -> &str {
-        &self.filter
+        if self.mode == Mode::Filter {
+            &self.input
+        } else {
+            &self.filter
+        }
     }
 
     pub fn input(&self) -> &str {
@@ -2677,10 +2711,10 @@ impl App {
     }
 
     fn refresh_visible_entries(&mut self) {
-        if self.filter.is_empty() {
+        if self.filter().is_empty() {
             self.entries = self.all_entries.clone();
         } else {
-            let filter = self.filter.to_lowercase();
+            let filter = self.filter().to_lowercase();
             self.entries = self
                 .all_entries
                 .iter()
@@ -2688,7 +2722,9 @@ impl App {
                 .cloned()
                 .collect();
         }
-        self.retain_visible_selection();
+        if self.mode != Mode::Filter {
+            self.retain_visible_selection();
+        }
         self.cursor = self.cursor.min(self.entries.len().saturating_sub(1));
         self.update_preview();
     }
@@ -3209,8 +3245,10 @@ impl App {
     fn submit(&mut self) {
         match self.mode {
             Mode::Filter => {
-                self.filter = self.input.clone();
+                self.filter = std::mem::take(&mut self.input);
+                self.filter_origin = None;
                 self.mode = Mode::Normal;
+                self.retain_visible_selection();
                 self.reload();
             }
             Mode::PreviewSearch => self.execute_preview_search(),
@@ -3364,7 +3402,6 @@ impl App {
             | Mode::Conflict => {
                 self.input.push(ch);
                 if self.mode == Mode::Filter {
-                    self.filter = self.input.clone();
                     self.refresh_visible_entries();
                     self.preview_offset = 0;
                 }
@@ -3374,6 +3411,15 @@ impl App {
     }
 
     fn cancel(&mut self) {
+        if self.mode == Mode::Filter {
+            self.mode = Mode::Normal;
+            self.input.clear();
+            self.refresh_visible_entries();
+            if let Some(name) = self.filter_origin.take() {
+                self.focus_raw_name(&name);
+            }
+            return;
+        }
         if self.mode == Mode::LogSearch {
             self.mode = Mode::Log;
             self.input.clear();
@@ -3701,13 +3747,18 @@ fn run_tui(
         }
     }
     app.set_keymap(keymap);
+    let mut updates = crate::update_prompt::StartupCheck::start();
     let mut dirty = true;
 
     while !app.should_quit() {
+        dirty |= updates.poll();
         dirty |= app.poll_job();
         dirty |= app.poll_readers();
         if dirty {
-            terminal.draw(|frame| crate::ui::draw(frame, &app))?;
+            terminal.draw(|frame| {
+                let body = updates.draw_notice(frame);
+                crate::ui::draw_in(frame, body, &app)
+            })?;
             dirty = false;
         }
         let poll_interval = if app.directory_loading()
@@ -3736,6 +3787,9 @@ fn run_tui(
             }
         }
     }
+    drop(terminal);
+    drop(_guard);
+    updates.offer_on_exit();
     Ok(app.cwd().to_path_buf())
 }
 

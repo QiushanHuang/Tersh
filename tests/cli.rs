@@ -142,3 +142,21 @@ fn keymap_dump_and_invalid_config_are_headless() {
     assert!(!output.status.success());
     assert!(!output.stdout.contains(&0x1b));
 }
+
+#[test]
+fn list_hosts_reads_the_bound_inventory_without_probing() {
+    let d = tempfile::tempdir().unwrap();
+    let file = d.path().join("shared.json");
+    std::fs::write(&file, r#"{"main_machine":{"alias":"desk","tailscale_ip":"desk.invalid"},"servers":[{"alias":"studio","campus_ip":"studio.invalid"}],"local_alias":"studio"}"#).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tersh"))
+        .args(["--c", "--list-hosts", "--cluster-config"])
+        .arg(&file)
+        .env("PATH", d.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let table: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(table["local_alias"], "studio");
+    assert_eq!(table["hosts"].as_array().unwrap().len(), 2);
+    assert_eq!(table["hosts"][0]["kind"], "server");
+}

@@ -22,6 +22,7 @@ const MODAL_CONTEXTS: &[&str] = &[
     "help",
     "actions",
     "cluster_detail",
+    "cluster_topology",
     "cluster_filter",
     "trash",
     "jobs",
@@ -542,6 +543,8 @@ fn default_config() -> Config {
         ("backspace", &["Backspace"]),
         ("down", &["Down", "Tab"]),
         ("up", &["Up", "BackTab"]),
+        ("first", &["Home"]),
+        ("last", &["End"]),
         ("cancel", &["Esc", "Ctrl+g"]),
         ("force_quit", &["Ctrl+c"]),
     ]);
@@ -556,6 +559,10 @@ fn default_config() -> Config {
         ("open_workbench", &["t"]),
         ("open_detail", &["l"]),
         ("open_hardware", &["H"]),
+        ("open_topology", &["m"]),
+        ("show_overview", &["1"]),
+        ("show_topology_trends", &["2"]),
+        ("show_topology_meters", &["3"]),
         ("open_help", &["?"]),
         ("quit", &["q"]),
         ("force_quit", &["Q", "Ctrl+c"]),
@@ -577,6 +584,14 @@ fn default_config() -> Config {
         "cancel".to_owned(),
         vec!["Esc".to_owned(), "Ctrl+g".to_owned(), "q".to_owned()],
     );
+    let mut topology = detail.clone();
+    topology.extend(map(&[
+        ("open_detail", &["Enter", "l"]),
+        ("refresh_selected", &["R"]),
+        ("topology_parent", &["Left"]),
+        ("topology_child", &["Right"]),
+        ("toggle_topology_trends", &["Tab"]),
+    ]));
     detail.insert("detail_down".to_owned(), vec!["PageDown".to_owned()]);
     detail.insert("detail_up".to_owned(), vec!["PageUp".to_owned()]);
     let trash = map(&[
@@ -641,7 +656,12 @@ fn default_config() -> Config {
         ("actions", actions),
         ("cluster", cluster),
         ("cluster_detail", detail),
-        ("cluster_filter", input),
+        ("cluster_topology", topology),
+        ("cluster_filter", {
+            let mut filter = input;
+            filter.extend(map(&[("up", &["Up"]), ("down", &["Down"])]));
+            filter
+        }),
         ("trash", trash),
         ("jobs", jobs),
     ]
