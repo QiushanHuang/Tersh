@@ -71,15 +71,25 @@ def plan(state, request, config_path):
     incoming = request.get("inventory")
     if incoming is not None:
         data = base64.b64decode(incoming, validate=True)
-        if len(data) > 65536 or not isinstance(json.loads(data.decode("utf-8")), dict):
+        if len(data) > 65536:
+            raise ValueError("Invalid inventory")
+        incoming_doc = json.loads(data.decode("utf-8"))
+        if not isinstance(incoming_doc, dict):
             raise ValueError("Invalid inventory")
         previous = state["config"]
         wanted = digest(data)
         if previous != wanted:
             if state["config_link"]:
                 raise ValueError("Will not replace a private inventory symlink")
-            if previous is not None and previous not in (state["managed_config"], request.get("reconcile")):
-                raise ValueError("Different inventory already exists. Reconcile its exact SHA-256: " + previous)
+            if previous is not None and request.get("reconcile") != previous:
+                if previous != state["managed_config"]:
+                    raise ValueError("Different inventory already exists. Reconcile its exact SHA-256: " + previous)
+                # Multiple SSH hosts can share one home directory. A clean managed
+                # snapshot authorizes refreshing that receiver, not rebinding it.
+                current_doc = json.loads(config_path.read_bytes().decode("utf-8"))
+                if (current_doc.get("local_alias") != incoming_doc.get("local_alias")
+                        or current_doc.get("observer_only", False) != incoming_doc.get("observer_only", False)):
+                    raise ValueError("Different device identity. Reconcile its exact SHA-256: " + previous)
             changes.append((config_path, "inventory", previous))
         if wanted != state["managed_config"]:
             if state["config_link"]:

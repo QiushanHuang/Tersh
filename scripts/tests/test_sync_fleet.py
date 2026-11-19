@@ -113,6 +113,43 @@ class FleetTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Different inventory"):
             remote.install(self.home, [self.bin], self.request())
 
+    def test_shared_home_requires_exact_reconcile_for_every_binding_change(self):
+        original = self.request()
+        remote.install(self.home, [self.bin], original)
+        for target, observer in [("gateway", False), (None, True), ("worker", False)]:
+            req = self.request()
+            req["inventory"] = base64.b64encode(fleet.bound(inventory, target, observer=observer)).decode()
+            old = self.cfg.read_bytes()
+            req["reconcile"] = "0" * 64
+            with self.assertRaisesRegex(ValueError, "identity"):
+                remote.install(self.home, [self.bin], req)
+            self.assertEqual(self.cfg.read_bytes(), old)
+            req["reconcile"] = remote.digest(old)
+            remote.install(self.home, [self.bin], req)
+            self.assertEqual(self.cfg.read_bytes(), base64.b64decode(req["inventory"]))
+
+    def test_local_source_is_preserved_only_when_it_is_the_active_home_inventory(self):
+        source = self.root / "master.json"
+        source.write_text(json.dumps(inventory))
+        args = SimpleNamespace(inventory=source, release_dir=self.release, version="1.4.0", apply=False)
+        state = {"os": "Linux", "arch": "x86_64"}
+        with mock.patch.object(Path, "home", return_value=self.home):
+            with mock.patch.object(fleet, "endpoint", side_effect=[state, {"changed": []}]) as endpoint:
+                fleet.sync(args, inventory, "console", inventory["main_machine"], None)
+                payload = endpoint.call_args.args[1]["inventory"]
+                self.assertEqual(json.loads(base64.b64decode(payload))["local_alias"], "console")
+            self.cfg.parent.mkdir(parents=True)
+            self.cfg.symlink_to(source)
+            with mock.patch.object(fleet, "endpoint", side_effect=[state, {"changed": []}]) as endpoint:
+                fleet.sync(args, inventory, "console", inventory["main_machine"], None)
+                self.assertIsNone(endpoint.call_args.args[1]["inventory"])
+            separate = self.root / "another-master.json"
+            separate.write_bytes(source.read_bytes())
+            args.inventory = separate
+            with mock.patch.object(fleet, "endpoint", side_effect=[state, {"changed": []}]) as endpoint:
+                fleet.sync(args, inventory, "console", inventory["main_machine"], None)
+                self.assertIsNotNone(endpoint.call_args.args[1]["inventory"])
+
     def test_partial_activation_is_rolled_back(self):
         self.create_old()
         req = self.request()

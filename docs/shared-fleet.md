@@ -64,11 +64,16 @@ Each receiver gets the executable for its OS/architecture and its own private
 inventory. A differing hand-maintained inventory requires review; the plan
 reports its current SHA-256. After checking the contents, pass
 `--reconcile ALIAS=SHA256` to authorize replacing that exact revision.
+A later sync can refresh an unchanged managed copy. Rebinding an existing copy
+to a different observer still requires the reviewed digest.
 The tool verifies the staged files, creates backups for changed existing files
 and reports their paths. Rerun after changing the authoritative roster or to
 retry an unavailable endpoint. Devices sharing a home and configuration path
 must use separate inventory files with `TERSH_SERVERS_JSON` if their local
 aliases differ.
+
+Fleet deployment changes the program and inventory. On a new WSL route, use
+`tersh --check-install-patches` to inspect the separate [SSH lifecycle settings](wsl-ssh.md).
 
 ## Offline or unregistered computer
 

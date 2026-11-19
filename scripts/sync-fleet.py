@@ -138,8 +138,15 @@ def sync(args, inventory, name, host, accepted):
     if not platform:
         raise ValueError("Unsupported endpoint platform: {} {}".format(state["os"], state["arch"]))
     binary, digest = artifact(args.release_dir, args.version, platform)
-    # The controller's source inventory (often a symlink) is authoritative. Only imported copies are bound.
-    config = None if len(command) == 2 else base64.b64encode(bound(inventory, name)).decode()
+    # Protect the controller's live authority, including symlinks to a master.
+    # An explicitly supplied separate inventory is an import on this host, too.
+    same_source = False
+    if len(command) == 2:
+        try:
+            same_source = args.inventory.samefile(Path.home() / ".config/tersh/servers.json")
+        except FileNotFoundError:
+            pass
+    config = None if same_source else base64.b64encode(bound(inventory, name)).decode()
     request = {"operation": "plan", "version": args.version, "binary_sha256": digest, "inventory": config,
                "inspected": state, "reconcile": accepted}
     result = endpoint(command, request)
