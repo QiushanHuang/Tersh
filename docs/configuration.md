@@ -18,10 +18,26 @@ affect the current process; presentation presets do not write user settings.
 | `TERSH_CLIPBOARD=off` | Disable OSC52 terminal clipboard writes |
 | `NO_COLOR` / `TERSH_COLOR=off` | Disable colors |
 
+In a local Ghostty session, Tersh defaults to rounded borders and Unicode graph
+cells. Set `TERSH_BORDER` or `TERSH_GLYPHS` to override either default.
 A preset overrides the corresponding environment variables. Explicit `--theme`
 and `--no-motion` apply afterwards; no-color settings remain respected. Motion
 is limited to active probes at at most four frames/second. Graph history comes
 from completed probes, not an extra collector.
+
+### Ghostty 1.4.0
+
+Ghostty 1.4.0 on macOS is a compatibility target for the file workbench and
+cluster dashboard. The default btop theme gives panel borders, device outlines
+and graph traces distinct foreground colors on the terminal background.
+Resource meters have a segmented fill and a dotted track. Percentages and
+missing values (`--`) remain visible in monochrome. The topology draws its
+nodes, links and activity markers with text cells. Resize the window or change the font size
+to switch between the wide diagram and compact outline.
+
+For UI changes, verify the default local presentation and the ASCII SSH preset
+in Ghostty. Check that selecting a device, opening a dialog and returning to
+the list preserve focus, and that resizing keeps the selected item visible.
 
 ## Keys
 
@@ -69,6 +85,7 @@ combinations; keep a simple alternative on mobile keyboards.
 | `cluster` | Host list |
 | `cluster_detail` | Expanded host detail and hardware manager |
 | `cluster_filter` | Host filter input |
+| `cluster_topology` | Expanded SSH topology |
 | `trash` | Recovery list |
 | `jobs` | File-job progress/results |
 | `places` | Searchable recent and pinned directories |
@@ -82,12 +99,16 @@ before exit. Failed printable chords replay their text in input contexts.
 
 ## Host inventory
 
+For shared inventories, observer binding, deployment and update checks, see
+the [fleet guide](shared-fleet.md). Use `tersh --c --list-hosts` to inspect the
+effective source and device roles on the current machine.
+
 Lookup order: `--cluster-config FILE`, `TERSH_SERVERS_JSON`, `./ssh/servers.json`,
 then `~/.config/tersh/servers.json`. If no inventory exists, the dashboard uses
 a local-host fallback. See [examples/servers.json](../examples/servers.json).
 
-The top-level keys are `main_machine`, `jump_host`, and `servers`. All are
-optional. A server accepts `alias`, `campus_ip` (hostname or IP), `ssh_user`,
+The host records are `main_machine`, `jump_host` and `servers`. A shared
+copy may also specify `local_alias` or `observer_only: true`. A server accepts `alias`, `campus_ip` (hostname or IP), `ssh_user`,
 `proxy_jump`, `role`, and `workdir`. A jump host accepts `device_name` or
 `tailscale_ip` for its address. `directory` and `tersh_dir` are accepted aliases
 for `workdir`. A server's `proxy_jump` must identify the configured jump host.
@@ -184,6 +205,35 @@ CSV supports quoted commas/newlines. Structured input/output is capped at
 Invalid or oversized input has an explicit bounded raw fallback. These are data
 limits, not a claim about peak process memory. No external renderer is launched.
 
+## SSH topology
+
+The overview draws the inventory's SSH routes alongside the host table when
+space permits. Press `m` at any width to expand the map. The local session is
+the origin. Each server with `proxy_jump` sits under its configured jump host.
+Additional hops configured outside the Tersh inventory are outside this diagram.
+
+Use `↑` / `↓` or `k` / `j` to select devices in tree order. `←` selects the
+visible parent and `→` the first visible child. `Enter` opens the selected
+device's detail. `Esc` goes back. In the expanded map `R` refreshes one device
+and `r` refreshes all. Filtering keeps the ancestor path visible.
+From the overview, topology, detail or hardware page, `1` opens the host overview,
+`2` opens the topology with trends, and `3` opens the topology with full-width
+usage meters for the selected device. These keys preserve the selected host.
+Press `m` from the overview to open the trends layout. Inside the topology,
+`Tab` switches between the two layouts, including before the first observation.
+The drawing adapts to the terminal size.
+
+Press `/` and type a configured alias, address or role to filter by name.
+An exact alias takes focus. Use the arrow keys to choose among matches and
+`Enter` to apply; `Esc` restores the previous filter and selection.
+`Backspace` in a host view clears filters while keeping the selected device in
+view. Digits remain searchable text inside the filter and action picker.
+
+The moving dot marks a probe in progress. The state beside each device comes
+from that device's snapshot. `--no-motion` keeps the status text and stationary
+links. Resource meters and trends follow the selected device. Missing readings
+display as `--`.
+
 ## Host attention and refresh
 
 In `--c`, `a` toggles hosts needing attention, `E` opens the latest 100 state
@@ -197,15 +247,25 @@ to 30/60/120 seconds. Existing concurrency and connection-time budgets remain
 bounded. Closing the dashboard cancels active probes and reaps their workers.
 Attention filters and charts reuse existing snapshots and never add collectors.
 
-Trend positions represent observation order with equal visual spacing, not equal
-time intervals. Gaps remain missing. Memory/storage use fixed percentage scales;
-load is not CPU utilization, and probe duration is not pure network latency.
+Observations are equally spaced from oldest to newest. On Unicode terminals,
+brighter stems mark the measurements and the filled trace connects adjacent
+valid samples. ASCII terminals use text symbols for the same trace. The
+number above the chart is the actual sample count. A failed probe leaves a
+gap between valid runs. The latest reading and vertical scale appear at
+the right. Memory and disk use a fixed 0–100% scale. Wide charts adapt their
+load and probe-duration scales to the visible observations. Load is the
+one-minute load average. Probe duration includes connection and collection.
 
 ## Interface behavior
 
 `I` toggles the wide-screen inspector. Directory sizes are shown as unscanned
 rather than presenting directory metadata as recursive storage use. At 40 columns,
 primary actions and the action menu retain priority, including custom keybindings.
-Action menus group tasks, support search aliases, and explain unavailable actions.
+Press `/` to filter in place while reading the file or host list. In the file
+list, `PageUp` and `PageDown` move by the current viewport height.
+Press `o` for the action menu. Search by name, shortcut or task keyword.
+An exact shortcut match respects case, so `s` and `S` can select different
+actions. Use `Home` or `End` to jump to the first or last match. The selected
+row shows the effective binding and explains any unavailable action.
 Pending chord hints follow the effective keymap. Existing no-color, ASCII and
 no-motion presets continue to work without font extensions or idle animation.

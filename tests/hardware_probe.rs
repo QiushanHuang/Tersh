@@ -26,7 +26,7 @@ fn probe(os: &str, commands: &[(&str, &str)], files: &[(&str, &str)]) -> ProbeRe
         ),
         (
             "vm_stat",
-            "printf '%s\n' 'Mach Virtual Memory Statistics: (page size of 16384 bytes)' 'Pages free: 1048576.' 'Pages speculative: 0.'",
+            "printf '%s\n' 'Mach Virtual Memory Statistics: (page size of 16384 bytes)' 'Pages free: 32768.' 'Pages speculative: 128.' 'File-backed pages: 1048576.' 'Anonymous pages: 2097152.' 'Pages purgeable: 131072.' 'Pages wired down: 262144.' 'Pages occupied by compressor: 65536.' 'Pages stored in compressor: 524288.'",
         ),
     ];
     for (name, body) in defaults.iter().chain(commands) {
@@ -86,11 +86,13 @@ FIXTURE"#,
         ],
         &[],
     );
+    assert_eq!(report.memory_used_percent(), Some(74));
+    assert_eq!(report.memory.as_deref(), Some("48640/65536 MiB (74%)"));
     let h = report.hardware;
     assert_eq!(h.cpu_usage_percent, Some(55));
     assert_eq!(h.memory_total_bytes, Some(68719476736));
-    assert_eq!(h.memory_used_bytes, Some(51539607552));
-    assert!(h.memory_basis.unwrap().contains("includes caches"));
+    assert_eq!(h.memory_used_bytes, Some(51002736640));
+    assert!(h.memory_basis.unwrap().contains("free + file-backed"));
     assert_eq!(h.gpus.len(), 2);
     assert_eq!(h.gpus[0].usage_percent, Some(31));
     assert!(h.gpus[0].shared_memory);
@@ -99,6 +101,34 @@ FIXTURE"#,
     assert_eq!(h.gpus[1].name, "Discrete GPU");
     assert_eq!(h.gpus[1].usage_percent, None);
     assert_eq!(h.gpus[1].memory_total_bytes, Some(8589934592));
+}
+
+#[test]
+fn darwin_missing_or_inconsistent_ram_counters_keep_usage_unknown() {
+    for counters in [
+        "'File-backed pages: 8.'",
+        "'Pages free: 8.'",
+        "'Pages free: 4194304.' 'File-backed pages: 1.'",
+        "'Pages free: malformed.' 'File-backed pages: 1.'",
+        "'Pages free: 5.' 'File-backed pages: -1.'",
+    ] {
+        let script = format!(
+            "printf '%s\n' 'Mach Virtual Memory Statistics: (page size of 16384 bytes)' {counters}"
+        );
+        let report = probe(
+            "Darwin",
+            &[
+                ("vm_stat", &script),
+                (
+                    "memory_pressure",
+                    "echo 'System-wide memory free percentage: 90%'",
+                ),
+            ],
+            &[],
+        );
+        assert_eq!(report.memory_used_percent(), None);
+        assert_eq!(report.hardware.memory_total_bytes, Some(68719476736));
+    }
 }
 
 #[test]

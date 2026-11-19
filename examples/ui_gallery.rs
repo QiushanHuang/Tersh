@@ -28,12 +28,86 @@ fn export(name: &str, width: u16, height: u16, out: &Path, draw: impl FnOnce(&mu
     .unwrap();
 }
 
+fn export_topology(out: &Path) {
+    let inventory = out.join("topology-demo-inventory.json");
+    fs::write(
+        &inventory,
+        r#"{
+            "main_machine": {"alias":"workstation","role":"Local workstation"},
+            "jump_host": {"alias":"campus-jump","device_name":"jump.invalid","role":"Campus gateway"},
+            "servers": [
+                {"alias":"compute-1","campus_ip":"hpc1.invalid","proxy_jump":"campus-jump","role":"HPC login"},
+                {"alias":"compute-2","campus_ip":"hpc2.invalid","proxy_jump":"campus-jump","role":"HPC login"},
+                {"alias":"studio","campus_ip":"studio.invalid","proxy_jump":"campus-jump","role":"Mac Studio"},
+                {"alias":"nas","campus_ip":"nas.invalid","role":"Direct storage"},
+                {"alias":"lab-desktop","campus_ip":"lab.invalid","role":"Direct workstation"}
+            ]
+        }"#,
+    )
+    .unwrap();
+    let mut app = ClusterApp::from_inventory(ClusterInventory::from_path(&inventory).unwrap());
+    for (alias, cpu, mem, disk, ms) in [
+        ("workstation", 12, 33, 41, 8),
+        ("campus-jump", 6, 21, 19, 54),
+        ("studio", 74, 59, 38, 162),
+        ("nas", 9, 32, 78, 41),
+    ] {
+        let report = ProbeReport::parse(&format!(
+            "cpu_usage={cpu}\nmemory={mem}% used\nstorage={disk}% used"
+        ));
+        app.apply_snapshot(HostSnapshot::online(alias, report, ms));
+    }
+    let now = SystemTime::now();
+    for (n, cpu) in [24, 38, 29, 45, 67, 58, 74, 62].into_iter().enumerate() {
+        let report = ProbeReport::parse(&format!(
+            "hostname=compute-1\nsystem=Linux x86_64\ncpu_usage={cpu}\nload={:.2}\nmemory={}% used\nstorage=46% used",
+            f64::from(cpu) / 10.0,
+            45 + n,
+        ));
+        let mut snapshot = HostSnapshot::online("compute-1", report, 135 + n as u128 * 3);
+        snapshot.refreshed_at = Some(now - Duration::from_secs((7 - n as u64) * 15));
+        app.apply_snapshot(snapshot);
+    }
+    app.apply_snapshot(HostSnapshot::offline(
+        "lab-desktop",
+        "Synthetic offline example",
+    ));
+    // Mark an in-flight probe in the model. The gallery never starts a worker.
+    app.begin_refresh(&["compute-2".into()]);
+    app.apply(ClusterCommand::Down);
+    app.apply(ClusterCommand::Down);
+    assert_eq!(app.selected_host().unwrap().alias(), "compute-1");
+    export("topology-overview", 144, 36, out, |f| {
+        tersh::cluster_ui::draw(f, &app)
+    });
+    app.apply(ClusterCommand::OpenTopology);
+    export("topology-desktop", 144, 36, out, |f| {
+        tersh::cluster_ui::draw(f, &app)
+    });
+    export("topology-phone", 40, 18, out, |f| {
+        tersh::cluster_ui::draw(f, &app)
+    });
+    for frame in 1..4 {
+        assert!(app.animate(Duration::from_millis(frame * 250), true));
+        export(&format!("topology-pulse-{frame}"), 144, 36, out, |f| {
+            tersh::cluster_ui::draw(f, &app)
+        });
+    }
+    app.apply(ClusterCommand::Down);
+    app.apply(ClusterCommand::Down);
+    assert_eq!(app.selected_host().unwrap().alias(), "studio");
+    export("topology-studio", 144, 36, out, |f| {
+        tersh::cluster_ui::draw(f, &app)
+    });
+}
+
 fn main() {
     let out = std::env::args()
         .nth(1)
         .unwrap_or("target/ui-gallery".into());
     let out = Path::new(&out);
     fs::create_dir_all(out).unwrap();
+    export_topology(out);
     let fixture = tempfile::Builder::new()
         .prefix("tersh-demo-")
         .tempdir_in("/tmp")

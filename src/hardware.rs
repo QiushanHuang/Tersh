@@ -74,6 +74,12 @@ impl HardwareInfo {
         self == &Self::default()
     }
 
+    pub fn is_macos_ram_estimate(&self) -> bool {
+        self.memory_basis
+            .as_deref()
+            .is_some_and(|basis| basis.starts_with("macOS estimate:"))
+    }
+
     pub fn memory_percent(&self) -> Option<u16> {
         ratio(self.memory_used_bytes?, self.memory_total_bytes?)
     }

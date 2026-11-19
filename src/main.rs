@@ -9,6 +9,24 @@ use std::path::PathBuf;
     about = "Tersh is a lightweight terminal file workbench for local and SSH shell sessions."
 )]
 struct Cli {
+    #[arg(long, group = "update_mode", conflicts_with_all = ["install_patch_mode", "export_observation", "cluster_status", "path", "print_cwd", "dump_keymap", "ui_profile", "theme", "keymap", "no_motion"], help = "Check the latest official stable release without installing it")]
+    check_update: bool,
+    #[arg(long, group = "update_mode", conflicts_with_all = ["install_patch_mode", "export_observation", "cluster_status", "path", "print_cwd", "dump_keymap", "ui_profile", "theme", "keymap", "no_motion"], help = "Offer to install a verified newer release of the running executable")]
+    update: bool,
+    #[arg(
+        long,
+        requires = "update",
+        help = "Confirm an explicitly requested --update without a terminal prompt"
+    )]
+    yes: bool,
+    #[arg(long, requires_all = ["observation_host", "observation_resource", "observation_output"], conflicts_with_all = ["cluster_status", "install_patches", "check_install_patches", "path", "dump_keymap", "print_cwd"], help = "Collect exactly one selected host through the existing 30-second collector; no background service")]
+    export_observation: Option<PathBuf>,
+    #[arg(long, requires = "export_observation")]
+    observation_host: Option<String>,
+    #[arg(long, requires = "export_observation")]
+    observation_resource: Option<String>,
+    #[arg(long, requires = "export_observation")]
+    observation_output: Option<PathBuf>,
     #[arg(long, group = "install_patch_mode",
         conflicts_with_all = ["cluster_status", "path", "print_cwd", "dump_keymap", "keymap", "ui_profile", "theme", "no_motion"],
         help = "Apply local WSL connection lifecycle patches with backups; no remote access")]
@@ -58,6 +76,13 @@ struct Cli {
 
     #[arg(
         long,
+        requires = "cluster_status",
+        help = "Print the effective inventory and observer as JSON without starting probes"
+    )]
+    list_hosts: bool,
+
+    #[arg(
+        long,
         value_name = "FILE",
         requires = "cluster_status",
         help = "Read multi-server status inventory from a JSON file"
@@ -76,8 +101,46 @@ struct Cli {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if cli.check_update || cli.update {
+        return tersh::update_command(cli.update, cli.yes);
+    }
+    if let Some(inventory) = cli.export_observation.as_deref() {
+        return tersh::observation_export::run(
+            inventory,
+            cli.observation_host.as_deref().unwrap(),
+            cli.observation_resource.as_deref().unwrap(),
+            cli.observation_output.as_deref().unwrap(),
+        );
+    }
     if cli.install_patches || cli.check_install_patches {
         return tersh::install_patches::run(cli.install_patches, cli.patch_ssh_config.as_deref());
+    }
+    if cli.list_hosts {
+        use tersh::cluster::{ClusterInventory, HostKind};
+        let inventory = match cli.cluster_config.as_deref() {
+            Some(path) => ClusterInventory::from_path(path)?,
+            None => ClusterInventory::load_default()?,
+        };
+        let local = inventory
+            .hosts()
+            .iter()
+            .find(|host| host.kind() == HostKind::Local);
+        let hosts: Vec<_> = inventory
+            .hosts()
+            .iter()
+            .map(|host| {
+                serde_json::json!({
+                    "alias": host.alias(), "kind": host.kind().label(), "via": host.proxy_jump(),
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "source": inventory.source(), "local_alias": local.map(|h| h.alias()), "hosts": hosts,
+            }))?
+        );
+        return Ok(());
     }
     let keymap = load_keymap(cli.keymap.as_deref())?;
     if cli.dump_keymap {
@@ -90,6 +153,15 @@ fn main() -> Result<()> {
         if let Some(profile) = cli.ui_profile.as_deref() {
             for (key, value) in tersh::theme::profile_settings(profile) {
                 std::env::set_var(key, value);
+            }
+        } else if std::env::var("TERM_PROGRAM").as_deref() == Ok("ghostty")
+            && std::env::var_os("SSH_CONNECTION").is_none()
+            && std::env::var_os("SSH_TTY").is_none()
+        {
+            for (key, value) in [("TERSH_BORDER", "rounded"), ("TERSH_GLYPHS", "unicode")] {
+                if std::env::var_os(key).is_none() {
+                    std::env::set_var(key, value);
+                }
             }
         }
         if let Some(theme) = &cli.theme {

@@ -285,30 +285,160 @@ fn semantic_tones_and_chips_route_through_palette() {
 
 #[test]
 fn resource_bar_component_clamps_and_preserves_ascii_shape() {
-    let danger_bar = resource_bar(Theme::Btop, Some(95), 10);
-    let rendered = danger_bar
-        .iter()
-        .map(|span| span.content.as_ref())
-        .collect::<String>();
-
-    assert_eq!(rendered, "[##########]");
-    assert_eq!(danger_bar[1].style.fg, Some(Theme::Btop.palette().danger));
-
-    let half_bar = resource_bar(Theme::Btop, Some(50), 10);
-    let rendered = half_bar
-        .iter()
-        .map(|span| span.content.as_ref())
-        .collect::<String>();
-
-    assert_eq!(rendered, "[#####-----]");
-    assert_ne!(half_bar[1].style.fg, half_bar[2].style.fg);
-
-    let mono_bar = resource_bar(Theme::Mono, Some(50), 10);
-    assert!(
-        mono_bar
+    with_env_var("TERSH_GLYPHS", "ascii", || {
+        let danger_bar = resource_bar(Theme::Btop, Some(95), 10);
+        let rendered = danger_bar
             .iter()
-            .all(|span| span.style.fg.is_none() && span.style.bg.is_none())
-    );
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert_eq!(rendered, "[##########]");
+        assert_eq!(danger_bar[1].style.fg, Some(Theme::Btop.palette().danger));
+
+        let half_bar = resource_bar(Theme::Btop, Some(50), 10);
+        let rendered = half_bar
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert_eq!(rendered, "[#####-----]");
+        assert_ne!(half_bar[1].style.fg, half_bar[2].style.fg);
+
+        let mono_bar = resource_bar(Theme::Mono, Some(50), 10);
+        assert!(
+            mono_bar
+                .iter()
+                .all(|span| span.style.fg.is_none() && span.style.bg.is_none())
+        );
+    });
+}
+
+#[test]
+fn unicode_resource_meter_matches_the_desktop_glyph_setting() {
+    with_env_var("TERSH_GLYPHS", "unicode", || {
+        let bar = resource_bar(Theme::Btop, Some(50), 6);
+        assert_eq!(
+            bar.iter().map(|s| s.content.as_ref()).collect::<String>(),
+            "[▆▆▆⣿⣿⣿]"
+        );
+    });
+}
+
+#[test]
+fn ghostty_charts_separate_rows_and_samples_and_keep_the_empty_track_visible() {
+    with_env_var("TERM_PROGRAM", "ghostty", || {
+        let _restore = EnvRestore {
+            name: "TERSH_GLYPHS".into(),
+            old: std::env::var_os("TERSH_GLYPHS"),
+        };
+        unsafe { std::env::set_var("TERSH_GLYPHS", "unicode") };
+        for (value, expected) in [
+            (None, "[⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿]"),
+            (Some(0), "[⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿]"),
+            (Some(7), "[▆⣿⣿⣿⣿⣿⣿⣿⣿⣿]"),
+            (Some(100), "[▆▆▆▆▆▆▆▆▆▆]"),
+        ] {
+            let bar = resource_bar(Theme::Btop, value, 10);
+            assert_eq!(
+                bar.iter().map(|s| s.content.as_ref()).collect::<String>(),
+                expected
+            );
+        }
+        let bar = resource_bar(Theme::Btop, Some(50), 10);
+        assert_eq!(bar[1].style.fg, Some(Color::Rgb(136, 192, 140)));
+        assert_ne!(bar[1].style.fg, bar[2].style.fg);
+        let track = bar.iter().find(|s| s.content.contains('⣿')).unwrap();
+        assert_eq!(track.style.fg, Some(Color::Rgb(83, 97, 113)));
+        assert!(bar.iter().all(|span| span.style.bg.is_none()));
+        let mut app = ClusterApp::new(vec![]);
+        let host = app.hosts()[0].alias().to_owned();
+        for _ in 0..2 {
+            app.apply_snapshot(HostSnapshot::online(
+                &host,
+                ProbeReport::parse("storage=46% used"),
+                10,
+            ));
+        }
+        app.apply(tersh::cluster::ClusterCommand::OpenTopology);
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal
+            .draw(|frame| cluster_ui::draw(frame, &app))
+            .unwrap();
+        let disk = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(120)
+            .find(|row| {
+                row.iter()
+                    .map(|c| c.symbol())
+                    .collect::<String>()
+                    .contains("Disk used")
+            })
+            .unwrap();
+        let original = Color::Rgb(225, 186, 117);
+        let shaded = Color::Rgb(196, 162, 102);
+        let interior = Color::Rgb(171, 141, 89);
+        let columns: Vec<_> = disk
+            .iter()
+            .filter(|cell| [original, shaded, interior].contains(&cell.fg))
+            .collect();
+        assert!(
+            columns.len() >= 24,
+            "two samples only drew {} cells",
+            columns.len()
+        );
+        assert!(columns.iter().all(|cell| cell.bg == Color::Reset));
+        assert_eq!(
+            columns.iter().filter(|cell| cell.fg == original).count(),
+            2,
+            "only measured columns use the brightest ink"
+        );
+        assert!(
+            columns
+                .iter()
+                .all(|c| { c.symbol().chars().all(|ch| "▁▂▃▄▅▆▇█".contains(ch)) })
+        );
+        assert_eq!(
+            columns
+                .iter()
+                .filter(|c| c.modifier.contains(ratatui::style::Modifier::BOLD))
+                .count(),
+            2,
+            "mark the two actual observations"
+        );
+        assert!(
+            resource_bar(Theme::Mono, Some(50), 10)
+                .iter()
+                .all(|s| s.style.fg.is_none() && s.style.bg.is_none())
+        );
+    });
+}
+
+#[test]
+fn ghostty_inactive_panel_frames_are_distinct_from_the_focused_panel_and_background() {
+    with_env_var("TERM_PROGRAM", "ghostty", || {
+        let app = ClusterApp::new(vec![]);
+        let mut term = Terminal::new(TestBackend::new(144, 36)).unwrap();
+        term.draw(|f| cluster_ui::draw(f, &app)).unwrap();
+        let palette = Theme::Btop.palette();
+        assert_ne!(palette.active, palette.inactive);
+        for label in ["Route", "Detail"] {
+            let frame = term
+                .backend()
+                .buffer()
+                .content()
+                .chunks(144)
+                .find_map(|row| {
+                    let text: String = row.iter().map(|c| c.symbol()).collect();
+                    text.find(label).map(|_| row.last().unwrap())
+                })
+                .unwrap();
+            assert_eq!(frame.fg, palette.inactive);
+            assert!(matches!(frame.fg, Color::Rgb(_, _, _)));
+            assert_eq!(frame.bg, Color::Reset);
+        }
+    });
 }
 
 #[test]

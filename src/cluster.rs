@@ -69,14 +69,22 @@ impl HostKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+enum SshRoute {
+    Direct,
+    Via { alias: String, target: String },
+    // This observer is the configured gateway. Suppress a matching ProxyJump
+    // in its SSH client configuration when talking to its downstream peers.
+    FromLocalGateway,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostConfig {
     alias: String,
     kind: HostKind,
     address: String,
     user: Option<String>,
     role: String,
-    proxy_jump: Option<String>,
-    proxy_jump_target: Option<String>,
+    route: SshRoute,
     ssh_target: String,
     workdir: Option<String>,
 }
@@ -103,11 +111,17 @@ impl HostConfig {
     }
 
     pub fn proxy_jump(&self) -> Option<&str> {
-        self.proxy_jump.as_deref()
+        match &self.route {
+            SshRoute::Via { alias, .. } => Some(alias),
+            _ => None,
+        }
     }
 
     pub fn proxy_jump_target(&self) -> Option<&str> {
-        self.proxy_jump_target.as_deref()
+        match &self.route {
+            SshRoute::Via { target, .. } => Some(target),
+            _ => None,
+        }
     }
 
     pub fn ssh_target(&self) -> &str {
@@ -127,9 +141,7 @@ impl HostConfig {
             format!(
                 "{}|{}|{}",
                 self.ssh_target,
-                self.proxy_jump_target()
-                    .or_else(|| self.proxy_jump())
-                    .unwrap_or(""),
+                self.proxy_jump_target().unwrap_or(""),
                 self.kind.label()
             ),
         )
@@ -145,19 +157,37 @@ pub struct ClusterInventory {
 impl ClusterInventory {
     pub fn from_json(input: &str) -> Result<Self> {
         let file: InventoryFile = serde_json::from_str(input).context("parse servers.json")?;
+        anyhow::ensure!(
+            !file.observer_only || file.local_alias.is_none(),
+            "observer_only and local_alias cannot both be set"
+        );
         let mut hosts = Vec::new();
 
         if let Some(main) = file.main_machine {
             let alias = normalize_optional(main.alias).unwrap_or_else(|| "local".to_string());
+            let address = normalize_optional(main.tailscale_ip).unwrap_or_else(|| alias.clone());
+            let user = normalize_optional(main.ssh_user);
+            let remote = file.observer_only
+                || file
+                    .local_alias
+                    .as_ref()
+                    .is_some_and(|local| local != &alias);
             hosts.push(HostConfig {
-                address: normalize_optional(main.tailscale_ip).unwrap_or_else(|| alias.clone()),
+                ssh_target: if remote {
+                    connection_target(user.as_deref(), &address)
+                } else {
+                    alias.clone()
+                },
+                address,
                 role: normalize_optional(main.role).unwrap_or_else(|| "Codex host".to_string()),
-                ssh_target: alias.clone(),
                 alias,
-                kind: HostKind::Local,
-                user: None,
-                proxy_jump: None,
-                proxy_jump_target: None,
+                kind: if remote {
+                    HostKind::Server
+                } else {
+                    HostKind::Local
+                },
+                user,
+                route: SshRoute::Direct,
                 workdir: normalize_workdir(main.workdir),
             });
         }
@@ -179,8 +209,7 @@ impl ClusterInventory {
                 alias,
                 kind: HostKind::Jump,
                 user,
-                proxy_jump: None,
-                proxy_jump_target: None,
+                route: SshRoute::Direct,
                 workdir: normalize_workdir(jump.workdir),
             });
         }
@@ -191,11 +220,16 @@ impl ClusterInventory {
             });
             let user = normalize_optional(server.ssh_user);
             let address = normalize_optional(server.campus_ip).unwrap_or_else(|| alias.clone());
-            let proxy_jump = normalize_optional(server.proxy_jump);
-            let proxy_jump_target = proxy_jump
-                .as_ref()
-                .and_then(|alias| proxy_targets.get(alias).cloned())
-                .or_else(|| proxy_jump.clone());
+            let route = match normalize_optional(server.proxy_jump) {
+                Some(alias) => {
+                    let target = proxy_targets
+                        .get(&alias)
+                        .with_context(|| format!("unresolved proxy_jump: {alias}"))?
+                        .clone();
+                    SshRoute::Via { alias, target }
+                }
+                None => SshRoute::Direct,
+            };
             hosts.push(HostConfig {
                 ssh_target: connection_target(user.as_deref(), &address),
                 address,
@@ -204,16 +238,33 @@ impl ClusterInventory {
                 alias,
                 kind: HostKind::Server,
                 user,
-                proxy_jump,
-                proxy_jump_target,
+                route,
                 workdir: normalize_workdir(server.workdir),
             });
         }
 
-        if hosts.is_empty() {
+        validate_hosts(&hosts)?;
+        if let Some(local_alias) = file.local_alias {
+            anyhow::ensure!(
+                hosts.iter().any(|h| h.alias() == local_alias),
+                "local_alias must match a registered host: {local_alias:?}"
+            );
+            for host in &mut hosts {
+                if host.alias == local_alias {
+                    host.kind = HostKind::Local;
+                    host.route = SshRoute::Direct;
+                    host.ssh_target = host.alias.clone();
+                } else if host.proxy_jump() == Some(&local_alias) {
+                    host.route = SshRoute::FromLocalGateway;
+                }
+            }
+        } else if hosts.is_empty() {
+            anyhow::ensure!(
+                !file.observer_only,
+                "observer_only needs at least one registered host"
+            );
             hosts.push(local_fallback_host());
         }
-        validate_hosts(&hosts)?;
 
         Ok(Self {
             hosts,
@@ -257,15 +308,28 @@ impl ClusterInventory {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InventoryFile {
+    #[serde(default)]
+    observer_only: bool,
+    #[serde(default, deserialize_with = "read_local_alias")]
+    local_alias: Option<String>,
     main_machine: Option<MainMachineRecord>,
     jump_host: Option<JumpHostRecord>,
     servers: Option<Vec<ServerRecord>>,
+}
+
+// Missing means the legacy controller. An explicit null must not quietly
+// turn a broken observer binding into local execution on the wrong machine.
+fn read_local_alias<'de, D: serde::Deserializer<'de>>(
+    input: D,
+) -> Result<Option<String>, D::Error> {
+    String::deserialize(input).map(Some)
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MainMachineRecord {
     alias: Option<String>,
+    ssh_user: Option<String>,
     tailscale_ip: Option<String>,
     role: Option<String>,
     #[serde(alias = "directory", alias = "tersh_dir")]
@@ -299,6 +363,7 @@ struct ServerRecord {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProbeReport {
     pub hardware: crate::hardware::HardwareInfo,
+    pub source_time: Option<String>,
     pub hostname: Option<String>,
     pub system: Option<String>,
     pub uptime: Option<String>,
@@ -324,6 +389,7 @@ impl ProbeReport {
                 continue;
             }
             match key.trim() {
+                "source_time" => report.source_time = Some(value.to_string()),
                 "hostname" => report.hostname = Some(value.to_string()),
                 "system" => report.system = Some(value.to_string()),
                 "uptime" => report.uptime = Some(value.to_string()),
@@ -336,6 +402,42 @@ impl ProbeReport {
             }
         }
         report
+    }
+
+    /// Earlier Darwin probes put the memory_pressure tool's index into the
+    /// raw memory field. That index cannot be converted to occupied bytes.
+    pub fn legacy_darwin_pressure_index(&self) -> Option<u16> {
+        let macos = self
+            .system
+            .as_deref()
+            .is_some_and(|s| s.split_whitespace().next() == Some("Darwin"))
+            || self
+                .hardware
+                .memory_basis
+                .as_deref()
+                .is_some_and(|basis| basis.starts_with("macOS"));
+        if !macos {
+            return None;
+        }
+        let index = self
+            .memory
+            .as_deref()?
+            .strip_suffix("% free")?
+            .trim()
+            .parse()
+            .ok()?;
+        (index <= 100).then_some(index)
+    }
+
+    /// Prefer measured bytes; fall back only to summaries of physical RAM.
+    pub fn memory_used_percent(&self) -> Option<u16> {
+        if let Some(percent) = self.hardware.memory_percent() {
+            return Some(percent);
+        }
+        if self.legacy_darwin_pressure_index().is_some() {
+            return None;
+        }
+        self.memory.as_deref().and_then(crate::metrics::memory_used)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -516,6 +618,7 @@ impl HostSnapshot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClusterMode {
     Normal,
+    Topology,
     Detail,
     Hardware,
     Help,
@@ -536,6 +639,13 @@ pub enum ClusterCommand {
     OpenWorkbench,
     OpenDetail,
     OpenHardware,
+    OpenTopology,
+    ShowOverview,
+    ShowTopologyTrends,
+    ShowTopologyMeters,
+    TopologyParent,
+    TopologyChild,
+    ToggleTopologyTrends,
     OpenHelp,
     Cancel,
     Quit,
@@ -563,7 +673,9 @@ macro_rules! cluster_actions {
     }
 }
 cluster_actions! { Down=>"down",Up=>"up",First=>"first",Last=>"last",RefreshAll=>"refresh_all",RefreshSelected=>"refresh_selected",
-OpenSession=>"open_session",OpenWorkbench=>"open_workbench",OpenDetail=>"open_detail",OpenHardware=>"open_hardware",OpenHelp=>"open_help",Cancel=>"cancel",
+OpenSession=>"open_session",OpenWorkbench=>"open_workbench",OpenDetail=>"open_detail",OpenHardware=>"open_hardware",OpenTopology=>"open_topology",
+ShowOverview=>"show_overview",ShowTopologyTrends=>"show_topology_trends",ShowTopologyMeters=>"show_topology_meters",
+TopologyParent=>"topology_parent",TopologyChild=>"topology_child",ToggleTopologyTrends=>"toggle_topology_trends",OpenHelp=>"open_help",Cancel=>"cancel",
 Quit=>"quit",ForceQuit=>"force_quit",DetailDown=>"detail_down",DetailUp=>"detail_up",OpenFilter=>"open_filter",ClearFilter=>"clear_filter",
 CycleSort=>"cycle_sort",ReverseSort=>"reverse_sort",OpenActions=>"open_actions",
 ToggleAttention=>"toggle_attention",OpenEvents=>"open_events",TogglePause=>"toggle_pause",
@@ -622,11 +734,13 @@ pub struct ClusterApp {
     key_state: crate::bindings::KeyState,
     help_offset: usize,
     help_context: String,
+    overlay_origin: ClusterMode,
     actions: Option<crate::actions::ActionMenu<ClusterCommand>>,
     history: BTreeMap<String, VecDeque<crate::metrics::MetricSample>>,
     detail_offset: u16,
     detail_limit: std::cell::Cell<u16>,
     hardware_page_step: std::cell::Cell<u16>,
+    topology_full_width: bool,
     animation_frame: u64,
     hosts: Vec<HostConfig>,
     visible: Vec<usize>,
@@ -660,6 +774,7 @@ pub struct ClusterApp {
     active_probes: BTreeMap<String, ActiveProbe>,
     cursor: usize,
     mode: ClusterMode,
+    overview: ClusterMode, // The host table or the expanded topology beneath a detail view.
     should_quit: bool,
     logs: Vec<String>,
     refreshing: BTreeSet<String>,
@@ -676,6 +791,10 @@ impl ClusterApp {
         }
         let mut seen = BTreeSet::new();
         hosts.retain(|host| seen.insert(host.alias().to_string()));
+        let cursor = hosts
+            .iter()
+            .position(|host| host.kind() == HostKind::Local)
+            .unwrap_or(0);
         let snapshots = hosts
             .iter()
             .map(|host| {
@@ -690,6 +809,7 @@ impl ClusterApp {
             key_state: crate::bindings::KeyState::default(),
             help_offset: 0,
             help_context: "cluster".into(),
+            overlay_origin: ClusterMode::Normal,
             visible: (0..hosts.len()).collect(),
             filter: String::new(),
             filter_before: String::new(),
@@ -703,6 +823,7 @@ impl ClusterApp {
             detail_offset: 0,
             detail_limit: std::cell::Cell::new(0),
             hardware_page_step: std::cell::Cell::new(1),
+            topology_full_width: false,
             animation_frame: 0,
             snapshots,
             last_good_reports: BTreeMap::new(),
@@ -726,8 +847,9 @@ impl ClusterApp {
             pending_workbench: None,
             refresh_deadlines: BTreeMap::new(),
             active_probes: BTreeMap::new(),
-            cursor: 0,
+            cursor,
             mode: ClusterMode::Normal,
+            overview: ClusterMode::Normal,
             should_quit: false,
             logs: vec!["ready".to_string()],
             refreshing: BTreeSet::new(),
@@ -779,8 +901,50 @@ impl ClusterApp {
                 _ => {}
             }
         }
+        let navigating_map = self.mode == ClusterMode::Topology
+            || (self.mode == ClusterMode::Filter && self.topology_active());
+        if navigating_map
+            && matches!(
+                command,
+                ClusterCommand::Down
+                    | ClusterCommand::Up
+                    | ClusterCommand::First
+                    | ClusterCommand::Last
+                    | ClusterCommand::TopologyParent
+                    | ClusterCommand::TopologyChild
+            )
+        {
+            if let Some(cursor) = self.topology_cursor(command) {
+                self.cursor = cursor;
+                self.detail_offset = 0;
+            }
+            return;
+        }
         match command {
+            ClusterCommand::ToggleTopologyTrends => {
+                if self.mode == ClusterMode::Topology {
+                    self.topology_full_width = !self.topology_full_width;
+                }
+            }
+            ClusterCommand::OpenTopology
+            | ClusterCommand::ShowOverview
+            | ClusterCommand::ShowTopologyTrends
+            | ClusterCommand::ShowTopologyMeters => {
+                self.overview = if command == ClusterCommand::ShowOverview
+                    || (command == ClusterCommand::OpenTopology
+                        && self.mode == ClusterMode::Topology)
+                {
+                    ClusterMode::Normal
+                } else {
+                    ClusterMode::Topology
+                };
+                self.topology_full_width = command == ClusterCommand::ShowTopologyMeters;
+                self.mode = self.overview;
+                self.detail_offset = 0;
+            }
+            ClusterCommand::TopologyParent | ClusterCommand::TopologyChild => {}
             ClusterCommand::OpenPlaces => {
+                self.overlay_origin = self.mode;
                 self.place_query.clear();
                 self.place_cursor = 0;
                 self.place_message = None;
@@ -793,6 +957,7 @@ impl ClusterApp {
                 self.rebuild_view();
             }
             ClusterCommand::OpenEvents => {
+                self.overlay_origin = self.mode;
                 self.help_offset = 0;
                 self.mode = ClusterMode::Events;
             }
@@ -852,6 +1017,7 @@ impl ClusterApp {
                 self.detail_offset = 0;
             }
             ClusterCommand::OpenHelp => {
+                self.overlay_origin = self.mode;
                 self.help_context = self.key_context().into();
                 self.help_offset = 0;
                 self.mode = ClusterMode::Help;
@@ -870,21 +1036,14 @@ impl ClusterApp {
                     }
                     self.mode = self.filter_origin;
                 } else {
-                    self.mode = ClusterMode::Normal;
+                    self.back_to_overview();
                 }
             }
             ClusterCommand::Quit => {
-                if matches!(
-                    self.mode,
-                    ClusterMode::Help
-                        | ClusterMode::Detail
-                        | ClusterMode::Hardware
-                        | ClusterMode::Events
-                        | ClusterMode::Places
-                ) {
-                    self.mode = ClusterMode::Normal;
-                } else {
+                if matches!(self.mode, ClusterMode::Normal | ClusterMode::Filter) {
                     self.should_quit = true;
+                } else {
+                    self.back_to_overview();
                 }
             }
             ClusterCommand::ForceQuit => self.should_quit = true,
@@ -1120,9 +1279,11 @@ impl ClusterApp {
                     match action.as_str() {
                         "cancel" => self.apply(ClusterCommand::Cancel),
                         "submit" => self.mode = self.filter_origin,
+                        "up" => self.apply(ClusterCommand::Up),
+                        "down" => self.apply(ClusterCommand::Down),
                         "backspace" => {
                             self.filter.pop();
-                            self.rebuild_view();
+                            self.update_filter_results();
                         }
                         _ => {}
                     }
@@ -1155,9 +1316,22 @@ impl ClusterApp {
             && self.filter.chars().count() < 256
         {
             self.filter.push(ch);
-            self.rebuild_view();
+            self.update_filter_results();
         }
     }
+
+    fn update_filter_results(&mut self) {
+        self.rebuild_view();
+        if let Some(cursor) = self.visible.iter().position(|index| {
+            self.hosts[*index]
+                .alias()
+                .eq_ignore_ascii_case(&self.filter)
+        }) {
+            self.cursor = cursor;
+        }
+        self.detail_offset = 0;
+    }
+
     pub fn set_keymap(&mut self, map: crate::keymap::Keymap) {
         self.keymap = std::sync::Arc::new(map);
         self.key_state.clear();
@@ -1172,6 +1346,7 @@ impl ClusterApp {
         }
         match self.mode {
             ClusterMode::Normal => "cluster",
+            ClusterMode::Topology => "cluster_topology",
             ClusterMode::Detail | ClusterMode::Hardware => "cluster_detail",
             ClusterMode::Help | ClusterMode::Events => "help",
             ClusterMode::Filter => "cluster_filter",
@@ -1197,6 +1372,26 @@ impl ClusterApp {
             Action::new("Open shell / SSH", "s", ClusterCommand::OpenSession),
             Action::new("Host detail and trends", "l", ClusterCommand::OpenDetail),
             Action::new("Hardware manager", "H", ClusterCommand::OpenHardware),
+            Action::new(
+                if self.mode == ClusterMode::Topology {
+                    "Back to host list"
+                } else {
+                    "SSH route topology"
+                },
+                "m",
+                ClusterCommand::OpenTopology,
+            ),
+            Action::new("Show host overview", "1", ClusterCommand::ShowOverview),
+            Action::new(
+                "Show topology with trends",
+                "2",
+                ClusterCommand::ShowTopologyTrends,
+            ),
+            Action::new(
+                "Show topology with full-width meters",
+                "3",
+                ClusterCommand::ShowTopologyMeters,
+            ),
             Action::new("Filter hosts", "/", ClusterCommand::OpenFilter),
             Action::new(
                 "Clear host filter",
@@ -1233,8 +1428,43 @@ impl ClusterApp {
             actions.extend([
                 Action::new("Scroll detail down", "PgDn", ClusterCommand::DetailDown),
                 Action::new("Scroll detail up", "PgUp", ClusterCommand::DetailUp),
-                Action::new("Back to hosts", "q", ClusterCommand::Cancel),
+                Action::new(
+                    if self.topology_active() {
+                        "Back to topology"
+                    } else {
+                        "Back to hosts"
+                    },
+                    "q",
+                    ClusterCommand::Cancel,
+                ),
             ]);
+        }
+        if self.mode == ClusterMode::Topology {
+            actions.push(Action::new(
+                if self.topology_shows_trends() {
+                    "Hide trends"
+                } else {
+                    "Show trends"
+                },
+                "Tab",
+                ClusterCommand::ToggleTopologyTrends,
+            ));
+            for (action, reason) in [
+                (
+                    Action::new("Parent device", "Left", ClusterCommand::TopologyParent),
+                    "No visible parent device",
+                ),
+                (
+                    Action::new("First child device", "Right", ClusterCommand::TopologyChild),
+                    "No visible child device",
+                ),
+            ] {
+                actions.push(if self.topology_cursor(action.command).is_some() {
+                    action
+                } else {
+                    action.disabled(reason)
+                });
+            }
         }
         if self.selected_host().is_none() {
             actions.retain(|action| {
@@ -1265,6 +1495,14 @@ impl ClusterApp {
     }
 
     fn dispatch(&mut self, command: ClusterCommand) -> Option<ClusterCommand> {
+        if self.selected_host().is_none()
+            && matches!(
+                command,
+                ClusterCommand::OpenDetail | ClusterCommand::OpenHardware
+            )
+        {
+            return None;
+        }
         if self.selected_host().is_none()
             && matches!(
                 command,
@@ -1400,7 +1638,7 @@ impl ClusterApp {
         let choice = self.place_choices.get(self.place_cursor).cloned();
         match action {
             "cancel" => {
-                self.mode = ClusterMode::Normal;
+                self.mode = self.overlay_origin;
                 self.pending_workbench = None;
             }
             "down" => {
@@ -1435,7 +1673,7 @@ impl ClusterApp {
                         }
                         host.workdir = choice.path.to_str().map(str::to_owned);
                         self.pending_workbench = Some(host);
-                        self.mode = ClusterMode::Normal;
+                        self.mode = self.overview;
                         return Some(ClusterCommand::OpenWorkbench);
                     }
                     self.place_message = Some(
@@ -1496,8 +1734,12 @@ impl ClusterApp {
     pub fn set_hardware_viewport(&self, rows: u16) {
         self.hardware_page_step.set(rows.saturating_sub(1).max(1));
     }
+    pub(crate) fn animation_phase(&self) -> usize {
+        (self.animation_frame % 4) as usize
+    }
+
     pub fn activity_symbol(&self) -> char {
-        ['|', '/', '-', '\\'][(self.animation_frame % 4) as usize]
+        ['|', '/', '-', '\\'][self.animation_phase()]
     }
 
     /// Only active probes request animation frames; idle state never does.
@@ -1514,6 +1756,14 @@ impl ClusterApp {
         } else {
             false
         }
+    }
+
+    pub fn topology_shows_trends(&self) -> bool {
+        !self.topology_full_width
+    }
+
+    pub fn topology_active(&self) -> bool {
+        self.overview == ClusterMode::Topology
     }
 
     pub fn mode(&self) -> ClusterMode {
@@ -1565,12 +1815,7 @@ impl ClusterApp {
                     .parse::<f64>()
                     .ok()
                     .filter(|v| v.is_finite() && *v >= 0.0),
-                HostSort::Memory => snapshot
-                    .report
-                    .memory
-                    .as_deref()
-                    .and_then(crate::metrics::memory_used)
-                    .map(f64::from),
+                HostSort::Memory => snapshot.report.memory_used_percent().map(f64::from),
                 HostSort::Disk => snapshot
                     .report
                     .storage
@@ -1897,6 +2142,44 @@ impl ClusterApp {
         )
     }
 
+    fn back_to_overview(&mut self) {
+        if matches!(
+            self.mode,
+            ClusterMode::Help | ClusterMode::Events | ClusterMode::Places
+        ) {
+            self.mode = self.overlay_origin;
+            return;
+        }
+        if self.mode == ClusterMode::Topology {
+            self.overview = ClusterMode::Normal;
+        }
+        self.mode = self.overview;
+    }
+
+    /// Return a cursor in the filtered host list, using the order displayed in the map.
+    fn topology_cursor(&self, command: ClusterCommand) -> Option<usize> {
+        let current = self.selected_host()?;
+        let nodes = crate::topology::ordered_hosts(self);
+        let position = nodes
+            .iter()
+            .position(|node| node.alias() == current.alias())?;
+        let target = match command {
+            ClusterCommand::Down => nodes.get(position + 1).copied(),
+            ClusterCommand::Up => nodes.get(position.checked_sub(1)?).copied(),
+            ClusterCommand::First => nodes.first().copied(),
+            ClusterCommand::Last => nodes.last().copied(),
+            ClusterCommand::TopologyParent => crate::topology::parent(self, current),
+            ClusterCommand::TopologyChild => nodes.into_iter().find(|node| {
+                crate::topology::parent(self, node)
+                    .is_some_and(|parent| parent.alias() == current.alias())
+            }),
+            _ => None,
+        }?;
+        self.visible
+            .iter()
+            .position(|index| self.hosts[*index].alias() == target.alias())
+    }
+
     fn move_cursor(&mut self, delta: isize) {
         self.detail_offset = 0;
         self.cursor = self
@@ -1956,11 +2239,13 @@ fn run_inventory_with_keymap(
     let (tx, rx) = mpsc::channel();
     let mut workers = ProbeWorkers::default();
     start_scheduled_refresh(&mut app, tx.clone(), &mut workers);
+    let mut updates = crate::update_prompt::StartupCheck::start();
     let mut dirty = true;
     let animation_started = Instant::now();
     let motion = crate::theme::motion_enabled();
 
     while !app.should_quit() {
+        dirty |= updates.poll();
         workers.reap();
         if app.tick_freshness() {
             dirty = true;
@@ -1981,7 +2266,10 @@ fn run_inventory_with_keymap(
         }
 
         if dirty {
-            terminal.draw(|frame| crate::cluster_ui::draw(frame, &app))?;
+            terminal.draw(|frame| {
+                let body = updates.draw_notice(frame);
+                crate::cluster_ui::draw_in(frame, body, &app)
+            })?;
             dirty = false;
         }
         if event::poll(Duration::from_millis(100))? {
@@ -2020,6 +2308,10 @@ fn run_inventory_with_keymap(
             }
         }
     }
+    drop(workers);
+    drop(terminal);
+    drop(guard);
+    updates.offer_on_exit();
     Ok(())
 }
 
@@ -2135,15 +2427,13 @@ pub fn ssh_probe_args(host: &HostConfig) -> Vec<String> {
         "-o".to_string(),
         "StrictHostKeyChecking=yes".to_string(),
         "-o".to_string(),
+        "UpdateHostKeys=no".to_string(),
+        "-o".to_string(),
         "ServerAliveInterval=10".to_string(),
         "-o".to_string(),
         "ServerAliveCountMax=2".to_string(),
     ];
-    if let Some(proxy_jump) = host.proxy_jump() {
-        args.push("-J".to_string());
-        args.push(host.proxy_jump_target().unwrap_or(proxy_jump).to_string());
-    }
-    args.push(host.ssh_target().to_string());
+    args.extend(ssh_session_args(host));
     args.push(remote_probe_command(PROBE_SCRIPT));
     args
 }
@@ -2193,12 +2483,12 @@ pub fn host_session_command(host: &HostConfig, local_shell: Option<&str>) -> Ses
 }
 
 pub fn ssh_session_args(host: &HostConfig) -> Vec<String> {
-    let mut args = Vec::new();
-    if let Some(proxy_jump) = host.proxy_jump() {
-        args.push("-J".to_string());
-        args.push(host.proxy_jump_target().unwrap_or(proxy_jump).to_string());
-    }
-    args.push(host.ssh_target().to_string());
+    let mut args = match &host.route {
+        SshRoute::Direct => Vec::new(),
+        SshRoute::Via { target, .. } => vec!["-J".into(), target.clone()],
+        SshRoute::FromLocalGateway => vec!["-o".into(), "ProxyJump=none".into()],
+    };
+    args.push(host.ssh_target().to_owned());
     args
 }
 
@@ -2233,11 +2523,7 @@ pub fn host_workbench_command(host: &HostConfig, local_tersh_program: &str) -> S
 
 pub fn ssh_workbench_args(host: &HostConfig) -> Vec<String> {
     let mut args = vec!["-t".to_string()];
-    if let Some(proxy_jump) = host.proxy_jump() {
-        args.push("-J".to_string());
-        args.push(host.proxy_jump_target().unwrap_or(proxy_jump).to_string());
-    }
-    args.push(host.ssh_target().to_string());
+    args.extend(ssh_session_args(host));
     args.push(remote_workbench_command(host));
     args
 }
@@ -2619,8 +2905,7 @@ fn local_fallback_host() -> HostConfig {
         address: "127.0.0.1".to_string(),
         user: None,
         role: "Local machine".to_string(),
-        proxy_jump: None,
-        proxy_jump_target: None,
+        route: SshRoute::Direct,
         ssh_target: "local".to_string(),
         workdir: None,
     }
@@ -2663,13 +2948,13 @@ fn validate_hosts(hosts: &[HostConfig]) -> Result<()> {
             validate_ssh_field("ssh_user", user)?;
         }
         validate_ssh_field("ssh_target", &host.ssh_target)?;
-        if let Some(proxy_jump) = &host.proxy_jump {
+        if let Some(proxy_jump) = host.proxy_jump() {
             validate_ssh_field("proxy_jump", proxy_jump)?;
-            if !jump_aliases.contains(proxy_jump.as_str()) {
+            if !jump_aliases.contains(proxy_jump) {
                 anyhow::bail!("unresolved proxy_jump: {proxy_jump}");
             }
         }
-        if let Some(proxy_target) = &host.proxy_jump_target {
+        if let Some(proxy_target) = host.proxy_jump_target() {
             validate_ssh_field("proxy_jump_target", proxy_target)?;
         }
         validate_display_field("role", &host.role)?;
@@ -3284,8 +3569,7 @@ mod tests {
             address: "203.0.113.10".to_string(),
             user: Some("ops".to_string()),
             role: "Remote server".to_string(),
-            proxy_jump: None,
-            proxy_jump_target: None,
+            route: SshRoute::Direct,
             ssh_target: "ops@203.0.113.10".to_string(),
             workdir: None,
         }

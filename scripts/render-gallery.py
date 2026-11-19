@@ -3,6 +3,7 @@
 python scripts/render-gallery.py target/ui-gallery
 """
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -16,6 +17,14 @@ COLORS = dict(zip(
      "#78c7d0", "#c8ced6", "#536171", "#ff9396", "#a6dcaa", "#f1d692",
      "#9bb9e2", "#d0a8e9", "#a0e1e6", "#f4f6fb"],
 ))
+
+def cell_color(value, default):
+    match = re.fullmatch(r"Rgb\((\d+), (\d+), (\d+)\)", value)
+    if match:
+        return tuple(map(int, match.groups()))
+    return COLORS.get(value, default)
+
+
 FONT_PATHS = ["/System/Library/Fonts/Menlo.ttc",
               "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"]
 font_path = next((p for p in FONT_PATHS if Path(p).exists()), "DejaVuSansMono.ttf")
@@ -32,7 +41,7 @@ for path in Path(sys.argv[1]).glob("*.json"):
     draw.text((20, 12), caption[:width], font=font, fill="#91a4b8")
     for index, cell in enumerate(data["cells"]):
         x, y = 20 + index % width * 10, 45 + index // width * 21
-        fg, bg = COLORS.get(cell["fg"], "#d6dfe9"), COLORS.get(cell["bg"], "#101820")
+        fg, bg = cell_color(cell["fg"], "#d6dfe9"), cell_color(cell["bg"], "#101820")
         if cell["reverse"]:
             fg, bg = bg, fg
         draw.rectangle((x, y, x + 10, y + 21), fill=bg)

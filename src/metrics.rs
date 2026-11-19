@@ -22,12 +22,7 @@ impl MetricSample {
                 .and_then(|s| s.split_whitespace().next())
                 .and_then(|s| s.parse::<f64>().ok())
                 .filter(|v| v.is_finite() && *v >= 0.0);
-            values[1] = snapshot
-                .report
-                .memory
-                .as_deref()
-                .and_then(memory_used)
-                .map(f64::from);
+            values[1] = snapshot.report.memory_used_percent().map(f64::from);
             values[2] = snapshot
                 .report
                 .storage
@@ -75,21 +70,35 @@ pub fn memory_used(raw: &str) -> Option<u16> {
     })
 }
 
+/// Zero reserves a gap for missing data; observed values use levels 1..=steps.
+pub(crate) fn trend_level(value: Option<f64>, low: f64, high: f64, steps: usize) -> usize {
+    let Some(value) = value.filter(|v| v.is_finite() && *v >= 0.0) else {
+        return 0;
+    };
+    let ratio = if high > low {
+        (value - low) / (high - low)
+    } else {
+        0.0
+    };
+    1 + (ratio.clamp(0.0, 1.0) * (steps - 1) as f64).round() as usize
+}
+
 /// One character per observation, no interpolation across a failed probe.
 pub fn sparkline(values: &[Option<f64>], ceiling: f64, unicode: bool) -> String {
-    let symbols = if unicode {
-        ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█']
+    // Keep a two-eighths gutter above each desktop sparkline, including peaks.
+    // Terminal block glyphs occupy the entire cell without font leading.
+    let symbols: &[char] = if unicode {
+        &['▁', '▂', '▃', '▄', '▅', '▆']
     } else {
-        ['_', '.', ':', '-', '=', '+', '*', '#']
+        &['_', '.', ':', '-', '=', '+', '*', '#']
     };
     values
         .iter()
-        .map(|value| match value {
-            Some(value) if value.is_finite() && *value >= 0.0 => {
-                let ratio = if ceiling > 0.0 { value / ceiling } else { 0.0 };
-                symbols[(ratio.clamp(0.0, 1.0) * 7.0).round() as usize]
-            }
-            _ => ' ',
-        })
+        .map(
+            |value| match trend_level(*value, 0.0, ceiling, symbols.len()) {
+                0 => ' ',
+                level => symbols[level - 1],
+            },
+        )
         .collect()
 }

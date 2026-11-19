@@ -442,3 +442,71 @@ fn file_rows_truncate_wide_unicode_names_by_display_width() {
     assert!(row.iter().filter(|cell| cell.symbol() == "界").count() < 24);
     assert_eq!(row.last().unwrap().symbol(), "|");
 }
+
+#[test]
+fn inline_file_filter_keeps_results_and_latest_input_visible_on_phone() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("align.rs"), "x").unwrap();
+    std::fs::write(dir.path().join("other.txt"), "x").unwrap();
+    let mut app = App::new(dir.path().into()).unwrap();
+    app.handle_key(KeyEvent::from(KeyCode::Char('/')));
+    for ch in "align".chars() {
+        app.handle_key(KeyEvent::from(KeyCode::Char(ch)));
+    }
+    let buffer = render_app(&app, 40, 10);
+    assert!(buffer.contains("Filter  align"));
+    assert!(buffer.contains("align.rs"));
+    assert!(!buffer.contains("other.txt"));
+    assert!(!buffer.contains("Command"));
+    for ch in "1234567890123456789012345678901234567890界END".chars() {
+        app.handle_key(KeyEvent::from(KeyCode::Char(ch)));
+    }
+    assert!(render_app(&app, 40, 10).contains("END"));
+}
+
+#[test]
+fn directory_pages_follow_the_number_of_visible_entries_after_resize() {
+    let dir = tempfile::tempdir().unwrap();
+    for i in 0..80 {
+        std::fs::write(dir.path().join(format!("entry-{i:02}")), "").unwrap();
+    }
+    let mut app = App::new(dir.path().into()).unwrap();
+    for height in [12, 28] {
+        let screen = render_app(&app, 40, height);
+        let visible = screen.matches("entry-").count();
+        let start = app.cursor();
+        app.handle_key(KeyEvent::from(KeyCode::PageDown));
+        assert_eq!(app.cursor(), start + visible);
+        let next_screen = render_app(&app, 40, height);
+        for i in 0..80 {
+            let name = format!("entry-{i:02}");
+            assert!(
+                !(screen.contains(&name) && next_screen.contains(&name)),
+                "repeated {name} after paging"
+            );
+        }
+    }
+}
+
+#[test]
+fn wider_file_table_aligns_metadata_after_the_filename() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("alpha.txt"), "xyz").unwrap();
+    let app = App::new(dir.path().into()).unwrap();
+    let mut terminal = Terminal::new(TestBackend::new(180, 24)).unwrap();
+    terminal.draw(|frame| draw(frame, &app)).unwrap();
+    let rows = terminal
+        .backend()
+        .buffer()
+        .content()
+        .chunks(180)
+        .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
+        .collect::<Vec<_>>();
+    let header = rows.iter().find(|row| row.contains("NAME")).unwrap();
+    let row = rows
+        .iter()
+        .find(|row| row.contains(">   alpha.txt"))
+        .unwrap();
+    assert_eq!(header.find("NAME"), row.find("alpha.txt"));
+    assert!(row.find("alpha.txt").unwrap() < row.find("3 B").unwrap());
+}

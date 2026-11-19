@@ -169,3 +169,66 @@ fn inspector_can_be_collapsed_without_hiding_preview() {
     assert!(!text.contains("Inspector"));
     assert!(text.contains("Preview"));
 }
+
+#[test]
+fn action_picker_ranks_exact_case_shortcuts_and_label_matches_first() {
+    for (query, expected) in [
+        ("S", "Reverse sort"),
+        ("s", "Cycle sort"),
+        ("sort", "Cycle sort"),
+    ] {
+        let mut menu = ActionMenu::new(vec![
+            Action::new("Inspect ordering", "i", ()).described(
+                "Navigation",
+                "Inspect the sort order",
+                "",
+            ),
+            Action::new("Cycle sort", "s", ()),
+            Action::new("Reverse sort", "S", ()),
+        ]);
+        for ch in query.chars() {
+            menu.input_char(ch);
+        }
+        assert_eq!(menu.matches()[0].label, expected);
+    }
+}
+
+#[test]
+fn action_picker_keeps_a_result_and_the_query_caret_on_a_short_terminal() {
+    use tersh::actions::MenuResult;
+    let mut menu = ActionMenu::new(vec![
+        Action::new("First choice", "a", 1),
+        Action::new("Last choice", "z", 2),
+    ]);
+    menu.handle_action("last");
+    assert!(matches!(menu.handle_action("submit"), MenuResult::Run(2)));
+    let mut term = Terminal::new(TestBackend::new(32, 8)).unwrap();
+    term.draw(|f| tersh::actions::draw(f, f.area(), &menu, tersh::theme::Theme::Mono))
+        .unwrap();
+    let text: String = term
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(text.contains("Last choice"), "{text}");
+    menu.handle_action("first");
+    assert!(matches!(menu.handle_action("submit"), MenuResult::Run(1)));
+    for ch in "这是一个很长的中文查询结尾".chars() {
+        menu.input_char(ch);
+    }
+    let mut term = Terminal::new(TestBackend::new(22, 8)).unwrap();
+    term.draw(|f| tersh::actions::draw(f, f.area(), &menu, tersh::theme::Theme::Mono))
+        .unwrap();
+    let text: String = term
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(text.contains('尾'), "{text}");
+    let caret = term.get_cursor_position().unwrap();
+    assert!(caret.x < 21 && caret.y < 7);
+}

@@ -49,7 +49,7 @@ class Session:
         for key in list(env):
             if key.startswith("TERSH_") or key == "NO_COLOR":
                 env.pop(key, None)
-        env.update({"TERM": "xterm-256color", "TERSH_CLIPBOARD": "off",
+        env.update({"TERM": "xterm-256color", "TERSH_CLIPBOARD": "off", "TERSH_UPDATE_CHECK": "off",
                     "XDG_CONFIG_HOME": str(runner.root / "empty-config"),
                     "XDG_STATE_HOME": str(runner.root / "state")})
         self.process = subprocess.Popen(

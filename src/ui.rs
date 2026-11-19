@@ -16,7 +16,10 @@ use ratatui::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 pub fn draw(frame: &mut Frame, app: &App) {
-    let area = frame.area();
+    draw_in(frame, frame.area(), app);
+}
+
+pub(crate) fn draw_in(frame: &mut Frame, area: Rect, app: &App) {
     let theme = Theme::current();
     match app.mode() {
         Mode::Preview | Mode::PreviewSearch | Mode::Log | Mode::LogSearch => {
@@ -60,8 +63,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
                 Mode::Jobs => draw_jobs(frame, rows[1], app, theme),
                 Mode::Trash => draw_trash(frame, rows[1], app, theme),
                 Mode::Places => draw_places(frame, rows[1], app, theme),
-                Mode::Filter
-                | Mode::Goto
+                Mode::Goto
                 | Mode::Rename
                 | Mode::CopyTo
                 | Mode::MoveTo
@@ -72,7 +74,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
                 | Mode::ExportJob => {
                     draw_input_modal(frame, command_overlay_rect(area, app.mode()), app, theme)
                 }
-                Mode::Message
+                Mode::Filter
+                | Mode::Message
                 | Mode::Normal
                 | Mode::Preview
                 | Mode::PreviewSearch
@@ -92,12 +95,6 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
         return;
     }
     let palette = theme.palette();
-    let hidden = if app.show_hidden() { "ON" } else { "OFF" };
-    let filter = if app.filter().is_empty() {
-        "-".to_string()
-    } else {
-        escape_display(app.filter())
-    };
     let lines = vec![
         Line::from(vec![
             Span::styled(" Tersh ", theme.chip(palette.text, palette.accent)),
@@ -123,31 +120,38 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
             ),
         ]),
         Line::from(vec![
-            chip(
-                "items",
-                app.entries().len(),
-                theme.chip(palette.text, palette.ok),
-            ),
+            chip("items", app.entries().len(), theme.fg_bold(palette.value)),
             Span::raw(" "),
             chip(
                 "sel",
-                format!("{} {}", app.selected_len(), selection_size(app)),
-                theme.chip(palette.text, palette.accent_alt),
+                if app.selected_len() == 0 || app.mode() == Mode::Filter {
+                    app.selected_len().to_string()
+                } else {
+                    format!("{} {}", app.selected_len(), selection_size(app))
+                },
+                if app.selected_len() > 0 {
+                    theme.chip(palette.text, palette.accent_alt)
+                } else {
+                    theme.fg(palette.muted)
+                },
             ),
             Span::raw(" "),
             chip(
                 "buf",
                 app.copy_buffer_label(),
-                theme.chip(palette.text, palette.accent),
+                if app.copy_buffer_len() > 0 {
+                    theme.chip(palette.text, palette.accent)
+                } else {
+                    theme.fg(palette.muted)
+                },
             ),
             Span::raw(" "),
             chip("sort", app.sort_label(), theme.fg_bold(palette.path)),
-            chip("hidden", hidden, theme.fg(palette.muted)),
-            chip(
-                "filter",
-                truncate_display_width(&filter, 16),
-                theme.fg(palette.warn),
-            ),
+            if app.show_hidden() {
+                chip("hidden", "ON", theme.fg(palette.warn))
+            } else {
+                Span::raw("")
+            },
         ]),
     ];
     let paragraph = Paragraph::new(lines).block(
@@ -243,31 +247,40 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
 
 fn draw_files(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
     let palette = theme.palette();
-    let compact = area.width < 55;
-    let mut lines = vec![Line::from(Span::styled(
-        if compact && area.width >= 44 {
-            "CSB    SIZE NAME"
-        } else if compact {
-            "CSB NAME"
-        } else {
-            "CSB K    PERM      SIZE NAME"
-        },
-        theme.fg_bold(palette.key),
-    ))];
+    let width = area.width.saturating_sub(2) as usize;
+    let show_size = area.width >= 44;
+    let show_kind = area.width >= 55;
+    let metadata_width = usize::from(show_size) * 12 + usize::from(show_kind) * 11;
+    let name_width = width.saturating_sub(4 + metadata_width);
+    let editing = app.mode() == Mode::Filter;
+    let mut lines = Vec::new();
+    if editing {
+        lines.push(Line::default());
+    } else {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "    {:<name_width$}{}{}",
+                "NAME",
+                if show_kind { " KIND  MODE" } else { "" },
+                if show_size { "        SIZE" } else { "" }
+            ),
+            theme.fg_bold(palette.key),
+        )));
+    }
     if let Some(message) = app.loading_message().filter(|_| app.directory_loading()) {
         lines.push(Line::from(Span::styled(
             message,
             theme.fg(theme.palette().warn),
         )));
     }
-    if !app.filter().is_empty() {
+    if !editing && !app.filter().is_empty() {
         lines.push(kv_line(theme, "filter", escape_display(app.filter())));
     }
     let entry_capacity = area
         .height
         .saturating_sub(2)
         .saturating_sub(lines.len() as u16) as usize;
-    let visible_start = visible_entry_start(app.cursor(), app.entries().len(), entry_capacity);
+    let visible_start = app.file_view_start(entry_capacity);
     for (index, entry) in app
         .entries()
         .iter()
@@ -287,87 +300,87 @@ fn draw_files(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
             crate::fs_core::FileKind::Symlink => "@",
             _ => "",
         };
-        let perm = if entry.readonly { "RO" } else { "RW" };
-        let prefix = if compact && area.width >= 44 {
-            format!(
-                "{cursor}{mark}{buffer_mark} {:>7} ",
-                if entry.kind == FileKind::Directory {
-                    "-".into()
-                } else {
-                    entry_size(entry)
-                }
-            )
-        } else if compact {
-            format!("{cursor}{mark}{buffer_mark} ")
-        } else {
-            format!(
-                "{cursor}{mark}{buffer_mark} {:<4} {:<4} {:>8} ",
-                kind_icon(entry.kind),
-                perm,
-                if entry.kind == FileKind::Directory {
-                    "-".into()
-                } else {
-                    entry_size(entry)
-                }
-            )
-        };
-        let inner_width = area.width.saturating_sub(2) as usize;
-        let name_width = inner_width
-            .saturating_sub(display_width(&prefix))
-            .saturating_sub(display_width(suffix));
-        let row = format!(
-            "{prefix}{}{}",
-            truncate_display_width(&entry.name, name_width),
-            suffix
+        let name = truncate_display_width(&entry.name, name_width.saturating_sub(suffix.len()));
+        let name_padding = name_width.saturating_sub(display_width(&name) + suffix.len());
+        let mut row = format!(
+            "{cursor}{mark}{buffer_mark} {name}{suffix}{}",
+            " ".repeat(name_padding)
         );
-        if index == app.cursor() {
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "{row}{}",
-                    " ".repeat(inner_width.saturating_sub(display_width(&row)))
-                ),
-                theme.selected(),
-            )));
-        } else {
-            lines.push(Line::from(Span::styled(
-                row,
-                file_row_style(theme, entry.kind, entry.readonly, buffer_mark),
-            )));
+        if show_kind {
+            let perm = if entry.readonly { "RO" } else { "RW" };
+            row.push_str(&format!(" {:<5} {:<4}", entry.kind_marker(), perm));
         }
+        if show_size {
+            let size = if entry.kind == FileKind::Directory {
+                "-".to_owned()
+            } else {
+                entry_size(entry)
+            };
+            row.push_str(&format!(" {size:>11}"));
+        }
+        let style = if index == app.cursor() {
+            theme.selected()
+        } else {
+            file_row_style(theme, entry.kind, entry.readonly, buffer_mark)
+        };
+        lines.push(Line::from(Span::styled(row, style)));
     }
-    if app.entries().is_empty() {
+    if app.entries().is_empty() && !app.directory_loading() {
         lines.push(Line::from(if app.filter().is_empty() {
             "Empty directory"
         } else {
             "No matching files"
         }));
-        lines.push(Line::from(Span::styled(
-            format!(
-                "{} filter | {} refresh | {} parent",
-                action_key(app, "files", "open_filter"),
-                action_key(app, "files", "refresh"),
-                action_key(app, "files", "parent")
-            ),
-            theme.fg(palette.muted),
-        )));
+        if !editing {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "{} filter | {} refresh | {} parent",
+                    action_key(app, "files", "open_filter"),
+                    action_key(app, "files", "refresh"),
+                    action_key(app, "files", "parent")
+                ),
+                theme.fg(palette.muted),
+            )));
+        }
     }
-    let title = if app.entries().is_empty() {
-        format!(
-            "Files | {} actions | sort {}",
-            action_key(app, "files", "open_actions"),
-            app.sort_label()
-        )
+    let mut block = panel_block(theme, "Files", Tone::Active);
+    let position = if app.entries().is_empty() {
+        0
     } else {
-        format!(
-            "Files {}/{} | {} actions | sort {}",
-            app.cursor().saturating_add(1),
-            app.entries().len(),
-            action_key(app, "files", "open_actions"),
-            app.sort_label()
-        )
+        app.cursor() + 1
     };
-    let paragraph = Paragraph::new(lines).block(panel_block(theme, title, Tone::Active));
+    let position = format!(" {position}/{} ", app.entries().len());
+    if position.len() + 7 <= width {
+        block = block.title_top(Line::styled(position, theme.fg(palette.value)).right_aligned());
+    }
+    if !editing {
+        let hint = crate::bindings::hint(app.keymap(), "files", "open_actions", "actions")
+            .map(|hint| format!(" {hint} "))
+            .unwrap_or_default();
+        let hint_width = display_width(&hint);
+        if hint_width > 0 && hint_width <= width {
+            block = block.title_bottom(Line::styled(hint, theme.fg(palette.key)));
+        }
+        if frame.area().width < 80 {
+            let sort = format!(" sort {} ", app.sort_label());
+            if hint_width + sort.len() < width {
+                block =
+                    block.title_bottom(Line::styled(sort, theme.fg(palette.muted)).right_aligned());
+            }
+        }
+    }
+    let paragraph = Paragraph::new(lines).block(block);
     frame.render_widget(paragraph, area);
+    if editing && area.height > 2 {
+        let input = Rect::new(area.x + 1, area.y + 1, area.width.saturating_sub(2), 1);
+        crate::theme::draw_query(
+            frame,
+            input,
+            theme,
+            "Filter  ",
+            &escape_display(app.input()),
+        );
+    }
 }
 
 fn draw_fullscreen_preview(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
@@ -1327,15 +1340,6 @@ fn log_style(theme: Theme, log: &str) -> Style {
         theme.fg(palette.ok)
     } else {
         theme.fg(palette.muted)
-    }
-}
-
-fn kind_icon(kind: crate::fs_core::FileKind) -> &'static str {
-    match kind {
-        crate::fs_core::FileKind::Directory => "D",
-        crate::fs_core::FileKind::File => "F",
-        crate::fs_core::FileKind::Symlink => "L",
-        crate::fs_core::FileKind::Other => "O",
     }
 }
 
